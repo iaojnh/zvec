@@ -10,6 +10,7 @@
 #include <algorithm/hnsw/hnsw_algorithm.h>
 #include <algorithm/hnsw/hnsw_context.h>
 #include <algorithm/hnsw/hnsw_entity.h>
+#include <algorithm/hnsw/hnsw_graph_mutex.h>
 #include <algorithm/hnsw/hnsw_params.h>
 #include <algorithm/hnsw/hnsw_streamer_entity.h>
 #include <gtest/gtest.h>
@@ -86,59 +87,262 @@ TEST_F(HnswStreamerTest, ProviderReadErrorDuringTraversalRollsBackInsert) {
   };
 
   ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
+  auto check_build = [&](auto &entity, const char *storage_name) {
+    using Entity = std::decay_t<decltype(entity)>;
+    SCOPED_TRACE(storage_name);
+    auto storage = IndexFactory::CreateStorage(storage_name);
+    ASSERT_TRUE(storage);
+    ASSERT_EQ(0, storage->init({}));
+    ASSERT_EQ(0, storage->open(dir_ + storage_name, true));
+    entity.set_vector_size(dim * sizeof(float));
+    entity.set_l0_neighbor_cnt(4);
+    entity.set_upper_neighbor_cnt(4);
+    entity.set_prune_cnt(4);
+    entity.set_scaling_factor(5);
+    entity.set_ef_construction(8);
+    entity.set_use_key_info_map(true);
+    ASSERT_EQ(0, entity.init(8));
+    ASSERT_EQ(0, entity.open(storage, 8UL << 20, false));
+
+    auto provider = std::make_shared<FailingProvider>(dim);
+    NumericalVector<float> vector(dim);
+    for (node_id_t id = 0; id < 3; ++id) {
+      std::fill_n(vector.data(), dim, static_cast<float>(id));
+      ASSERT_TRUE(provider->emplace(id, vector));
+      if (id < 2) {
+        ASSERT_EQ(0, entity.add_vector_with_id(0, id, vector.data()));
+      }
+    }
+    ASSERT_EQ(0, entity.update_neighbors(0, 0, {{1, 1.0f}}));
+    ASSERT_EQ(0, entity.update_neighbors(0, 1, {{0, 1.0f}}));
+    entity.update_ep_and_level(0, 0);
+
+    auto metric = IndexFactory::CreateMetric("SquaredEuclidean");
+    ASSERT_TRUE(metric);
+    ASSERT_EQ(0, metric->init(*index_meta_ptr_, {}));
+    HnswContext context(dim, metric, entity.clone());
+    context.set_max_scan_limit(8);
+    context.set_min_scan_limit(8);
+    ASSERT_EQ(0, context.init(HnswContext::kStreamerContext));
+    context.set_filter([](uint64_t) { return false; });
+    HnswAlgorithm<Entity> algorithm(entity);
+    const auto prepare_query = [&] {
+      context.clear();
+      context.bind_dist_space(metric->distance(), metric->batch_distance(),
+                              provider, dim * sizeof(float), 0);
+      context.reset_query_raw(vector.data(), *index_meta_ptr_);
+    };
+    prepare_query();
+    EXPECT_EQ(IndexError_NoReady, algorithm.search(&context));
+
+    if constexpr (std::is_same_v<Entity, HnswBufferPoolStreamerEntity>) {
+      const auto insert = [&] {
+        prepare_query();
+        return entity.insert_buffered(0, 2, vector.data(), true,
+                                      [&](node_id_t id) {
+                                        return algorithm.add_node(id, 0, &context);
+                                      });
+      };
+      EXPECT_EQ(IndexError_NoReady, insert());
+      EXPECT_EQ(2u, entity.doc_cnt());
+      provider->fail = false;
+      EXPECT_EQ(0, insert());
+    } else {
+      prepare_query();
+      ASSERT_EQ(0, entity.add_vector_with_id(0, 2, vector.data()));
+      ASSERT_EQ(0, algorithm.add_node(2, 0, &context));
+      EXPECT_FALSE(context.error());
+      const auto neighbors = entity.get_neighbors(0, 2);
+      ASSERT_EQ(1u, neighbors.size());
+      EXPECT_EQ(0u, neighbors[0]);
+    }
+    EXPECT_EQ(3u, entity.doc_cnt());
+    ASSERT_EQ(0, entity.close());
+    ASSERT_EQ(0, storage->close());
+  };
+
+  IndexStreamer::Stats buffered_stats;
+  HnswBufferPoolStreamerEntity buffered(buffered_stats);
+  check_build(buffered, "BufferStorage");
+  IndexStreamer::Stats mmap_stats;
+  HnswMmapStreamerEntity mmap(mmap_stats);
+  check_build(mmap, "MMapFileStorage");
+}
+
+TEST_F(HnswStreamerTest, AdjacencyReadFailureAbortsSearchAndCanRetry) {
+  class FailingAdjacency : public IndexSegmentStorage::Segment {
+   public:
+    explicit FailingAdjacency(const Chunk::Pointer &backing, size_t offset)
+        : IndexSegmentStorage::Segment(backing, 0, backing->data_size(),
+                                       backing->padding_size(), 0),
+          backing_(backing),
+          offset_(offset) {}
+
+    size_t read_borrowed(size_t offset, IndexStorage::MemoryBlock &block,
+                         size_t len) override {
+      if (offset != offset_) {
+        return backing_->read_borrowed(offset, block, len);
+      }
+      block.reset();
+      return 0;
+    }
+
+    int read_error() const override {
+      return IndexError_NoMemory;
+    }
+
+   private:
+    Chunk::Pointer backing_;
+    size_t offset_;
+  };
+
+  class TestEntity : public HnswBufferPoolStreamerEntity {
+   public:
+    using HnswBufferPoolStreamerEntity::HnswBufferPoolStreamerEntity;
+
+    void fail_entry_adjacency() {
+      original_ = node_chunks_.front();
+      node_chunks_.front() = std::make_shared<FailingAdjacency>(
+          original_, vector_size() + sizeof(zvec::core::key_t));
+    }
+
+    void restore_entry_adjacency() {
+      node_chunks_.front() = std::move(original_);
+    }
+
+   private:
+    Chunk::Pointer original_;
+  };
+
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
   auto storage = IndexFactory::CreateStorage("BufferStorage");
   ASSERT_TRUE(storage);
   ASSERT_EQ(0, storage->init({}));
-  ASSERT_EQ(0, storage->open(dir_ + "ProviderReadError", true));
-  IndexStreamer::Stats stats;
-  HnswBufferPoolStreamerEntity entity(stats);
-  entity.set_vector_size(dim * sizeof(float));
-  entity.set_l0_neighbor_cnt(4);
-  entity.set_upper_neighbor_cnt(4);
-  entity.set_prune_cnt(4);
-  entity.set_scaling_factor(5);
-  entity.set_ef_construction(8);
-  entity.set_use_key_info_map(true);
-  ASSERT_EQ(0, entity.init(8));
-  ASSERT_EQ(0, entity.open(storage, 8UL << 20, false));
+  ASSERT_EQ(0, storage->open(dir_ + "AdjacencyReadError", true));
 
-  auto provider = std::make_shared<FailingProvider>(dim);
+  IndexStreamer::Stats stats;
+  auto entity = std::make_shared<TestEntity>(stats);
+  entity->set_vector_size(dim * sizeof(float));
+  entity->set_l0_neighbor_cnt(4);
+  entity->set_upper_neighbor_cnt(4);
+  entity->set_scaling_factor(5);
+  ASSERT_EQ(0, entity->init(8));
+  ASSERT_EQ(0, entity->open(storage, 8UL << 20, false));
   NumericalVector<float> vector(dim);
-  for (node_id_t id = 0; id < 3; ++id) {
-    std::fill_n(vector.data(), dim, static_cast<float>(id));
-    ASSERT_TRUE(provider->emplace(id, vector));
-    if (id < 2) {
-      ASSERT_EQ(0, entity.add_vector_with_id(0, id, vector.data()));
-    }
-  }
-  ASSERT_EQ(0, entity.update_neighbors(0, 0, {{1, 1.0f}}));
-  ASSERT_EQ(0, entity.update_neighbors(0, 1, {{0, 1.0f}}));
-  entity.update_ep_and_level(0, 0);
+  std::fill_n(vector.data(), dim, 0.0f);
+  ASSERT_EQ(0, entity->add_vector_with_id(0, 0, vector.data()));
+  std::fill_n(vector.data(), dim, 1.0f);
+  ASSERT_EQ(0, entity->add_vector_with_id(0, 1, vector.data()));
+  ASSERT_EQ(0, entity->update_neighbors(0, 0, {{1, 1.0f}}));
+  entity->update_ep_and_level(0, 0);
 
   auto metric = IndexFactory::CreateMetric("SquaredEuclidean");
   ASSERT_TRUE(metric);
   ASSERT_EQ(0, metric->init(*index_meta_ptr_, {}));
-  HnswContext context(dim, metric, entity.clone());
+  HnswContext context(dim, metric, entity);
+  context.set_topk(1);
+  context.set_ef(4);
   context.set_max_scan_limit(8);
   context.set_min_scan_limit(8);
   ASSERT_EQ(0, context.init(HnswContext::kStreamerContext));
-  HnswAlgorithm<HnswBufferPoolStreamerEntity> algorithm(entity);
-  const auto insert = [&] {
+  context.check_need_adjuct_ctx(entity->doc_cnt());
+  HnswAlgorithm<HnswBufferPoolStreamerEntity> algorithm(*entity);
+
+  const auto search = [&] {
     context.clear();
     context.bind_dist_space(metric->distance(), metric->batch_distance(),
-                            provider, dim * sizeof(float), 0);
+                            nullptr, dim * sizeof(float), 0);
     context.reset_query_raw(vector.data(), *index_meta_ptr_);
-    return entity.insert_buffered(0, 2, vector.data(), true, [&](node_id_t id) {
-      return algorithm.add_node(id, 0, &context);
-    });
+    return algorithm.search(&context);
   };
-  EXPECT_EQ(IndexError_NoReady, insert());
-  EXPECT_EQ(2u, entity.doc_cnt());
-  provider->fail = false;
-  EXPECT_EQ(0, insert());
-  EXPECT_EQ(3u, entity.doc_cnt());
-  ASSERT_EQ(0, entity.close());
+  for (bool filtered : {false, true}) {
+    SCOPED_TRACE(filtered);
+    if (filtered) context.set_filter([](uint64_t) { return false; });
+    entity->fail_entry_adjacency();
+    EXPECT_EQ(IndexError_NoMemory, search());
+    entity->restore_entry_adjacency();
+    ASSERT_EQ(0, search());
+    std::vector<uint64_t> keys;
+    context.topk_to_keys(keys);
+    EXPECT_EQ((std::vector<uint64_t>{1}), keys);
+  }
+  ASSERT_EQ(0, entity->close());
   ASSERT_EQ(0, storage->close());
+}
+
+TEST_F(HnswStreamerTest, FailedSizeRollbackQuarantinesStorage) {
+  class FailingResize : public IndexSegmentStorage::Segment {
+   public:
+    explicit FailingResize(const Chunk::Pointer &backing)
+        : IndexSegmentStorage::Segment(backing, 0, backing->data_size(),
+                                       backing->padding_size(), 0),
+          backing_(backing),
+          committed_size_(backing->data_size()) {}
+
+    size_t data_size() const override { return backing_->data_size(); }
+
+    bool write_batch(const IndexStorage::SegmentData *writes,
+                     size_t count) override {
+      return backing_->write_batch(writes, count);
+    }
+
+    size_t resize(size_t size) override {
+      return size == committed_size_ ? data_size() : backing_->resize(size);
+    }
+
+   private:
+    Chunk::Pointer backing_;
+    size_t committed_size_;
+  };
+
+  class TestEntity : public HnswBufferPoolStreamerEntity {
+   public:
+    using HnswBufferPoolStreamerEntity::HnswBufferPoolStreamerEntity;
+
+    Chunk::Pointer fail_shrink_of_first_chunk() {
+      auto chunk = node_chunks_.front();
+      node_chunks_.front() = std::make_shared<FailingResize>(chunk);
+      return chunk;
+    }
+  };
+
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
+  auto storage = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->init({}));
+  ASSERT_EQ(0, storage->open(dir_ + "FailedSizeRollback", true));
+
+  IndexStreamer::Stats stats;
+  TestEntity entity(stats);
+  entity.set_vector_size(dim * sizeof(float));
+  entity.set_l0_neighbor_cnt(4);
+  entity.set_upper_neighbor_cnt(4);
+  entity.set_scaling_factor(5);
+  ASSERT_EQ(0, entity.init(8));
+  ASSERT_EQ(0, entity.open(storage, 8UL << 20, false));
+  NumericalVector<float> vector(dim);
+  std::fill_n(vector.data(), dim, 1.0f);
+  ASSERT_EQ(0, entity.add_vector_with_id(0, 0, vector.data()));
+  entity.update_ep_and_level(0, 0);
+  ASSERT_EQ(0, entity.flush(0));
+  const auto chunk = entity.fail_shrink_of_first_chunk();
+  const auto committed_size = chunk->data_size();
+  const auto pool = storage->vec_buffer_pool();
+  ASSERT_TRUE(pool);
+
+  EXPECT_EQ(IndexError_WriteData,
+            entity.insert_buffered(0, 1, vector.data(), true,
+                                   [](node_id_t) { return IndexError_NoMemory; }));
+  EXPECT_GT(chunk->data_size(), committed_size);
+  EXPECT_EQ(1u, entity.doc_cnt());
+  EXPECT_TRUE(pool->writeback_quarantined());
+  EXPECT_EQ(IndexError_WriteData, entity.flush(0));
+  EXPECT_EQ(IndexError_WriteData, storage->flush());
+  EXPECT_EQ(IndexError_WriteData, storage->close());
+  EXPECT_TRUE(storage->file_path().empty());
+  float first = 0;
+  EXPECT_EQ(sizeof(first), chunk->fetch(0, &first, sizeof(first)));
+  EXPECT_EQ(1.0f, first);
 }
 
 TEST_F(HnswStreamerTest, LegacyReadsReleaseStorageBeforeThreadExit) {
@@ -920,6 +1124,16 @@ TEST_F(HnswStreamerTest, BufferSearchDispatchReusesContextAcrossVisitModes) {
         EXPECT_EQ(expected[i], results[i].key());
       }
     }
+  }
+  {
+    // A provider under another graph's write lock may use its own core
+    // context to search this independent graph.
+    HnswGraphMutex other_graph;
+    const HnswGraphLock writing(&other_graph, HnswGraphLock::Mode::kWrite);
+    ctx->reset_filter();
+    ASSERT_EQ(0, read_streamer->search_impl(vector.data(), qmeta, ctx));
+    ASSERT_FALSE(ctx->result().empty());
+    EXPECT_EQ(64u, ctx->result().front().key());
   }
   ctx.reset();
   ASSERT_EQ(0, read_streamer->close());

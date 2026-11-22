@@ -72,6 +72,7 @@ class HnswStreamerEntity : public HnswEntity {
 
   int get_vector_snapshot(node_id_t id,
                           IndexStorage::MemoryBlock &block) const override;
+  key_t get_key_snapshot(node_id_t id) const;
 
   int get_vector_borrowed(const node_id_t id,
                           IndexStorage::MemoryBlock &block) const override;
@@ -759,7 +760,7 @@ HnswStreamerEntity::get_neighbors_typed<MmapMemoryBlock>(level_t level,
   size_t ret = chunk->read(offset, ptr, nbr_size);
   if (ailego_unlikely(ret != nbr_size)) {
     LOG_ERROR("Read neighbor header failed, ret=%zu", ret);
-    return NeighborsT<MmapMemoryBlock>();
+    return NeighborsT<MmapMemoryBlock>(chunk->read_error());
   }
   MmapMemoryBlock block(const_cast<void *>(ptr.data()));
   return NeighborsT<MmapMemoryBlock>(std::move(block));
@@ -791,7 +792,7 @@ HnswStreamerEntity::get_neighbors_typed<BufferPoolMemoryBlock>(
   size_t ret = chunk->read_borrowed(offset, mem_block, nbr_size);
   if (ailego_unlikely(ret != nbr_size)) {
     LOG_ERROR("Read neighbor header failed, ret=%zu", ret);
-    return NeighborsT<BufferPoolMemoryBlock>();
+    return NeighborsT<BufferPoolMemoryBlock>(chunk->read_error());
   }
   return NeighborsT<BufferPoolMemoryBlock>(std::move(mem_block));
 }
@@ -813,7 +814,9 @@ inline int HnswStreamerEntity::get_vector_typed<MmapMemoryBlock>(
     if (ailego_unlikely(ret != read_size)) {
       LOG_ERROR("Read vector failed, offset=%u, read size=%zu, ret=%zu",
                 loc.second, read_size, ret);
-      return IndexError_ReadData;
+      const int error = node_chunks_[loc.first]->read_error();
+      vec_blocks.clear();
+      return error;
     }
     vec_blocks[i].reset(const_cast<void *>(ptr.data()));
   }
@@ -850,7 +853,9 @@ inline int HnswStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
       if (ailego_unlikely(ret != read_size)) {
         LOG_ERROR("Read vector failed, offset=%u, read size=%zu, ret=%zu",
                   loc.second, read_size, ret);
-        return IndexError_ReadData;
+        const int error = node_chunks_[loc.first]->read_error();
+        vec_blocks.clear();
+        return error;
       }
       vec_blocks[i] = std::move(mem_block);
     }
@@ -878,7 +883,9 @@ inline int HnswStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
               batch_reads.data(), batch_reads.size()))) {
     LOG_ERROR("Batch read vectors failed, count=%u, read size=%zu", count,
               read_size);
-    return IndexError_ReadData;
+    const int error = batch_reads.front().segment->read_error();
+    vec_blocks.clear();
+    return error;
   }
   return 0;
 }

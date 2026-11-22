@@ -1193,7 +1193,7 @@ int IVFEntity::search_by_keys(const std::vector<uint64_t> &keys,
     if (id >= vector_count()) continue;
     InvertedVecLocation loc(0, false);
     if (offsets_->fetch(id * sizeof(loc), &loc, sizeof(loc)) != sizeof(loc)) {
-      return IndexError_ReadData;
+      return offsets_->read_error();
     }
     if (loc.column_major) return IndexError_InvalidFormat;
     float score = 0;
@@ -1207,7 +1207,7 @@ int IVFEntity::search_by_keys(const std::vector<uint64_t> &keys,
       if (block != cached_block) {
         if (inverted_->read(block, data, header_.block_size) !=
             header_.block_size) {
-          return IndexError_ReadData;
+          return inverted_->read_error();
         }
         query_features_distance(nullptr, data.data(),
                                 header_.block_vector_count, distances.data());
@@ -1218,7 +1218,7 @@ int IVFEntity::search_by_keys(const std::vector<uint64_t> &keys,
     } else {
       if (inverted_->read(loc.offset, data, meta_.element_size()) !=
           meta_.element_size()) {
-        return IndexError_ReadData;
+        return inverted_->read_error();
       }
       query_features_distance(nullptr, data.data(), 1, &score);
       ++(*stats->mutable_dist_calced_count());

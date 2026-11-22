@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include "hnsw_streamer.h"
+#include <functional>
 #include <iostream>
 #include <ailego/internal/cpu_features.h>
 #include <ailego/pattern/defer.h>
@@ -967,6 +968,13 @@ HnswGraphMutex *HnswStreamer::buffered_graph_mutex() const {
   return entity_ ? entity_->buffered_graph_mutex() : nullptr;
 }
 
+bool HnswStreamer::search_blocked_in_callback() const {
+  const auto *mutex = buffered_graph_mutex();
+  // A separately owned context can read a different buffered graph or a
+  // read-only graph. Writable layouts without this guard use node locks.
+  return (mutex || !read_only_) && HnswGraphLock::has_writer(mutex);
+}
+
 const void *HnswStreamer::get_vector(uint64_t key) const {
   IndexStorage::MemoryBlock block;
   if (get_vector(key, block) != 0) return nullptr;
@@ -1112,8 +1120,9 @@ int HnswStreamer::add_with_id_impl(uint32_t id, const void *query,
     return result == 0 ? ctx->dist_calculator().error_code() : result;
   };
   if (guard.owns_lock()) {
-    ret = entity_->insert_buffered(level, id, query,
-                                   /*explicit_id=*/true, add_to_graph);
+    ret =
+        entity_->insert_buffered(level, id, query,
+                                 /*explicit_id=*/true, std::ref(add_to_graph));
   } else {
     ret = entity_->add_vector_with_id(level, id, query);
     if (ret == 0) ret = add_to_graph(id);
@@ -1220,8 +1229,9 @@ int HnswStreamer::add_impl(uint64_t pkey, const void *query,
     return result == 0 ? ctx->dist_calculator().error_code() : result;
   };
   if (guard.owns_lock()) {
-    ret = entity_->insert_buffered(level, pkey, query,
-                                   /*explicit_id=*/false, add_to_graph);
+    ret =
+        entity_->insert_buffered(level, pkey, query,
+                                 /*explicit_id=*/false, std::ref(add_to_graph));
   } else {
     node_id_t id;
     ret = entity_->add_vector(level, pkey, query, &id);
@@ -1248,7 +1258,7 @@ int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
 int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
                               uint32_t count,
                               IndexStreamer::Context::Pointer &context) const {
-  if (HnswGraphLock::has_writer()) return IndexError_NoReady;
+  if (search_blocked_in_callback()) return IndexError_NoReady;
   const HnswGraphLock guard(buffered_graph_mutex());
   if (guard.blocked()) return IndexError_NoReady;
   if (entity_ && entity_->mutation_error() != 0)
@@ -1313,10 +1323,10 @@ int HnswStreamer::search_candidates_impl(
     const void *query, const IndexQueryMeta &qmeta, std::vector<uint64_t> &keys,
     IndexStreamer::Context::Pointer &context,
     std::vector<float> *scores) const {
-  if (HnswGraphLock::has_writer()) return IndexError_NoReady;
-  const HnswGraphLock guard(buffered_graph_mutex());
   keys.clear();
   if (scores) scores->clear();
+  if (search_blocked_in_callback()) return IndexError_NoReady;
+  const HnswGraphLock guard(buffered_graph_mutex());
   if (guard.blocked()) return IndexError_NoReady;
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
@@ -1402,7 +1412,7 @@ int HnswStreamer::search_bf_impl(
 int HnswStreamer::search_bf_impl(
     const void *query, const IndexQueryMeta &qmeta, uint32_t count,
     IndexStreamer::Context::Pointer &context) const {
-  if (HnswGraphLock::has_writer()) return IndexError_NoReady;
+  if (search_blocked_in_callback()) return IndexError_NoReady;
   const HnswGraphLock guard(buffered_graph_mutex());
   if (guard.blocked()) return IndexError_NoReady;
   if (entity_ && entity_->mutation_error() != 0)
@@ -1512,7 +1522,7 @@ int HnswStreamer::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const {
-  if (HnswGraphLock::has_writer()) return IndexError_NoReady;
+  if (search_blocked_in_callback()) return IndexError_NoReady;
   const HnswGraphLock guard(buffered_graph_mutex());
   if (guard.blocked()) return IndexError_NoReady;
   if (entity_ && entity_->mutation_error() != 0)

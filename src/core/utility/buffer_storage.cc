@@ -894,7 +894,7 @@ class BufferStorageFile
       std::shared_lock<std::shared_mutex> latch(
           owner_->mapping_shards_[owner_->mapping_shard_id()].mtx);
       if (owner_->retired_) return 0;
-      if (ailego_unlikely(owner_->corrupted_.load(std::memory_order_acquire))) {
+      if (ailego_unlikely(owner_->is_corrupted())) {
         LOG_ERROR(
             "WrappedSegment::write: storage is marked corrupted, refusing "
             "write, file[%s], id[%s]",
@@ -941,8 +941,7 @@ class BufferStorageFile
 
       std::shared_lock<std::shared_mutex> latch(
           owner_->mapping_shards_[owner_->mapping_shard_id()].mtx);
-      if (ailego_unlikely(owner_->retired_ ||
-                          owner_->corrupted_.load(std::memory_order_acquire))) {
+      if (ailego_unlikely(owner_->retired_ || owner_->is_corrupted())) {
         return false;
       }
       if (!owner_->buffer_pool_->writable()) {
@@ -1006,12 +1005,7 @@ class BufferStorageFile
         return false;
       if (!owner_->buffer_pool_->restore_range(
               absolute_offset(offset), len, static_cast<const char *>(data))) {
-        if (!owner_->corrupted_.exchange(true, std::memory_order_acq_rel)) {
-          // Cached query contexts can release the last storage reference in
-          // a TLS destructor. Stop the worker at the terminal failure so
-          // that destructor never has to join it under Windows' loader lock.
-          owner_->buffer_pool_->quarantine_writeback();
-        }
+        owner_->mark_corrupted();
         return false;
       }
       owner_->set_as_dirty();
@@ -1022,7 +1016,7 @@ class BufferStorageFile
     size_t resize(size_t size) override {
       std::shared_lock<std::shared_mutex> latch(
           owner_->mapping_shards_[owner_->mapping_shard_id()].mtx);
-      if (ailego_unlikely(owner_->corrupted_.load(std::memory_order_acquire))) {
+      if (ailego_unlikely(owner_->is_corrupted())) {
         LOG_ERROR(
             "WrappedSegment::resize: storage is marked corrupted, refusing "
             "resize, file[%s], id[%s]",
@@ -1044,7 +1038,7 @@ class BufferStorageFile
     void update_data_crc(uint32_t crc) override {
       std::shared_lock<std::shared_mutex> latch(
           owner_->mapping_shards_[owner_->mapping_shard_id()].mtx);
-      if (ailego_unlikely(owner_->corrupted_.load(std::memory_order_acquire))) {
+      if (ailego_unlikely(owner_->is_corrupted())) {
         LOG_ERROR(
             "WrappedSegment::update_data_crc: storage is marked corrupted, "
             "refusing CRC update, file[%s], id[%s]",
@@ -1212,6 +1206,8 @@ class BufferStorageFile
       if (ret != 0) return ret;
     }
 
+    // Publication completes creation. Pool construction captures one backing
+    // file generation, which may have been replaced since publication.
     file_name_ = path;
     buffer_pool_ = std::make_shared<ailego::VecBufferPool>(path, writable);
     buffer_pool_handle_ =
@@ -1235,10 +1231,13 @@ class BufferStorageFile
     const size_t available = pool.available();
     size_t cache_budget = available;
     if (writable) {
-      // Writable metadata is mandatory. Resident pages can be reclaimed by
-      // init()'s actual reservation; fixed reservations still count.
+      // The mandatory reservation can reclaim native pages and chunk cache
+      // backing. Only fixed reservations reduce the preflight capacity.
+      const size_t external = pool.external_used();
+      const size_t fixed_external =
+          external - std::min(external, pool.evictable_cache_used());
       cache_budget = pool.capacity();
-      for (size_t fixed : {pool.metadata_used(), pool.external_used()}) {
+      for (size_t fixed : {pool.metadata_used(), fixed_external}) {
         cache_budget = fixed >= cache_budget ? 0 : cache_budget - fixed;
       }
     }
@@ -1463,7 +1462,7 @@ class BufferStorageFile
   }
 
   //! Write the version segment while the new mapping is open.
-  int init_version_segment(IndexMapping &mapping) {
+  static int init_version_segment(IndexMapping &mapping) {
     size_t data_size = std::strlen(IndexVersion::Details());
     int error_code = mapping.append(INDEX_VERSION_SEGMENT_NAME, data_size);
     if (error_code != 0) {
@@ -1486,33 +1485,11 @@ class BufferStorageFile
 
   //! Create an index compatible with the mmap storage format.
   int init_index(const std::string &path) {
-    IndexMapping mapping;
-    int ret = mapping.create(path, segment_meta_capacity_, /*exclusive=*/true);
+    const int ret = IndexMapping::CreateExclusive(path, segment_meta_capacity_,
+                                                  init_version_segment);
     if (ret != 0) {
       LOG_ERROR(
           "BufferStorage failed to create index file: path[%s], errno[%d]",
-          path.c_str(), ret);
-      return ret;
-    }
-    bool ready = false;
-    const auto discard_incomplete = ailego::ScopeGuard::Make([&] {
-      mapping.close();
-      if (!ready && !ailego::File::Delete(path))
-        LOG_ERROR("Failed to remove incomplete index %s", path.c_str());
-    });
-    ret = this->init_version_segment(mapping);
-    if (ret != 0) {
-      LOG_ERROR(
-          "BufferStorage failed to append version segment: path[%s], errno[%d]",
-          path.c_str(), ret);
-      return ret;
-    }
-    mapping.refresh(0);
-    ret = mapping.flush();
-    ready = ret == 0;
-    if (ret != 0) {
-      LOG_ERROR(
-          "BufferStorage failed to flush new index file: path[%s], errno[%d]",
           path.c_str(), ret);
     }
     return ret;
@@ -1526,12 +1503,14 @@ class BufferStorageFile
   void refresh_index(uint64_t chkp) {
     if (!buffer_pool_->writable()) return;
     AllShardsExclusiveLatch latch(mapping_shards_);
+    if (is_corrupted()) return;
     pending_checkpoint_ = std::max(pending_checkpoint_, chkp);
     set_as_dirty();
   }
 
   //! Flush index storage.
   int flush_index() {
+    if (is_corrupted()) return IndexError_WriteData;
     if (!index_dirty_.load(std::memory_order_relaxed)) {
       return 0;
     }
@@ -1543,12 +1522,12 @@ class BufferStorageFile
   // The caller excludes writers from the first data flush through the last
   // footer.
   int flush_index_locked() {
-    if (corrupted_.load(std::memory_order_acquire)) {
+    if (is_corrupted()) {
       LOG_ERROR(
           "BufferStorage::flush_index skipped: storage is marked corrupted, "
           "file[%s]",
           file_name_.c_str());
-      return IndexError_Runtime;
+      return IndexError_WriteData;
     }
     if (!buffer_pool_->writable()) {
       // Read-only pool: nothing to flush.
@@ -1604,7 +1583,7 @@ class BufferStorageFile
       LOG_ERROR("append_segment: pool not ready, file[%s]", file_name_.c_str());
       return IndexError_Runtime;
     }
-    if (corrupted_.load(std::memory_order_acquire)) {
+    if (is_corrupted()) {
       LOG_ERROR(
           "append_segment: storage is marked corrupted, refusing to append, "
           "file[%s], id[%s]",
@@ -1704,9 +1683,11 @@ class BufferStorageFile
       // Extend the file and write the new chain's header + (zero) footer.
       // The segment_meta region is zero-filled by ftruncate.
       const size_t new_meta_end = new_chain_start + new_meta_total;
-      if (new_meta_end > buffer_pool_->file_size() &&
-          !buffer_pool_->extend_file(new_meta_end)) {
-        return IndexError_Runtime;
+      const auto growth = buffer_pool_->extend_file_status(new_meta_end);
+      if (growth != ailego::PageWriteStatus::kOk) {
+        return growth == ailego::PageWriteStatus::kNoMemory
+                   ? IndexError_NoMemory
+                   : IndexError_WriteData;
       }
 
       if (buffer_pool_handle_->write_meta(
@@ -1746,7 +1727,7 @@ class BufferStorageFile
               "file[%s] is now in an inconsistent state -- marking storage "
               "as corrupted; further writes will be rejected.",
               file_name_.c_str());
-          corrupted_.store(true, std::memory_order_release);
+          mark_corrupted();
         }
         meta_chains_.pop_back();
         meta_chains_.back().footer = footer_before_split;
@@ -1764,11 +1745,12 @@ class BufferStorageFile
       return IndexError_InvalidLength;
     }
     uint64_t new_file_size = new_seg_abs_offset + padded_size;
-    if (new_file_size > buffer_pool_->file_size()) {
-      if (!buffer_pool_->extend_file(new_file_size)) {
-        rollback_chain_split();
-        return IndexError_Runtime;
-      }
+    const auto growth = buffer_pool_->extend_file_status(new_file_size);
+    if (growth != ailego::PageWriteStatus::kOk) {
+      rollback_chain_split();
+      return growth == ailego::PageWriteStatus::kNoMemory
+                 ? IndexError_NoMemory
+                 : IndexError_WriteData;
     }
 
     // Snapshot every overwritten metadata region for rollback.
@@ -1823,7 +1805,7 @@ class BufferStorageFile
             "inconsistent state -- marking storage as corrupted; further "
             "writes will be rejected.",
             rc_meta, rc_footer, file_name_.c_str());
-        corrupted_.store(true, std::memory_order_release);
+        mark_corrupted();
       }
     };
 
@@ -1912,6 +1894,19 @@ class BufferStorageFile
   ReusableReadScratch read_scratch_;
   uint64_t pending_checkpoint_{0};
   uint64_t committed_checkpoint_{0};
+  bool is_corrupted() const {
+    return corrupted_.load(std::memory_order_acquire) ||
+           buffer_pool_->writeback_quarantined();
+  }
+
+  void mark_corrupted() {
+    if (!corrupted_.exchange(true, std::memory_order_acq_rel)) {
+      // A cached query context may release the last file reference at thread
+      // exit. Join here so TLS teardown cannot wait under the loader lock.
+      buffer_pool_->quarantine_writeback();
+    }
+  }
+
   // Called under the exclusive mapping latches after flushing accepted writes.
   // A cloned segment may keep this file alive until its thread's TLS unwinds.
   void retire() {
@@ -2091,10 +2086,7 @@ class BufferStorage : public IndexStorage {
     BufferStorageFile::AllShardsExclusiveLatch writers(
         previous->mapping_shards_);
     const int ret = previous->flush_index_locked();
-    if (ret != 0 && !disposing &&
-        !previous->corrupted_.load(std::memory_order_acquire) &&
-        !previous->buffer_pool_->writeback_quarantined())
-      return ret;
+    if (ret != 0 && !disposing && !previous->is_corrupted()) return ret;
     previous->retire();
     file_.reset();
     return ret;

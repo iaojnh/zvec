@@ -277,6 +277,7 @@ void RunHnswProviderFetchDuringAdd(size_t index_count) {
   struct IndexTestState {
     Index::Pointer index;
     std::shared_ptr<FetchingProvider> provider;
+    core::IndexContext::Pointer nested_context;
     std::promise<void> provider_entered, write_finished;
     std::future<void> provider_started{provider_entered.get_future()};
     std::future<void> write_done{write_finished.get_future()};
@@ -302,6 +303,10 @@ void RunHnswProviderFetchDuringAdd(size_t index_count) {
         0, site.index->open(path + std::to_string(i) + ".index",
                             {StorageOptions::StorageType::kBufferPool, true}));
     ASSERT_EQ(0, site.index->add(VectorData{DenseVector{original.data()}}, 0));
+    if (index_count == 1) {
+      site.nested_context = site.index->index_searcher()->create_context();
+      ASSERT_TRUE(site.nested_context);
+    }
   }
   for (size_t i = 0; i < index_count; ++i) {
     auto &site = sites[i];
@@ -317,6 +322,17 @@ void RunHnswProviderFetchDuringAdd(size_t index_count) {
           if (target.provider_started.wait_for(5s) != std::future_status::ready)
             std::_Exit(2);
         }
+      }
+      if (index_count == 1) {
+        std::vector<uint64_t> keys{42};
+        std::vector<float> scores{1.0f};
+        const core::IndexQueryMeta query_meta(core::IndexMeta::DT_FP32, kDim);
+        EXPECT_EQ(core::IndexError_NoReady,
+                  target.index->index_searcher()->search_candidates_impl(
+                      original.data(), query_meta, keys, site.nested_context,
+                      &scores));
+        EXPECT_TRUE(keys.empty());
+        EXPECT_TRUE(scores.empty());
       }
       VectorDataBuffer fetched;
       return target.index->fetch(0, &fetched);
@@ -509,6 +525,7 @@ void RunHnswExportedProviderAcrossRollback() {
   const auto cleanup =
       ailego::ScopeGuard::Make([&] { test_util::RemoveTestFiles(path + "*"); });
   constexpr uint32_t kDim = 16;
+  constexpr uint64_t kOriginalKey = 42;
   auto build_provider = std::make_shared<BuildProvider>(kDim);
   ailego::NumericalVector<float> zero(kDim), original(kDim), replacement(kDim);
   std::fill_n(zero.data(), kDim, 0.0f);
@@ -517,6 +534,7 @@ void RunHnswExportedProviderAcrossRollback() {
   ASSERT_TRUE(build_provider->emplace(0, zero));
   ASSERT_TRUE(build_provider->emplace(1, original));
   ASSERT_TRUE(build_provider->emplace(2, replacement));
+  ASSERT_TRUE(build_provider->emplace(kOriginalKey, original));
   core::IndexMeta meta(core::IndexMeta::DT_FP32, kDim);
   meta.set_metric("SquaredEuclidean", 0, ailego::Params{});
   const auto param = HNSWIndexParamBuilder()
@@ -530,16 +548,22 @@ void RunHnswExportedProviderAcrossRollback() {
   ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kBufferPool,
                                  true}));
   ASSERT_EQ(0, index->add(VectorData{DenseVector{zero.data()}}, 0));
-  ASSERT_EQ(0, index->add(VectorData{DenseVector{original.data()}}, 1));
+  const auto streamer = index->index_searcher();
+  auto context = streamer->create_context();
+  ASSERT_TRUE(context);
+  const core::IndexQueryMeta query_meta(core::IndexMeta::DT_FP32, kDim);
+  ASSERT_EQ(0, streamer->add_impl(kOriginalKey, original.data(), query_meta,
+                                  context));
+  context.reset();
   const auto exported = index->create_index_provider();
   ASSERT_TRUE(exported);
   core::IndexStorage::MemoryBlock retained;
-  ASSERT_EQ(0, exported->get_vector(1, retained));
+  ASSERT_EQ(0, exported->get_vector(kOriginalKey, retained));
   auto iterator = exported->create_iterator();
   ASSERT_TRUE(iterator);
   iterator->next();
   ASSERT_TRUE(iterator->is_valid());
-  ASSERT_EQ(1u, iterator->key());
+  ASSERT_EQ(kOriginalKey, iterator->key());
 
   const auto query = HNSWQueryParamBuilder()
                          .with_topk(1)
@@ -549,14 +573,14 @@ void RunHnswExportedProviderAcrossRollback() {
   ASSERT_EQ(0, index->search(VectorData{DenseVector{original.data()}}, query,
                              &held_result));
   ASSERT_EQ(1u, held_result.doc_list_.size());
-  ASSERT_EQ(1u, held_result.doc_list_.front().key());
+  ASSERT_EQ(kOriginalKey, held_result.doc_list_.front().key());
   ASSERT_NE(nullptr, held_result.doc_list_.front().vector());
   int64_t id = -1;
   const auto ids_query = HNSWQueryParamBuilder().with_topk(1).build();
   ASSERT_EQ(0, index->search_internal_ids(
                    VectorData{DenseVector{original.data()}}, ids_query, &id,
                    nullptr));
-  EXPECT_EQ(1, id);
+  EXPECT_EQ(kOriginalKey, id);
 
   std::promise<void> staged, resume_writer, entering_read;
   auto writer_staged = staged.get_future();
@@ -569,9 +593,14 @@ void RunHnswExportedProviderAcrossRollback() {
     if (index->fetch(1, &fetched) != 0) std::_Exit(2);
     EXPECT_EQ(expected, std::get<DenseVectorBuffer>(fetched.vector_buffer).data);
     core::IndexStorage::MemoryBlock from_provider;
-    if (exported->get_vector(1, from_provider) != 0) std::_Exit(3);
+    if (exported->get_vector(kOriginalKey, from_provider) != 0) std::_Exit(3);
     EXPECT_EQ(expected, std::string(static_cast<const char *>(from_provider.data()),
                                     kDim * sizeof(float)));
+    EXPECT_EQ(core::IndexError_NoExist, exported->get_vector(1, from_provider));
+    EXPECT_EQ(kOriginalKey, iterator->key());
+    const auto *data = static_cast<const char *>(iterator->data());
+    EXPECT_EQ(expected, data ? std::string(data, kDim * sizeof(float))
+                             : std::string{});
     staged.set_value();
     if (resumed.wait_for(5s) != std::future_status::ready) std::_Exit(4);
     return core::IndexError_NoMemory;
@@ -591,10 +620,12 @@ void RunHnswExportedProviderAcrossRollback() {
       read.wait_for(5s) != std::future_status::ready) std::_Exit(7);
   EXPECT_NE(0, write.get());
   EXPECT_EQ(expected, read.get());
+  EXPECT_EQ(kOriginalKey, iterator->key());
   EXPECT_EQ(0, iterator->status());
 
   build_provider->after_staging = nullptr;
   ASSERT_EQ(0, index->add(input, 1));
+  EXPECT_EQ(1u, iterator->key());
   ASSERT_EQ(0, index->add(input, 2));
   EXPECT_EQ(2u, exported->count());
   EXPECT_EQ(expected, std::string(static_cast<const char *>(

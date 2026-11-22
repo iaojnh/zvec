@@ -31,12 +31,6 @@ namespace core {
 
 namespace {
 
-// Keep the historical error for ordinary read failures while allowing
-// callers to distinguish an allocation refusal and retry the operation.
-int map_read_error(int status) {
-  return status == IndexError_NoMemory ? status : IndexError_Runtime;
-}
-
 // DiskAnnContext instances are pooled above the indexer and can therefore
 // outlive the reader that prepared their lazy Windows file handle. Keep that
 // handle across all I/O batches in one logical operation, then release it on
@@ -301,7 +295,7 @@ int DiskAnnIndexer::use_medroids_data_as_centroids() {
   if (std::find(read_status.begin(), read_status.end(), false) !=
       read_status.end()) {
     LOG_ERROR("Failed to read one or more entrypoint vectors");
-    return io_error == IndexError_NoMemory ? io_error : IndexError_ReadData;
+    return io_error != 0 ? io_error : IndexError_InvalidFormat;
   }
 
   return 0;
@@ -1173,7 +1167,7 @@ int DiskAnnIndexer::get_vector(diskann_id_t id, IndexContext::Pointer &context,
     if (read_ret != 0) {
       LOG_ERROR("get_vector: reader_->read failed, ret=%d", read_ret);
       ctx->set_error(true);
-      return map_read_error(read_ret);
+      return read_ret;
     }
 
     uint8_t *node_disk_buf = frontier_neighbor.second + node_offset;
@@ -1400,7 +1394,7 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
       if (submit_ret != 0) {
         LOG_ERROR("cached_beam_search: submit failed, ret=%d", submit_ret);
         ctx->set_error(true);
-        return map_read_error(submit_ret);
+        return submit_ret;
       }
     }
 
@@ -1446,7 +1440,7 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
         if (n < 0) {
           LOG_ERROR("cached_beam_search: get_completed failed, ret=%d", n);
           ctx->set_error(true);
-          return map_read_error(n);
+          return n;
         }
 
         for (uint32_t idx : completed) {
@@ -1646,7 +1640,7 @@ int DiskAnnIndexer::cached_beam_search_by_group(DiskAnnContext *ctx) {
           LOG_ERROR("cached_beam_search_by_group: reader_->read failed, ret=%d",
                     read_ret);
           ctx->set_error(true);
-          return map_read_error(read_ret);
+          return read_ret;
         }
       }
 

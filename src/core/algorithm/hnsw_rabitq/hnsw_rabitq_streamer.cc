@@ -773,7 +773,7 @@ int HnswRabitqStreamer::search_impl(
       LOG_ERROR("Hnsw searcher fast search failed");
       return ret;
     }
-    ctx->topk_to_result(q);
+    if (const int status = ctx->topk_to_result(q); status != 0) return status;
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
 
@@ -874,7 +874,7 @@ int HnswRabitqStreamer::search_bf_impl(
           topk_heap.emplace(id, dist);
         }
       }
-      ctx->topk_to_result(q);
+      if (const int status = ctx->topk_to_result(q); status != 0) return status;
       query = static_cast<const char *>(query) + qmeta.element_size();
     }
   } else {
@@ -897,7 +897,7 @@ int HnswRabitqStreamer::search_bf_impl(
           ctx->topk_heap().emplace(id, dist);
         }
       }
-      ctx->topk_to_result(q);
+      if (const int status = ctx->topk_to_result(q); status != 0) return status;
       query = static_cast<const char *>(query) + qmeta.element_size();
     }
   }
@@ -977,7 +977,7 @@ int HnswRabitqStreamer::search_bf_by_p_keys_impl(
           }
         }
       }
-      ctx->topk_to_result(q);
+      if (const int status = ctx->topk_to_result(q); status != 0) return status;
       query = static_cast<const char *>(query) + qmeta.element_size();
     }
   } else {
@@ -1001,7 +1001,7 @@ int HnswRabitqStreamer::search_bf_by_p_keys_impl(
           }
         }
       }
-      ctx->topk_to_result(q);
+      if (const int status = ctx->topk_to_result(q); status != 0) return status;
       query = static_cast<const char *>(query) + qmeta.element_size();
     }
   }

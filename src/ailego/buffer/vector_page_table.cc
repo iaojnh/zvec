@@ -30,10 +30,6 @@
 #include <zvec/ailego/parallel/worker_memory.h>
 #include <zvec/ailego/utility/file_helper.h>
 
-#if defined(__APPLE__)
-#include <aio.h>
-#endif
-
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <ailego/io/io_backend_def.h>
 #include <ailego/io/iouring_loader.h>
@@ -1190,6 +1186,7 @@ int VecBufferPool::init() {
       page_table_.set_flush_callback(
           [this, fd, &fn = file_name_](block_id_t /*block_id*/, char *buf,
                                        size_t sz, size_t off) -> int {
+            std::shared_lock lock(eviction_writeback_mutex_);
             if (writeback_quarantined()) return -1;
             ssize_t w = zvec_pwrite(fd, buf, sz, off);
             if (w != static_cast<ssize_t>(sz)) {
@@ -1306,7 +1303,10 @@ int VecBufferPool::init() {
       auto ring = std::make_unique<IoUringRing>();
       const size_t io_staging_charge = kBlockingAioBatchSize * kVectorPageSize;
       if (ring->setup(kBlockingAioBatchSize) &&
-          pool.try_charge_metadata_without_reclaim(io_staging_charge)) {
+          pool.try_charge_metadata_without_reclaim(io_staging_charge +
+                                                   kVectorPageSize)) {
+        // An optional writeback ring must leave room for the first data page.
+        pool.release_metadata(kVectorPageSize);
         ring->adopt_staging_reservation(io_staging_charge);
         writeback_io_staging_charge_ = io_staging_charge;
         writeback_io_uring_ = std::move(ring);
@@ -1406,10 +1406,17 @@ void VecBufferPool::stop_writeback() {
   worker.join();
 }
 
+void VecBufferPool::mark_writeback_quarantined() {
+  // Batch writeback can wait for eviction to finish, so an evictor takes
+  // only the inner gate. Quarantine waits for any already started pwrite.
+  std::unique_lock lock(eviction_writeback_mutex_);
+  writeback_error_.store(kWritebackQuarantined, std::memory_order_release);
+}
+
 void VecBufferPool::quarantine_writeback() {
   {
     std::lock_guard<std::mutex> lock(writeback_flush_mutex_);
-    writeback_error_.store(kWritebackQuarantined, std::memory_order_release);
+    mark_writeback_quarantined();
   }
   stop_writeback();
 }
@@ -1485,6 +1492,34 @@ void VecBufferPool::writeback_loop() {
   }
 }
 
+bool VecBufferPool::pin_dirty_writeback_page(block_id_t page_id, bool wait,
+                                             char *&buffer) {
+  buffer = nullptr;
+  while (page_table_.is_block_dirty(page_id)) {
+    buffer = page_table_.acquire_block(page_id, /*record_reuse=*/false);
+    if (buffer != nullptr || !wait) return true;
+
+    // Synchronous eviction owns the page until its write finishes. If that
+    // write fails, eviction leaves a dirty resident page for this flush to
+    // retry. The caller holds no page latch while joining the transition.
+    if (!page_table_.has_residency_activity(page_id) ||
+        !page_table_.wait_for_block_transition(page_id))
+      break;
+  }
+  // A successful eviction clears dirty before publishing the unloaded state.
+  if (!page_table_.is_block_dirty(page_id)) return true;
+
+  writeback_failures_.fetch_add(1, std::memory_order_relaxed);
+  int expected = 0;
+  (void)writeback_error_.compare_exchange_strong(
+      expected, EIO, std::memory_order_release, std::memory_order_relaxed);
+  LOG_ERROR(
+      "VecBufferPool could not pin dirty page for writeback: file[%s], "
+      "page[%zu]",
+      file_name_.c_str(), static_cast<size_t>(page_id));
+  return false;
+}
+
 bool VecBufferPool::flush_writeback_batch(const block_id_t *page_ids,
                                           size_t count, char *staging) {
   if (writeback_quarantined()) return false;
@@ -1525,9 +1560,11 @@ bool VecBufferPool::flush_writeback_batch(const block_id_t *page_ids,
           break;
         }
 
-        char *buffer = page_table_.acquire_block(page_id,
-                                                 /*record_reuse=*/false);
+        char *buffer = nullptr;
+        if (!pin_dirty_writeback_page(page_id, selected == 0, buffer))
+          all_ok = false;
         if (buffer == nullptr) {
+          if (selected != 0 && page_table_.is_block_dirty(page_id)) break;
           ++pos;
           continue;
         }
@@ -1568,9 +1605,15 @@ bool VecBufferPool::flush_writeback_batch(const block_id_t *page_ids,
       const int result =
           writeback_io_uring_->execute_writes(fd_, requests.data(), selected);
       if (result == IoUringRing::kQuarantined) {
-        writeback_error_.store(kWritebackQuarantined,
-                               std::memory_order_release);
+        mark_writeback_quarantined();
         writeback_failures_.fetch_add(selected, std::memory_order_relaxed);
+        {
+          std::lock_guard<std::mutex> lock(writeback_mutex_);
+          writeback_stopping_ = true;
+        }
+        // The worker can report this failure itself. Signal it to exit and
+        // leave the join to the pool owner.
+        writeback_cv_.notify_all();
         return false;
       }
       const bool aio_ok = result == 0;
@@ -1639,11 +1682,9 @@ bool VecBufferPool::flush_writeback_batch(const block_id_t *page_ids,
     while (pos + run_count < count && run_count < run_limit &&
            page_ids[pos + run_count] == run_start + run_count) {
       const block_id_t page_id = page_ids[pos + run_count];
-      if (!page_table_.is_block_dirty(page_id)) {
-        break;
-      }
-      char *buffer = page_table_.acquire_block(page_id,
-                                               /*record_reuse=*/false);
+      char *buffer = nullptr;
+      if (!pin_dirty_writeback_page(page_id, run_count == 0, buffer))
+        all_ok = false;
       if (buffer == nullptr) {
         break;
       }
@@ -2165,59 +2206,8 @@ bool VecBufferPool::read_ranges_bypass(const ReadRange *ranges, size_t count) {
         (range.length != 0 && !range.buffer))
       return false;
   }
-#if defined(__linux__) && !defined(__ANDROID__)
-  if (!writable_ && read_ranges_bypass_aio(ranges, count)) return true;
-#elif defined(__APPLE__)
-  if (!writable_) {
-    // Read only requested fragments, without admitting a cold page or adding
-    // another staging allocation. The caller owns and budgets destinations.
-    static constexpr size_t kBatchSize = 16;
-    for (size_t begin = 0; begin < count; begin += kBatchSize) {
-      const size_t batch = std::min(kBatchSize, count - begin);
-      std::array<struct aiocb, kBatchSize> requests{};
-      std::array<bool, kBatchSize> accepted{};
-      std::array<bool, kBatchSize> completed{};
-      for (size_t i = 0; i < batch; ++i) {
-        const auto &range = ranges[begin + i];
-        if (range.length == 0) {
-          completed[i] = true;
-          continue;
-        }
-        auto &request = requests[i];
-        request.aio_fildes = fd_;
-        request.aio_offset = static_cast<off_t>(range.offset);
-        request.aio_buf = range.buffer;
-        request.aio_nbytes = range.length;
-        request.aio_sigevent.sigev_notify = SIGEV_NONE;
-        if (::aio_read(&request) != 0) break;
-        accepted[i] = true;
-      }
-      // Drain the entire accepted batch before fallback or an early return:
-      // failed reads must not leave the kernel using stack control blocks or
-      // destinations whose owners are about to release them.
-      for (size_t i = 0; i < batch; ++i) {
-        if (!accepted[i]) continue;
-        const struct aiocb *pending = &requests[i];
-        int status;
-        while ((status = ::aio_error(pending)) == EINPROGRESS) {
-          if (::aio_suspend(&pending, 1, nullptr) != 0 && errno != EINTR)
-            std::this_thread::yield();
-        }
-        const ssize_t bytes = ::aio_return(&requests[i]);
-        completed[i] = status == 0 &&
-                       bytes == static_cast<ssize_t>(ranges[begin + i].length);
-        if (completed[i]) record_bypass_read(ranges[begin + i].length);
-      }
-      for (size_t i = 0; i < batch; ++i) {
-        const auto &range = ranges[begin + i];
-        if (!completed[i] &&
-            !read_range_bypass(range.offset, range.length, range.buffer))
-          return false;
-      }
-    }
-    return true;
-  }
-#endif
+  // Demand bypass must return with caller buffers free to reuse. Native
+  // batches remain available when populating cache pages owned by the pool.
   for (size_t i = 0; i < count; ++i) {
     const auto &range = ranges[i];
     if (!read_range_bypass(range.offset, range.length, range.buffer))
@@ -2515,15 +2505,19 @@ int VecBufferPool::flush_all() {
 }
 
 bool VecBufferPool::extend_file(size_t new_size) {
+  return extend_file_status(new_size) == PageWriteStatus::kOk;
+}
+
+PageWriteStatus VecBufferPool::extend_file_status(size_t new_size) {
   std::lock_guard lock(extend_mutex_);
-  if (writeback_quarantined()) return false;
+  if (writeback_quarantined()) return PageWriteStatus::kError;
   if (!writable_) {
     LOG_ERROR("extend_file called on read-only pool: file[%s]",
               file_name_.c_str());
-    return false;
+    return PageWriteStatus::kError;
   }
   if (new_size <= file_size()) {
-    return true;
+    return PageWriteStatus::kOk;
   }
   // O_DIRECT requires page-aligned backing-file growth.
   if (new_size % kVectorPageSize != 0) {
@@ -2531,7 +2525,7 @@ bool VecBufferPool::extend_file(size_t new_size) {
         "extend_file target must be page-aligned: file[%s], new_size[%zu], "
         "page_size[%zu]",
         file_name_.c_str(), new_size, kVectorPageSize);
-    return false;
+    return PageWriteStatus::kError;
   }
   // Validate page-table capacity before changing the file.
   const size_t new_entry_num = (new_size - 1) / kVectorPageSize + 1;
@@ -2541,7 +2535,7 @@ bool VecBufferPool::extend_file(size_t new_size) {
         "exceeding VectorPageTable::kMaxEntries=%zu (file=%s).",
         new_size, new_entry_num, VectorPageTable::kMaxEntries,
         file_name_.c_str());
-    return false;
+    return PageWriteStatus::kError;
   }
   const size_t old_entry_num = page_table_.entry_num();
   if (new_entry_num > old_entry_num && !page_table_.extend(new_entry_num)) {
@@ -2549,7 +2543,7 @@ bool VecBufferPool::extend_file(size_t new_size) {
         "extend_file: page_table_.extend(%zu) failed before resizing "
         "file=%s to %zu bytes",
         new_entry_num, file_name_.c_str(), new_size);
-    return false;
+    return initialized_ ? PageWriteStatus::kNoMemory : PageWriteStatus::kError;
   }
 
 #if defined(_MSC_VER)
@@ -2559,8 +2553,9 @@ bool VecBufferPool::extend_file(size_t new_size) {
     if (!page_table_.rollback_extend(old_entry_num)) {
       LOG_ERROR("extend_file: failed to roll back page table for file[%s]",
                 file_name_.c_str());
+      quarantine_writeback();
     }
-    return false;
+    return PageWriteStatus::kError;
   }
 #else
   if (::ftruncate(fd_, static_cast<off_t>(new_size)) != 0) {
@@ -2569,12 +2564,13 @@ bool VecBufferPool::extend_file(size_t new_size) {
     if (!page_table_.rollback_extend(old_entry_num)) {
       LOG_ERROR("extend_file: failed to roll back page table for file[%s]",
                 file_name_.c_str());
+      quarantine_writeback();
     }
-    return false;
+    return PageWriteStatus::kError;
   }
 #endif
   file_size_.store(new_size, std::memory_order_release);
-  return true;
+  return PageWriteStatus::kOk;
 }
 
 char *VecBufferPoolHandle::get_single_page(size_t file_offset, size_t len,
@@ -3274,109 +3270,6 @@ bool drain_blocking_aio(const iocb *requests, char **buffers, size_t count,
 }  // namespace
 #endif
 
-bool VecBufferPool::read_ranges_bypass_aio(const ReadRange *ranges,
-                                           size_t count) {
-#if defined(__linux__) && !defined(__ANDROID__)
-  if (!aio_enabled_ || count < 2) return false;
-  // BufferStorage supplies aligned cold-page ranges. Other callers retain
-  // the scalar path, including partial reads at EOF and unaligned fragments.
-  for (size_t i = 0; i < count; ++i) {
-    if (ranges[i].length == 0 || ranges[i].length > kVectorPageSize ||
-        ranges[i].offset % 512 != 0 || ranges[i].length % 512 != 0)
-      return false;
-  }
-  bool use_io_uring = io_backend_type_ == IOBackendType::kIoUring &&
-                      tl_blocking_io_uring.ensure();
-  if (!use_io_uring && !tl_blocking_aio.ensure()) return false;
-
-  static constexpr size_t kBatchSize = 16;
-  for (size_t begin = 0; begin < count; begin += kBatchSize) {
-    const size_t batch = std::min(kBatchSize, count - begin);
-    if (use_io_uring) {
-      std::array<IoUringRead, kBatchSize> requests{};
-      for (size_t i = 0; i < batch; ++i) {
-        const auto &range = ranges[begin + i];
-        requests[i] =
-            IoUringRead(range.offset, range.length, range.buffer, range.length);
-      }
-      if (tl_blocking_io_uring.ring.execute(fd_, requests.data(), batch) == 0) {
-        aio_pages_submitted_.fetch_add(batch, std::memory_order_relaxed);
-        for (size_t i = 0; i < batch; ++i)
-          record_bypass_read(ranges[begin + i].length);
-        continue;
-      }
-      // execute() never gives caller memory to the kernel. A drained ring
-      // failure can therefore safely fall back to the libaio staging below.
-      if (!tl_blocking_aio.ensure()) return false;
-      use_io_uring = false;
-    }
-
-    auto &pool = MemoryLimitPool::get_instance();
-    std::array<char *, kBatchSize> buffers{};
-    AILEGO_DEFER([&] {
-      for (char *buffer : buffers) {
-        if (buffer) pool.release_buffer(buffer, kVectorPageSize);
-      }
-    });
-    size_t allocated =
-        pool.batch_acquire_buffers(kVectorPageSize, buffers.data(), batch);
-    if (allocated < batch) {
-      const size_t shortage = batch - allocated;
-      BlockEvictionQueue::get_instance().batch_recycle(shortage);
-      allocated += pool.batch_acquire_buffers(
-          kVectorPageSize, buffers.data() + allocated, shortage);
-    }
-    if (allocated != batch) return false;
-
-    std::array<struct iocb, kBatchSize> requests{};
-    std::array<struct iocb *, kBatchSize> pointers{};
-    for (size_t i = 0; i < batch; ++i) {
-      const auto &range = ranges[begin + i];
-      io_prep_pread(&requests[i], fd_, buffers[i], range.length,
-                    static_cast<long long>(range.offset));
-      requests[i].data = reinterpret_cast<void *>(i);
-      pointers[i] = &requests[i];
-    }
-    int submitted;
-    do {
-      submitted = LibAioLoader::Instance().io_submit(
-          tl_blocking_aio.ctx, static_cast<long>(batch), pointers.data());
-    } while (submitted == -EINTR);
-    if (submitted <= 0) return false;
-    if (static_cast<size_t>(submitted) > batch) {
-      retire_blocking_aio(buffers.data(), batch);
-      return false;
-    }
-    const size_t accepted = static_cast<size_t>(submitted);
-    aio_pages_submitted_.fetch_add(accepted, std::memory_order_relaxed);
-
-    std::array<struct io_event, kBatchSize> events{};
-    if (!drain_blocking_aio(requests.data(), buffers.data(), accepted,
-                            events.data()) ||
-        accepted != batch)
-      return false;
-    for (size_t i = 0; i < batch; ++i) {
-      const auto &event = events[i];
-      const auto index = reinterpret_cast<uintptr_t>(event.data);
-      if (event.res2 != 0 ||
-          static_cast<ssize_t>(event.res) !=
-              static_cast<ssize_t>(ranges[begin + index].length))
-        return false;
-    }
-    for (size_t i = 0; i < batch; ++i) {
-      const auto &range = ranges[begin + i];
-      std::memcpy(range.buffer, buffers[i], range.length);
-      record_bypass_read(range.length);
-    }
-  }
-  return true;
-#else
-  (void)ranges;
-  (void)count;
-  return false;
-#endif
-}
-
 void VecBufferPool::prefetch_pages_aio(block_id_t first_page, size_t page_count,
                                        uint8_t priority) {
   const size_t total_pages = page_table_.entry_num();
@@ -3405,99 +3298,7 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
   if (count == 0) return true;
   if (page_ids == nullptr || priority > kHighPriority) return false;
 
-#if defined(__APPLE__)
-  // Darwin has no Linux AIO backend, but resolving a batch with scalar pread
-  // serializes every random miss. Use the native bounded AIO queue directly
-  // into charged cache pages; no extra read staging or worker pool is needed.
-  static constexpr size_t kDarwinReadBatch = 16;
-  for (size_t i = 0; i < count; ++i) {
-    if (page_ids[i] >= page_table_.entry_num()) return false;
-  }
-  for (size_t begin = 0; begin < count; begin += kDarwinReadBatch) {
-    std::array<block_id_t, kDarwinReadBatch> load_pages{};
-    size_t load_count = 0;
-    const size_t end = std::min(count, begin + kDarwinReadBatch);
-    for (size_t i = begin; i < end; ++i) {
-      const block_id_t pid = page_ids[i];
-      const auto claim = page_table_.try_claim_block_load(pid);
-      if (claim == VectorPageTable::LoadClaimResult::kClaimed) {
-        load_pages[load_count++] = pid;
-      } else {
-        page_table_.promote_evict_priority(pid, priority);
-        if (claim == VectorPageTable::LoadClaimResult::kLoading)
-          singleflight_waits_.fetch_add(1, std::memory_order_relaxed);
-      }
-    }
-    if (load_count == 0) continue;
-
-    auto &pool = MemoryLimitPool::get_instance();
-    std::array<char *, kDarwinReadBatch> buffers{};
-    size_t allocated =
-        pool.batch_acquire_buffers(kVectorPageSize, buffers.data(), load_count);
-    while (allocated < load_count) {
-      const size_t shortage = load_count - allocated;
-      if (BlockEvictionQueue::get_instance().batch_recycle(shortage) == 0)
-        break;
-      const size_t acquired = pool.batch_acquire_buffers(
-          kVectorPageSize, buffers.data() + allocated, shortage);
-      allocated += acquired;
-      if (acquired == 0) break;
-    }
-    for (size_t i = allocated; i < load_count; ++i)
-      page_table_.cancel_block_load(load_pages[i]);
-    bool batch_ok = allocated == load_count;
-    std::array<struct aiocb, kDarwinReadBatch> requests{};
-    size_t submitted = 0;
-    for (; submitted < allocated; ++submitted) {
-      auto &request = requests[submitted];
-      request.aio_fildes = fd_;
-      request.aio_offset =
-          static_cast<off_t>(load_pages[submitted] * kVectorPageSize);
-      request.aio_buf = buffers[submitted];
-      request.aio_nbytes = kVectorPageSize;
-      request.aio_sigevent.sigev_notify = SIGEV_NONE;
-      if (::aio_read(&request) != 0) break;
-    }
-    aio_pages_submitted_.fetch_add(submitted, std::memory_order_relaxed);
-    // Even partial submission must drain every accepted request before its
-    // control block or destination can be released or reused by the fallback.
-    std::array<bool, kDarwinReadBatch> read_ok{};
-    for (size_t i = 0; i < submitted; ++i) {
-      const size_t offset = load_pages[i] * kVectorPageSize;
-      const size_t expected = std::min(kVectorPageSize, file_size() - offset);
-      const struct aiocb *pending = &requests[i];
-      int status;
-      while ((status = ::aio_error(pending)) == EINPROGRESS) {
-        if (::aio_suspend(&pending, 1, nullptr) != 0 && errno != EINTR)
-          std::this_thread::yield();
-      }
-      const ssize_t bytes = ::aio_return(&requests[i]);
-      read_ok[i] = status == 0 && bytes == static_cast<ssize_t>(expected);
-    }
-    for (size_t i = 0; i < allocated; ++i) {
-      const size_t offset = load_pages[i] * kVectorPageSize;
-      const size_t expected = std::min(kVectorPageSize, file_size() - offset);
-      if (!read_ok[i]) {
-        pool.release_buffer(buffers[i], kVectorPageSize);
-        page_table_.cancel_block_load(load_pages[i]);
-        batch_ok = false;
-        continue;
-      }
-      if (expected < kVectorPageSize)
-        std::memset(buffers[i] + expected, 0, kVectorPageSize - expected);
-      miss_count_.fetch_add(1, std::memory_order_relaxed);
-      page_table_.promote_evict_priority(load_pages[i], priority);
-      if (page_table_.publish_claimed_block(load_pages[i], buffers[i],
-                                            offset)) {
-        page_table_.release_block(load_pages[i]);
-      } else {
-        batch_ok = false;
-      }
-    }
-    if (!batch_ok) return false;
-  }
-  return true;
-#elif defined(__linux__) && !defined(__ANDROID__)
+#if defined(__linux__) && !defined(__ANDROID__)
   if (!aio_enabled_) return false;
   bool use_io_uring = io_backend_type_ == IOBackendType::kIoUring &&
                       tl_blocking_io_uring.ensure();

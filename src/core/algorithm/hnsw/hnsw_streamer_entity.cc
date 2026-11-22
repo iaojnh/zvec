@@ -16,6 +16,7 @@
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/mman.h>
 #endif
+#include <optional>
 #include <ailego/utility/memory_helper.h>
 #include "utility/legacy_read_buffer.h"
 
@@ -35,6 +36,7 @@ struct HnswStreamerEntity::InsertUndo {
   ailego::BudgetedVector<Write> writes;
   ailego::BudgetedVector<std::pair<Chunk *, size_t>> sizes;
   node_id_t overwritten_id{kInvalidNodeId};
+  std::optional<size_t> overwritten_key_write;
   node_id_t entry_point{kInvalidNodeId};
   level_t max_level{0};
 
@@ -138,6 +140,10 @@ int HnswStreamerEntity::insert_buffered(
     if (!undo.rollback()) {
       LOG_ERROR("Failed to restore HNSW graph after insert error %d", ret);
       buffered_graph_->error = IndexError_WriteData;
+      // A failed size restore may leave staged bytes in the storage pool.
+      if (auto pool = broker_->storage()->vec_buffer_pool()) {
+        pool->quarantine_writeback();
+      }
       return IndexError_WriteData;
     }
     return ret;
@@ -411,7 +417,7 @@ const Neighbors HnswStreamerEntity::get_neighbors(level_t level,
       size_t size = chunk->read(offset, neighbor_block, neighbor_size);
       if (ailego_unlikely(size != neighbor_size)) {
         LOG_ERROR("Read neighbor header failed, ret=%zu", size);
-        return Neighbors();
+        return Neighbors(chunk->read_error());
       }
       return Neighbors(std::move(neighbor_block));
     }
@@ -433,7 +439,7 @@ const Neighbors HnswStreamerEntity::get_neighbors(level_t level,
       size_t size = chunk->read(offset, neighbor_block, neighbor_size);
       if (ailego_unlikely(size != neighbor_size)) {
         LOG_ERROR("Read neighbor header failed, ret=%zu", size);
-        return Neighbors();
+        return Neighbors(chunk->read_error());
       }
       return Neighbors(std::move(neighbor_block));
     }
@@ -476,10 +482,10 @@ int HnswStreamerEntity::get_vector_snapshot(
     node_id_t id, IndexStorage::MemoryBlock &block) const try {
   if (!buffered_graph_) return get_vector(id, block);
   block.reset();
-  if (auto *undo = insert_undo();
-      undo && id == undo->overwritten_id && !undo->writes.empty()) {
-    // The overwrite captures the previous vector before changing the record.
-    const auto &previous = undo->writes.front().bytes;
+  if (auto *undo = insert_undo(); undo && id == undo->overwritten_id &&
+                                  undo->overwritten_key_write &&
+                                  vector_size() != 0) {
+    const auto &previous = undo->writes[*undo->overwritten_key_write - 1].bytes;
     block = IndexStorage::MemoryBlock::AllocateOwned(previous.size());
     std::memcpy(block.data_, previous.data(), previous.size());
     return 0;
@@ -625,6 +631,18 @@ key_t HnswStreamerEntity::get_key(node_id_t id) const {
   } else {
     return id;
   }
+}
+
+key_t HnswStreamerEntity::get_key_snapshot(node_id_t id) const {
+  if (auto *undo = insert_undo(); use_key_info_map_ && undo &&
+                                  id == undo->overwritten_id &&
+                                  undo->overwritten_key_write) {
+    key_t key;
+    const auto &previous = undo->writes[*undo->overwritten_key_write].bytes;
+    std::memcpy(&key, previous.data(), sizeof(key));
+    return key;
+  }
+  return get_key(id);
 }
 
 int HnswStreamerEntity::add_neighbor(level_t level, node_id_t id, uint32_t size,
@@ -926,7 +944,7 @@ int HnswStreamerEntity::check_hnsw_index(const HNSWHeader *hd) const {
 
 int HnswStreamerEntity::write_node_data(Chunk &chunk, size_t offset,
                                         const void *vec, key_t key) {
-  if (insert_undo()) {
+  if (auto *undo = insert_undo()) {
     const bool append = offset >= chunk.data_size();
     const uint32_t zero = 0;
     const IndexStorage::SegmentData writes[] = {
@@ -937,15 +955,29 @@ int HnswStreamerEntity::write_node_data(Chunk &chunk, size_t offset,
     const size_t count = append ? 3 : 2;
     const size_t page_offset =
         (chunk.data_offset() + offset) % ailego::kVectorPageSize;
-    if (vector_size() <= ailego::kVectorPageSize - page_offset) {
-      return write_with_undo(chunk, writes, count);
+    const bool stream_vector =
+        vector_size() > ailego::kVectorPageSize - page_offset;
+    const size_t first_write = undo->writes.size();
+    const int ret =
+        capture_write_undo(chunk, writes, count, nullptr, stream_vector);
+    if (ret != 0) return ret;
+    if (undo->overwritten_id != kInvalidNodeId) {
+      const size_t key_write = first_write + (vector_size() != 0);
+      if (key_write >= undo->writes.size() ||
+          undo->writes[key_write].offset != writes[1].offset ||
+          undo->writes[key_write].bytes.size() != sizeof(key) ||
+          (vector_size() != 0 &&
+           undo->writes[first_write].bytes.size() != vector_size())) {
+        return IndexError_ReadData;
+      }
+      // A reentrant provider read can now reconstruct the committed record.
+      undo->overwritten_key_write = key_write;
+    }
+    if (!stream_vector) {
+      return chunk.write_batch(writes, count) ? 0 : chunk.write_error();
     }
 
     // A cross-page vector can be streamed with one cache pin at a time.
-    // Capture the original record first and keep the key and count ordered.
-    const int ret = capture_write_undo(chunk, writes, count, nullptr,
-                                       /*streamed_vector=*/true);
-    if (ret != 0) return ret;
     if (chunk.write(offset, vec, vector_size()) != vector_size()) {
       return chunk.write_error();
     }

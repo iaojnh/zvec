@@ -97,16 +97,16 @@ class FlatStreamerEntity {
                                     FlatSearchScratch *scratch) const;
 
   //! Search in a block
-  void search_block(const void *query, const BlockLocation &bl,
-                    const BlockHeader *hd, float norm_val,
-                    IndexDocumentHeap *heap) const;
+  int search_block(const void *query, const BlockLocation &bl,
+                   const BlockHeader *hd, float norm_val,
+                   IndexDocumentHeap *heap) const;
 
   //! Search in a block with filter
-  void search_block(const void *query, const BlockLocation &bl,
-                    const BlockHeader *hd, float norm_val,
-                    const IndexFilter &filter, const DeletionMap *deletion_map,
-                    IndexDocumentHeap *heap,
-                    IndexContext::Stats *context_stats) const;
+  int search_block(const void *query, const BlockLocation &bl,
+                   const BlockHeader *hd, float norm_val,
+                   const IndexFilter &filter, const DeletionMap *deletion_map,
+                   IndexDocumentHeap *heap,
+                   IndexContext::Stats *context_stats) const;
 
   //! Flat Search with filter
   int search_bf(const void *query, const IndexFilter &filter,
@@ -489,7 +489,7 @@ class FlatStreamerEntity {
                        IndexStorage::MemoryBlock &header_block) const {
     // The header is located in the end of a block to align features
     auto segment = this->get_segment(block.segment_id);
-    ailego_assert_with(segment != nullptr, "Index Overflow");
+    if (!segment) return IndexError_ReadData;
     size_t off = this->get_block_header_offset(block.block_index);
     if (segment->read(off, header_block, sizeof(BlockHeader)) !=
         sizeof(BlockHeader)) {
@@ -502,12 +502,12 @@ class FlatStreamerEntity {
       const BlockLocation &block,
       IndexStorage::MemoryBlock &deletion_map_block) const {
     auto segment = this->get_segment(block.segment_id);
-    ailego_assert_with(segment != nullptr, "Index Overflow");
+    if (!segment) return IndexError_ReadData;
     size_t off = this->get_block_deletion_map_offset(block.block_index);
     if (segment->read(off, deletion_map_block, sizeof(DeletionMap)) !=
         sizeof(DeletionMap)) {
       LOG_ERROR("Failed to read deletion map, off=%zu", off);
-      return -1;
+      return segment->read_error();
     }
     return 0;
   }
@@ -515,13 +515,13 @@ class FlatStreamerEntity {
   int get_block_keys(const BlockLocation &block,
                      IndexStorage::MemoryBlock &keys_block) const {
     auto segment = this->get_segment(block.segment_id);
-    ailego_assert_with(segment != nullptr, "Index Overflow");
+    if (!segment) return IndexError_ReadData;
     size_t off = this->get_block_key_offset(block.block_index, 0);
     if (segment->read(off, keys_block,
                       block_vector_count() * sizeof(uint64_t)) !=
         block_vector_count() * sizeof(uint64_t)) {
-      LOG_ERROR("Failed to read block header, off=%zu", off);
-      return -1;
+      LOG_ERROR("Failed to read block keys, off=%zu", off);
+      return segment->read_error();
     }
     return 0;
   }
@@ -529,13 +529,13 @@ class FlatStreamerEntity {
   int get_block_vectors(const BlockLocation &block,
                         IndexStorage::MemoryBlock &vector_block) const {
     auto segment = this->get_segment(block.segment_id);
-    ailego_assert_with(segment != nullptr, "Index Overflow");
+    if (!segment) return IndexError_ReadData;
     size_t off = this->get_block_vector_offset(block.block_index, 0);
     if (segment->read(off, vector_block,
                       block_vector_count() * index_meta_.element_size()) !=
         block_vector_count() * index_meta_.element_size()) {
-      LOG_ERROR("Failed to read block header, off=%zu", off);
-      return -1;
+      LOG_ERROR("Failed to read block vectors, off=%zu", off);
+      return segment->read_error();
     }
     return 0;
   }

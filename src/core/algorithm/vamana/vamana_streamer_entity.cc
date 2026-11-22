@@ -132,7 +132,7 @@ const Neighbors VamanaStreamerEntity::get_neighbors(node_id_t id) const {
   size_t ret = loc.first->read(loc.second, mem_block, neighbor_size_);
   if (ailego_unlikely(ret != neighbor_size_)) {
     LOG_ERROR("Read neighbor header failed, ret=%zu", ret);
-    return Neighbors();
+    return Neighbors(loc.first->read_error());
   }
   return Neighbors(mem_block);
 }

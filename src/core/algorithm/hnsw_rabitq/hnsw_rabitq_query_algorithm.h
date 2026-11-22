@@ -84,23 +84,23 @@ class HnswRabitqQueryAlgorithm {
 
  private:
   //! Select in upper layer to get entry point for next layer search
-  void select_entry_point(level_t level, node_id_t *entry_point,
-                          EstimateRecord *dist, HnswRabitqContext *ctx,
-                          HnswRabitqQueryEntity *entity) const;
+  int select_entry_point(level_t level, node_id_t *entry_point,
+                         EstimateRecord *dist, HnswRabitqContext *ctx,
+                         HnswRabitqQueryEntity *entity) const;
 
 
   //! Given a node id and level, search the nearest neighbors in graph
   //! Note: the nearest neighbors result keeps in topk, and entry_point and
   //! dist will be updated to current level nearest node id and distance
-  void search_neighbors(level_t level, node_id_t *entry_point,
-                        EstimateRecord *dist, TopkHeap &topk,
-                        HnswRabitqContext *ctx,
-                        HnswRabitqQueryEntity *entity) const;
+  int search_neighbors(level_t level, node_id_t *entry_point,
+                       EstimateRecord *dist, TopkHeap &topk,
+                       HnswRabitqContext *ctx,
+                       HnswRabitqQueryEntity *entity) const;
 
 
   //! expand neighbors until group nums are reached
-  void expand_neighbors_by_group(TopkHeap &topk, HnswRabitqContext *ctx,
-                                 HnswRabitqQueryEntity *query_entity) const;
+  int expand_neighbors_by_group(TopkHeap &topk, HnswRabitqContext *ctx,
+                                HnswRabitqQueryEntity *query_entity) const;
 
   void get_full_est(const void *vector, EstimateRecord &res,
                     HnswRabitqQueryEntity &entity) const;

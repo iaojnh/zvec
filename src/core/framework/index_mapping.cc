@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cerrno>
+#include <cstdio>
+#include <filesystem>
+#include <random>
 #include <ailego/pattern/scope_guard.h>
 #include <zvec/ailego/io/mmap_file.h>
 #include <zvec/ailego/logger/logger.h>
@@ -22,11 +26,15 @@
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <Windows.h>
+#else
+#include <unistd.h>
 #endif
 
 #ifdef __linux__
 #include <sys/statfs.h>
+#include <sys/syscall.h>
 #include <sys/vfs.h>
+#include <fcntl.h>
 #ifndef HUGETLBFS_MAGIC
 #define HUGETLBFS_MAGIC 0x958458f6
 #endif
@@ -124,29 +132,113 @@ int IndexMapping::open_mapping(const std::string &path, bool cow,
   return IndexError_NoMemory;
 }
 
-int IndexMapping::create(const std::string &path, size_t seg_meta_capacity) {
-  return create(path, seg_meta_capacity, false);
-}
-
-int IndexMapping::create(const std::string &path, size_t seg_meta_capacity,
-                         bool exclusive) try {
+int IndexMapping::create(const std::string &path,
+                         size_t seg_meta_capacity) try {
   close();
   path_ = path;
   seg_meta_capacity_ = seg_meta_capacity;
   huge_page_ = ishugetlbfs(path);
   bool ready = false;
   const auto rollback = ailego::ScopeGuard::Make([&] {
-    if (ready) return;
-    const bool remove = exclusive && file_.is_valid();
-    close();
-    if (remove && !ailego::File::Delete(path))
-      LOG_ERROR("Failed to remove incomplete index %s", path.c_str());
+    if (!ready) close();
   });
-  const int ret = init_meta_section(exclusive);
+  const int ret = init_meta_section();
   ready = ret == 0;
   return ret;
 } catch (const std::bad_alloc &) {
   return IndexError_NoMemory;
+}
+
+namespace fs = std::filesystem;
+
+static unsigned NativeFileError() {
+#if defined(_WIN32) || defined(_WIN64)
+  return static_cast<unsigned>(::GetLastError());
+#else
+  return static_cast<unsigned>(errno);
+#endif
+}
+
+enum class IndexPublication { kFailed, kMoved, kLinked };
+
+static IndexPublication PublishNewIndex(const fs::path &source,
+                                        const fs::path &target) {
+#if defined(_WIN32) || defined(_WIN64)
+  return ::MoveFileExW(source.c_str(), target.c_str(), 0)
+             ? IndexPublication::kMoved
+             : IndexPublication::kFailed;
+#else
+#if defined(__linux__) && defined(SYS_renameat2)
+  constexpr unsigned kNoReplace = 1;  // RENAME_NOREPLACE
+  if (::syscall(SYS_renameat2, AT_FDCWD, source.c_str(), AT_FDCWD,
+                target.c_str(), kNoReplace) == 0)
+    return IndexPublication::kMoved;
+  if (errno != ENOSYS && errno != EINVAL && errno != EOPNOTSUPP)
+    return IndexPublication::kFailed;
+#elif defined(__APPLE__)
+  if (::renamex_np(source.c_str(), target.c_str(), RENAME_EXCL) == 0)
+    return IndexPublication::kMoved;
+  if (errno != ENOTSUP) return IndexPublication::kFailed;
+#endif
+  // Linking is also atomic and fails when the destination already exists.
+  return ::link(source.c_str(), target.c_str()) == 0
+             ? IndexPublication::kLinked
+             : IndexPublication::kFailed;
+#endif
+}
+
+int IndexMapping::CreateExclusive(
+    const std::string &path, size_t seg_meta_capacity,
+    const std::function<int(IndexMapping &)> &init) try {
+  const auto target = fs::u8path(path);
+  std::random_device nonce;
+  const auto source =
+      target.parent_path() / (".zvec-index-" + std::to_string(nonce()) + "-" +
+                              std::to_string(nonce()));
+  if (source == target) return IndexError_CreateFile;
+
+  // The sibling inherits the same directory protections as the final file.
+  // Only the private staging name is eligible for rollback.
+  IndexMapping mapping;
+  mapping.path_ = source.u8string();
+  mapping.seg_meta_capacity_ = seg_meta_capacity;
+  mapping.huge_page_ = mapping.ishugetlbfs(mapping.path_);
+  if (!mapping.file_.create_exclusive(mapping.path_.c_str())) {
+    const auto error = NativeFileError();
+    LOG_ERROR("Failed to stage new index %s, error=%u", path.c_str(), error);
+    return IndexError_CreateFile;
+  }
+  auto publication = IndexPublication::kFailed;
+  const auto cleanup = ailego::ScopeGuard::Make([&] {
+    mapping.close();
+    if (publication == IndexPublication::kMoved) return;
+    std::error_code error;
+    fs::remove(source, error);
+    if (error)
+      LOG_ERROR("Failed to remove staging file for %s, error=%d", path.c_str(),
+                error.value());
+  });
+
+  int ret = mapping.init_meta_section();
+  if (ret != 0) return ret;
+  ret = init(mapping);
+  if (ret != 0) return ret;
+  mapping.refresh(0);
+  ret = mapping.flush();
+  if (ret != 0) return ret;
+  mapping.close();
+  publication = PublishNewIndex(source, target);
+  if (publication == IndexPublication::kFailed) {
+    const auto error = NativeFileError();
+    LOG_ERROR("Failed to publish new index %s, error=%u", path.c_str(), error);
+    return IndexError_CreateFile;
+  }
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const fs::filesystem_error &error) {
+  LOG_ERROR("Failed to stage new index %s: %s", path.c_str(), error.what());
+  return IndexError_CreateFile;
 }
 
 size_t IndexMapping::meta_mapping_length() const {
@@ -160,10 +252,6 @@ size_t IndexMapping::meta_mapping_length() const {
 }
 
 int IndexMapping::init_meta_section() {
-  return init_meta_section(false);
-}
-
-int IndexMapping::init_meta_section(bool exclusive) {
   const size_t page_size = huge_page_ ? ailego::MemoryHelper::HugePageSize()
                                       : ailego::MemoryHelper::PageSize();
   if (current_header_start_offset_ % page_size != 0)
@@ -185,8 +273,7 @@ int IndexMapping::init_meta_section(bool exclusive) {
                   MetaMapping{nullptr, len, charge});
   auto pending_node = pending.extract(pending.begin());
 
-  if (!file_.is_valid() && !(exclusive ? file_.create_exclusive(path_.c_str())
-                                       : file_.create(path_.c_str(), 0))) {
+  if (!file_.is_valid() && !file_.create(path_.c_str(), 0)) {
     LOG_ERROR("Failed to create file %s, %s", path_.c_str(),
               ailego::FileHelper::GetLastErrorString().c_str());
     return IndexError_CreateFile;

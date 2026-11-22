@@ -16,7 +16,6 @@
 #include <atomic>
 #include <mutex>
 #include <shared_mutex>
-#include <ailego/pattern/scope_guard.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_mapping.h>
@@ -225,6 +224,8 @@ class MMapFileStorage : public IndexStorage {
         return error_code;
       }
     }
+    // Publication completes creation. Open captures the generation at path
+    // when its backing handle is acquired, including a later replacement.
     auto next =
         std::allocate_shared<OpenFile>(ailego::BudgetedAllocator<OpenFile>{});
     const int ret = next->mapping.open(path, copy_on_write_, force_flush_);
@@ -299,7 +300,7 @@ class MMapFileStorage : public IndexStorage {
 
  protected:
   //! Initialize index version segment
-  int init_version_segment(IndexMapping &mapping) {
+  static int init_version_segment(IndexMapping &mapping) {
     size_t data_size = std::strlen(IndexVersion::Details());
     int error_code = mapping.append(INDEX_VERSION_SEGMENT_NAME, data_size);
     if (error_code != 0) {
@@ -322,22 +323,8 @@ class MMapFileStorage : public IndexStorage {
 
   //! Initialize index file
   int init_index(const std::string &path) {
-    IndexMapping mapping;
-    int ret = mapping.create(path, segment_meta_capacity_, /*exclusive=*/true);
-    if (ret != 0) return ret;
-
-    bool ready = false;
-    const auto cleanup = ailego::ScopeGuard::Make([&] {
-      mapping.close();
-      if (!ready && !ailego::File::Delete(path))
-        LOG_ERROR("Failed to remove incomplete index %s", path.c_str());
-    });
-    ret = init_version_segment(mapping);
-    if (ret != 0) return ret;
-    mapping.refresh(0);
-    ret = mapping.flush();
-    ready = ret == 0;
-    return ret;
+    return IndexMapping::CreateExclusive(path, segment_meta_capacity_,
+                                         init_version_segment);
   }
 
   bool is_huge_page() const override {

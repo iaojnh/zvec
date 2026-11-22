@@ -49,15 +49,18 @@ int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
   level_t cur_level = cur_max_level;
   dist_t dist = ctx->batch_dist(entry_point);
   if (ailego_unlikely(ctx->error())) return ctx->dist_calculator().error_code();
+  // Without a graph transaction the vector is already published. Build with
+  // the candidates found before a traversal read failed.
   for (; cur_level > level; --cur_level) {
-    select_entry_point(cur_level, &entry_point, &dist, ctx);
+    select_entry_point(cur_level, &entry_point, &dist, ctx,
+                       kTransactionalBuild);
     if (ailego_unlikely(ctx->error()))
       return ctx->dist_calculator().error_code();
   }
 
   for (; cur_level >= 0; --cur_level) {
     search_neighbors(cur_level, &entry_point, &dist, ctx->level_topk(cur_level),
-                     ctx);
+                     ctx, kTransactionalBuild);
     if (ailego_unlikely(ctx->error()))
       return ctx->dist_calculator().error_code();
   }
@@ -93,7 +96,8 @@ int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const {
   dist_t dist = ctx->dist_calculator().dist(entry_point);
   if (ailego_unlikely(ctx->error())) return ctx->dist_calculator().error_code();
   for (level_t cur_level = max_level; cur_level >= 1; --cur_level) {
-    select_entry_point(cur_level, &entry_point, &dist, ctx);
+    select_entry_point(cur_level, &entry_point, &dist, ctx,
+                       /*fail_on_read_error=*/true);
     if (ailego_unlikely(ctx->error()))
       return ctx->dist_calculator().error_code();
   }
@@ -105,7 +109,8 @@ int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const {
     if (ailego_unlikely(ret != 0)) return ret;
   } else {
     auto &topk = ctx->search_heap().reset<TopkHeap>(capacity);
-    search_neighbors(0, &entry_point, &dist, topk, ctx);
+    search_neighbors(0, &entry_point, &dist, topk, ctx,
+                     /*fail_on_read_error=*/true);
   }
 
   if (ailego_unlikely(ctx->error())) return ctx->dist_calculator().error_code();
@@ -117,10 +122,9 @@ int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const {
 }
 
 template <typename EntityType>
-void HnswAlgorithm<EntityType>::select_entry_point(level_t level,
-                                                   node_id_t *entry_point,
-                                                   dist_t *dist,
-                                                   HnswContext *ctx) const {
+void HnswAlgorithm<EntityType>::select_entry_point(
+    level_t level, node_id_t *entry_point, dist_t *dist, HnswContext *ctx,
+    bool fail_on_read_error) const {
   const auto &entity = static_cast<const EntityType &>(ctx->get_entity());
   HnswDistCalculator &dc = ctx->dist_calculator();
   const bool use_provider = dc.has_provider();
@@ -134,6 +138,10 @@ void HnswAlgorithm<EntityType>::select_entry_point(level_t level,
       std::lock_guard<std::mutex> node_lock(
           lock_pool_[*entry_point & kLockMask]);
       const auto neighbors = entity.get_neighbors_typed(level, *entry_point);
+      if (ailego_unlikely(neighbors.status != 0)) {
+        if (fail_on_read_error) dc.set_error(neighbors.status);
+        return;
+      }
       neighbor_ids.clear();
       if (neighbors.size() != 0) {
         neighbor_ids.assign(neighbors.data, neighbors.data + neighbors.size());
@@ -160,7 +168,7 @@ void HnswAlgorithm<EntityType>::select_entry_point(level_t level,
       (*ctx->mutable_stats_get_vector())++;
     }
     if (ailego_unlikely(ret != 0)) {
-      dc.set_error(ret);
+      if (fail_on_read_error) dc.set_error(ret);
       return;
     }
 
@@ -271,6 +279,10 @@ void fast_search_neighbors(const EntityType &entity, HeapType &pool,
     auto current_node = pool.pop();
 
     const auto neighbors = entity.get_neighbors_typed(0, current_node);
+    if (ailego_unlikely(neighbors.status != 0)) {
+      dc.set_error(neighbors.status);
+      return;
+    }
     ailego_prefetch(neighbors.data);
 
     if (neighbors.size() > buf_capacity) {
@@ -359,6 +371,10 @@ void fast_search_neighbors_buffer(const EntityType &entity, HeapType &pool,
   while (pool.has_next()) {
     const auto current_node = pool.pop();
     const auto neighbors = entity.get_neighbors_typed(0, current_node);
+    if (ailego_unlikely(neighbors.status != 0)) {
+      dc.set_error(neighbors.status);
+      return;
+    }
     ailego_prefetch(neighbors.data);
 
     if (neighbors.size() > buf_capacity) {
@@ -421,7 +437,8 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
                                 node_id_t *entry_point, dist_t *dist,
                                 TopkHeap &topk, HnswContext *ctx,
                                 HnswDistCalculator &dc, FilterFn &&filter,
-                                std::mutex *node_locks, uint32_t lock_mask) {
+                                std::mutex *node_locks, uint32_t lock_mask,
+                                bool fail_on_read_error) {
   const uint32_t prefetch_offset = ctx->po();
   const size_t vector_lines = ailego_cache_line_count(entity.vector_size());
   const uint32_t prefetch_lines =
@@ -468,6 +485,11 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
     {
       std::lock_guard<std::mutex> node_lock(node_locks[main_node & lock_mask]);
       const auto neighbors = entity.get_neighbors_typed(level, main_node);
+      if (ailego_unlikely(neighbors.status != 0)) {
+        if (!fail_on_read_error) continue;
+        dc.set_error(neighbors.status);
+        return;
+      }
       ailego_prefetch(neighbors.data);
       if (ailego_unlikely(ctx->debugging())) {
         (*ctx->mutable_stats_get_neighbors())++;
@@ -513,7 +535,7 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
       (*ctx->mutable_stats_get_vector())++;
     }
     if (ailego_unlikely(ret != 0)) {
-      dc.set_error(ret);
+      if (fail_on_read_error) dc.set_error(ret);
       return;
     }
 
@@ -568,17 +590,17 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
 // queries, and upper levels for every backend.
 // ============================================================================
 template <typename EntityType>
-void HnswAlgorithm<EntityType>::search_neighbors(level_t level,
-                                                 node_id_t *entry_point,
-                                                 dist_t *dist, TopkHeap &topk,
-                                                 HnswContext *ctx) const {
+void HnswAlgorithm<EntityType>::search_neighbors(
+    level_t level, node_id_t *entry_point, dist_t *dist, TopkHeap &topk,
+    HnswContext *ctx, bool fail_on_read_error) const {
   const auto &entity = static_cast<const EntityType &>(ctx->get_entity());
   HnswDistCalculator &dc = ctx->dist_calculator();
 
   auto run_with_filter = [&](auto &&filter) {
     dual_heap_search_neighbors<EntityType, MemBlockType>(
         entity, level, entry_point, dist, topk, ctx, dc,
-        std::forward<decltype(filter)>(filter), lock_pool_.data(), kLockMask);
+        std::forward<decltype(filter)>(filter), lock_pool_.data(), kLockMask,
+        fail_on_read_error);
   };
 
   if (ctx->filter().is_valid()) {
@@ -678,6 +700,10 @@ void HnswAlgorithm<EntityType>::expand_neighbors_by_group(
 
       candidates.pop();
       const auto neighbors = entity.get_neighbors_typed(0, main_node);
+      if (ailego_unlikely(neighbors.status != 0)) {
+        dc.set_error(neighbors.status);
+        return;
+      }
       if (ailego_unlikely(ctx->debugging())) {
         (*ctx->mutable_stats_get_neighbors())++;
       }
@@ -873,7 +899,12 @@ int HnswAlgorithm<EntityType>::reverse_update_neighbors(
   const uint32_t lock_idx = id & kLockMask;
   std::lock_guard<std::mutex> node_lock(lock_pool_[lock_idx]);
   Neighbors neighbors = entity_.get_neighbors(level, id);
-  if (ailego_unlikely(!neighbors.data)) return IndexError_ReadData;
+  if (ailego_unlikely(neighbors.status != 0 || !neighbors.data)) {
+    if constexpr (kTransactionalBuild) {
+      return neighbors.status != 0 ? neighbors.status : IndexError_ReadData;
+    }
+    return 0;
+  }
   const size_t size = neighbors.size();
   ailego_assert_with(size <= max_neighbor_cnt, "invalid neighbor size");
   if (size < max_neighbor_cnt) {

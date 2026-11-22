@@ -15,8 +15,11 @@
 #include <array>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
+#include <zvec/core/framework/index_segment_storage.h>
 #include "tests/test_util.h"
 #include "vamana_algorithm.h"
 
@@ -136,6 +139,129 @@ class VamanaFastSearchTest : public testing::Test {
   std::unordered_map<const void *, node_id_t> ids_;
   std::vector<std::vector<node_id_t>> evaluated_;
 };
+
+TEST(VamanaReadFailureTest, QueriesFailAndConstructionKeepsReadableCandidates) {
+  class FaultingChunk : public IndexSegmentStorage::Segment {
+   public:
+    FaultingChunk(const Chunk::Pointer &chunk, size_t adjacency, size_t vector)
+        : IndexSegmentStorage::Segment(chunk, 0, chunk->data_size(),
+                                       chunk->padding_size(), 0),
+          chunk_(chunk), adjacency_(adjacency), vector_(vector) {}
+
+    size_t read(size_t offset, IndexStorage::MemoryBlock &block,
+                size_t size) override {
+      if ((offset == adjacency_ && adjacency_reads_until_failure &&
+           --adjacency_reads_until_failure == 0) ||
+          (offset == vector_ && std::exchange(fail_neighbor_vector, false))) {
+        block.reset();
+        return 0;
+      }
+      return chunk_->read(offset, block, size);
+    }
+
+    size_t write(size_t offset, const void *data, size_t size) override {
+      return chunk_->write(offset, data, size);
+    }
+
+    int read_error() const override {
+      return IndexError_NoMemory;
+    }
+
+    int adjacency_reads_until_failure{0};
+    bool fail_neighbor_vector{false};
+
+   private:
+    Chunk::Pointer chunk_;
+    size_t adjacency_;
+    size_t vector_;
+  };
+
+  class FaultingEntity : public VamanaBufferPoolStreamerEntity {
+   public:
+    using VamanaBufferPoolStreamerEntity::VamanaBufferPoolStreamerEntity;
+
+    std::shared_ptr<FaultingChunk> inject_read_faults() {
+      auto faulting_chunk = std::make_shared<FaultingChunk>(
+          node_chunks_.front(), vector_size() + sizeof(zvec::core::key_t),
+          node_size());
+      node_chunks_.front() = faulting_chunk;
+      return faulting_chunk;
+    }
+  };
+
+  constexpr uint32_t dimension = 16;
+  const std::string path = "vamana_read_failure_test.index";
+  test_util::RemoveTestPath(path);
+  const auto cleanup = ailego::ScopeGuard::Make(
+      [&] { test_util::RemoveTestPath(path); });
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->init(ailego::Params()));
+  ASSERT_EQ(0, storage->open(path, true));
+  IndexStreamer::Stats stats;
+  auto entity = std::make_shared<FaultingEntity>(stats);
+  entity->set_vector_size(sizeof(float) * dimension);
+  entity->set_max_degree(8);
+  entity->set_search_list_size(32);
+  ASSERT_EQ(0, entity->init(3));
+  ASSERT_EQ(0, entity->open(storage, 0, false));
+
+  std::array<float, dimension> vector{};
+  for (node_id_t i = 0; i < 3; ++i) {
+    vector[0] = static_cast<float>(i);
+    node_id_t id = kInvalidNodeId;
+    ASSERT_EQ(0, entity->add_vector(i, vector.data(), &id));
+    ASSERT_EQ(i, id);
+  }
+  ASSERT_EQ(0, entity->update_neighbors(0, {{1, 1.0f}}));
+  entity->update_entry_point(0);
+  auto faults = entity->inject_read_faults();
+
+  auto metric = IndexFactory::CreateMetric("SquaredEuclidean");
+  ASSERT_TRUE(metric);
+  ASSERT_EQ(0, metric->init(IndexMeta(IndexMeta::DT_FP32, dimension), {}));
+  VamanaAlgorithm<VamanaBufferPoolStreamerEntity> algorithm(*entity);
+  VamanaContext context(dimension, metric, entity);
+  ASSERT_EQ(0, context.init(VamanaContext::kStreamerContext));
+  context.set_max_scan_num(1000);
+  context.set_topk(3);
+  context.reset_query(vector.data());
+  faults->adjacency_reads_until_failure = 1;
+  EXPECT_EQ(IndexError_NoMemory, algorithm.search(&context));
+
+  context.clear();
+  faults->fail_neighbor_vector = true;
+  faults->adjacency_reads_until_failure = 2;
+  ASSERT_EQ(0, algorithm.add_node(2, &context));
+  EXPECT_FALSE(faults->fail_neighbor_vector);
+  EXPECT_EQ(0, faults->adjacency_reads_until_failure);
+  const auto existing = entity->get_neighbors(0);
+  ASSERT_EQ(1U, existing.size());
+  EXPECT_EQ(1U, existing[0]);
+  const auto inserted = entity->get_neighbors(2);
+  ASSERT_EQ(1U, inserted.size());
+  EXPECT_EQ(0U, inserted[0]);
+
+  context.clear();
+  context.resize_results(1);
+  context.set_fetch_vector(true);
+  vector[0] = 0.0f;
+  context.reset_query(vector.data());
+  ASSERT_EQ(0, algorithm.search(&context));
+
+  faults->fail_neighbor_vector = true;
+  EXPECT_EQ(IndexError_NoMemory, context.topk_to_result(0));
+  EXPECT_FALSE(faults->fail_neighbor_vector);
+  EXPECT_TRUE(context.result().empty());
+
+  ASSERT_EQ(0, context.topk_to_result(0));
+  ASSERT_GE(context.result().size(), 2u);
+  for (const auto &doc : context.result()) {
+    EXPECT_NE(nullptr, doc.vector());
+  }
+  ASSERT_EQ(0, entity->close());
+  ASSERT_EQ(0, storage->close());
+}
 
 TEST_F(VamanaFastSearchTest, ContextDefaultsToBitmapAndAllowsExplicitOverride) {
   create_graph({10, 2}, {{1}, {0}});

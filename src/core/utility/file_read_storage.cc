@@ -348,24 +348,27 @@ class FileReadStorage : public IndexStorage {
       return IndexError_InvalidArgument;
     const size_t size = end_offset - candidate_offset;
     IndexParsingInput scratch;
-    int read_error = IndexError_ReadData;
+    int read_error = 0;
     auto read_data = [&file_ptr, &scratch, &read_error, candidate_offset, size](
                          size_t offset, const void **data, size_t len,
                          bool retry = false) {
-      read_error = IndexError_ReadData;
+      read_error = 0;
       if (offset > size || len > size - offset) return size_t{0};
       if (!scratch.prepare(len, retry)) {
         read_error = IndexError_NoMemory;
         return size_t{0};
       }
       *data = scratch.data();
-      return file_ptr->read(candidate_offset + offset, scratch.data(), len);
+      const size_t got =
+          file_ptr->read(candidate_offset + offset, scratch.data(), len);
+      if (got != len) read_error = IndexError_ReadData;
+      return got;
     };
 
     IndexUnpacker unpacker;
     if (!unpacker.unpack(read_data, size, checksum_validation_,
                          /*report_errors=*/false, /*retry_private=*/true)) {
-      if (read_error == IndexError_NoMemory) return read_error;
+      if (read_error != 0) return read_error;
       LOG_ERROR("Failed to unpack file: %s", path.c_str());
       return IndexError_UnpackIndex;
     }

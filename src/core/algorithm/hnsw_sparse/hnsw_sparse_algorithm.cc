@@ -17,6 +17,7 @@
 #include <iostream>
 #include <vector>
 #include <ailego/internal/cpu_features.h>
+#include <ailego/pattern/scope_guard.h>
 
 namespace zvec {
 namespace core {
@@ -32,6 +33,8 @@ int HnswSparseAlgorithm::cleanup() {
 
 int HnswSparseAlgorithm::add_node(node_id_t id, level_t level,
                                   HnswSparseContext *ctx) {
+  const auto clear_heaps =
+      ailego::ScopeGuard::Make([ctx] { ctx->clear_insert_heaps(); });
   spin_lock_.lock();
 
   // std::cout << "id: " << id << ", level: " << level << std::endl;
@@ -45,39 +48,41 @@ int HnswSparseAlgorithm::add_node(node_id_t id, level_t level,
   }
   spin_lock_.unlock();
 
+  std::unique_lock level_lock(mutex_, std::defer_lock);
   if (ailego_unlikely(level > cur_max_level)) {
-    mutex_.lock();
+    level_lock.lock();
     // re-check max level
     cur_max_level = entity_.cur_max_level();
     entry_point = entity_.entry_point();
     if (level <= cur_max_level) {
-      mutex_.unlock();
+      level_lock.unlock();
     }
   }
 
   level_t cur_level = cur_max_level;
   dist_t dist = ctx->dist_calculator()(entry_point);
+  // The streamer has already published the vector. Keep the candidates
+  // available to construction and leave distance errors to the caller.
   for (; cur_level > level; --cur_level) {
-    select_entry_point(cur_level, &entry_point, &dist, ctx);
+    select_entry_point(cur_level, &entry_point, &dist, ctx,
+                       /*strict_reads=*/false);
   }
 
   for (; cur_level >= 0; --cur_level) {
     search_neighbors(cur_level, &entry_point, &dist, ctx->level_topk(cur_level),
-                     ctx);
+                     ctx, /*strict_reads=*/false);
   }
 
   // add neighbors from down level to top level, to avoid upper level visible
   // to knn_search but the under layer level not ready
   for (cur_level = 0; cur_level <= level; ++cur_level) {
     add_neighbors(id, cur_level, ctx->level_topk(cur_level), ctx);
-    ctx->level_topk(cur_level).clear();
   }
 
   if (ailego_unlikely(level > cur_max_level)) {
     spin_lock_.lock();
     entity_.update_ep_and_level(id, level);
     spin_lock_.unlock();
-    mutex_.unlock();
   }
 
   return 0;
@@ -93,31 +98,40 @@ int HnswSparseAlgorithm::search(HnswSparseContext *ctx) const {
     return 0;
   }
 
-  dist_t dist = ctx->dist_calculator().dist(entry_point);
+  auto &dc = ctx->dist_calculator();
+  dist_t dist = dc.dist(entry_point);
+  if (ailego_unlikely(dc.error())) return dc.error_code();
   for (level_t cur_level = max_level; cur_level >= 1; --cur_level) {
-    select_entry_point(cur_level, &entry_point, &dist, ctx);
+    const int ret = select_entry_point(cur_level, &entry_point, &dist, ctx,
+                                       /*strict_reads=*/true);
+    if (ailego_unlikely(ret != 0)) return ret;
   }
 
   auto &topk_heap = ctx->topk_heap();
   topk_heap.clear();
-  search_neighbors(0, &entry_point, &dist, topk_heap, ctx);
+  const int ret = search_neighbors(0, &entry_point, &dist, topk_heap, ctx,
+                                   /*strict_reads=*/true);
+  if (ailego_unlikely(ret != 0)) return ret;
 
   if (ctx->group_by_search()) {
-    expand_neighbors_by_group(topk_heap, ctx);
+    return expand_neighbors_by_group(topk_heap, ctx);
   }
 
   return 0;
 }
 
 //! select_entry_point on hnsw level, ef = 1
-void HnswSparseAlgorithm::select_entry_point(level_t level,
-                                             node_id_t *entry_point,
-                                             dist_t *dist,
-                                             HnswSparseContext *ctx) const {
+int HnswSparseAlgorithm::select_entry_point(level_t level,
+                                            node_id_t *entry_point,
+                                            dist_t *dist,
+                                            HnswSparseContext *ctx,
+                                            bool strict_reads) const {
   auto &entity = ctx->get_entity();
   HnswSparseDistCalculator &dc = ctx->dist_calculator();
   while (true) {
     const Neighbors neighbors = entity.get_neighbors(level, *entry_point);
+    if (ailego_unlikely(neighbors.status != 0))
+      return strict_reads ? neighbors.status : 0;
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_neighbors())++;
     }
@@ -132,11 +146,12 @@ void HnswSparseAlgorithm::select_entry_point(level_t level,
       (*ctx->mutable_stats_get_vector())++;
     }
     if (ailego_unlikely(ret != 0)) {
-      break;
+      return strict_reads ? ret : 0;
     }
     bool find_closer = false;
     for (uint32_t i = 0; i < size; ++i) {
       dist_t cur_dist = dc.dist(neighbor_block_vecs[i].data());
+      if (strict_reads && dc.error()) return dc.error_code();
       if (cur_dist < *dist) {
         *entry_point = neighbors[i];
         *dist = cur_dist;
@@ -149,7 +164,7 @@ void HnswSparseAlgorithm::select_entry_point(level_t level,
     }
   }
 
-  return;
+  return 0;
 }
 
 void HnswSparseAlgorithm::add_neighbors(node_id_t id, level_t level,
@@ -168,14 +183,12 @@ void HnswSparseAlgorithm::add_neighbors(node_id_t id, level_t level,
     reverse_update_neighbors(dc, topk_heap[i].first, level, id,
                              topk_heap[i].second, ctx->update_heap());
   }
-
-  return;
 }
 
-void HnswSparseAlgorithm::search_neighbors(level_t level,
-                                           node_id_t *entry_point, dist_t *dist,
-                                           TopkHeap &topk,
-                                           HnswSparseContext *ctx) const {
+int HnswSparseAlgorithm::search_neighbors(level_t level, node_id_t *entry_point,
+                                          dist_t *dist, TopkHeap &topk,
+                                          HnswSparseContext *ctx,
+                                          bool strict_reads) const {
   const auto &entity = ctx->get_entity();
   HnswSparseDistCalculator &dc = ctx->dist_calculator();
   VisitFilter &visit = ctx->visit_filter();
@@ -204,6 +217,10 @@ void HnswSparseAlgorithm::search_neighbors(level_t level,
 
     candidates.pop();
     const Neighbors neighbors = entity.get_neighbors(level, main_node);
+    if (ailego_unlikely(neighbors.status != 0)) {
+      if (!strict_reads) continue;
+      return neighbors.status;
+    }
     ailego_prefetch(neighbors.data);
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_neighbors())++;
@@ -233,7 +250,7 @@ void HnswSparseAlgorithm::search_neighbors(level_t level,
       (*ctx->mutable_stats_get_vector())++;
     }
     if (ailego_unlikely(ret != 0)) {
-      break;
+      return strict_reads ? ret : 0;
     }
 
     static constexpr node_id_t PREFETCH_STEP = 2;
@@ -263,6 +280,7 @@ void HnswSparseAlgorithm::search_neighbors(level_t level,
       }
 
       dist_t cur_dist = dc.dist(neighbor_block_vecs[i].data());
+      if (strict_reads && dc.error()) return dc.error_code();
       if ((!topk.full()) || cur_dist < topk[0].second) {
         candidates.emplace(node, cur_dist);
         // update entry_point for next level scan
@@ -277,13 +295,13 @@ void HnswSparseAlgorithm::search_neighbors(level_t level,
     }  // end for
   }  // while
 
-  return;
+  return 0;
 }
 
-void HnswSparseAlgorithm::expand_neighbors_by_group(
+int HnswSparseAlgorithm::expand_neighbors_by_group(
     TopkHeap &topk, HnswSparseContext *ctx) const {
   if (!ctx->group_by().is_valid()) {
-    return;
+    return 0;
   }
 
   const auto &entity = ctx->get_entity();
@@ -335,6 +353,7 @@ void HnswSparseAlgorithm::expand_neighbors_by_group(
 
       candidates.pop();
       const Neighbors neighbors = entity.get_neighbors(0, main_node);
+      if (ailego_unlikely(neighbors.status != 0)) return neighbors.status;
       if (ailego_unlikely(ctx->debugging())) {
         (*ctx->mutable_stats_get_neighbors())++;
       }
@@ -363,7 +382,7 @@ void HnswSparseAlgorithm::expand_neighbors_by_group(
         (*ctx->mutable_stats_get_vector())++;
       }
       if (ailego_unlikely(ret != 0)) {
-        break;
+        return ret;
       }
 
       static constexpr node_id_t PREFETCH_STEP = 2;
@@ -374,6 +393,7 @@ void HnswSparseAlgorithm::expand_neighbors_by_group(
           ailego_prefetch(neighbor_block_vecs[prefetch_id].data());
         }
         dist_t cur_dist = dc.dist(neighbor_block_vecs[i].data());
+        if (ailego_unlikely(dc.error())) return dc.error_code();
 
         if (!filter(node)) {
           std::string group_id = group_by(node);
@@ -393,6 +413,7 @@ void HnswSparseAlgorithm::expand_neighbors_by_group(
       }  // end for
     }  // end while
   }  // end if
+  return 0;
 }
 
 void HnswSparseAlgorithm::update_neighbors(HnswSparseDistCalculator &dc,
@@ -466,13 +487,13 @@ void HnswSparseAlgorithm::reverse_update_neighbors(HnswSparseDistCalculator &dc,
   const size_t max_neighbor_cnt = entity_.neighbor_cnt(level);
 
   uint32_t lock_idx = id & kLockMask;
-  lock_pool_[lock_idx].lock();
+  std::lock_guard lock(lock_pool_[lock_idx]);
   const Neighbors neighbors = entity_.get_neighbors(level, id);
+  if (ailego_unlikely(neighbors.status != 0)) return;
   size_t size = neighbors.size();
   ailego_assert_with(size <= max_neighbor_cnt, "invalid neighbor size");
   if (size < max_neighbor_cnt) {
     entity_.add_neighbor(level, id, size, link_id);
-    lock_pool_[lock_idx].unlock();
     return;
   }
 
@@ -512,12 +533,7 @@ void HnswSparseAlgorithm::reverse_update_neighbors(HnswSparseDistCalculator &dc,
 
   update_heap.truncate(cur_size);
   entity_.update_neighbors(level, id, update_heap.container());
-
-  lock_pool_[lock_idx].unlock();
-
   update_heap.clear();
-
-  return;
 }
 
 }  // namespace core

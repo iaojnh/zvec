@@ -112,9 +112,9 @@ class FlatStreamerContext : public IndexStreamer::Context {
     }
   }
 
-  void topk_to_result(uint32_t idx) {
+  int topk_to_result(uint32_t idx) {
     if (ailego_unlikely(result_heap_.size() == 0)) {
-      return;
+      return 0;
     }
 
     ailego_assert_with(idx < results_.size(), "invalid idx");
@@ -130,21 +130,26 @@ class FlatStreamerContext : public IndexStreamer::Context {
       key_t key = result_heap_[i].key();
       if (fetch_vector_ && !owner_->use_external_vector()) {
         IndexStorage::MemoryBlock block;
-        owner_->entity().get_vector_by_key(key, block);
-        results_[idx].emplace_back(key, score, key, block);
+        const int status = owner_->entity().get_vector_by_key(key, block);
+        if (status == IndexError_NoExist) continue;
+        if (status != 0) {
+          results_[idx].clear();
+          return status;
+        }
+        results_[idx].emplace_back(key, score, key, std::move(block));
       } else {
         results_[idx].emplace_back(key, score, key);
       }
     }
+    return 0;
   }
 
   // Candidate searches consume their heap once. Transfer its document buffer
   // when vectors are not requested; keep the regular materialization path
   // when storage blocks must be pinned for fetch_vector.
-  void take_topk_result(uint32_t idx) {
+  int take_topk_result(uint32_t idx) {
     if (fetch_vector_) {
-      topk_to_result(idx);
-      return;
+      return topk_to_result(idx);
     }
     ailego_assert_with(idx < results_.size(), "invalid idx");
     result_heap_.sort();
@@ -159,9 +164,10 @@ class FlatStreamerContext : public IndexStreamer::Context {
     documents.resize(size);
     results_[idx].clear();
     results_[idx].swap(documents);
+    return 0;
   }
 
-  void topk_to_group_result(uint32_t idx) {
+  int topk_to_group_result(uint32_t idx) {
     ailego_assert_with(idx < group_results_.size(), "invalid idx");
     group_results_[idx].clear();
     std::vector<std::pair<std::string, TopkHeap>> group_topk_list;
@@ -199,18 +205,23 @@ class FlatStreamerContext : public IndexStreamer::Context {
         if (score > this->threshold()) {
           break;
         }
-        node_id_t id = group_topk_list[i].second[j].first;
-        auto provider = owner_->create_provider();
+        const key_t key = group_topk_list[i].second[j].first;
+        auto &docs = *group_results_[idx][i].mutable_docs();
         if (fetch_vector_) {
           IndexStorage::MemoryBlock block;
-          provider->get_vector(id, block);
-          group_results_[idx][i].mutable_docs()->emplace_back(id, score, id,
-                                                              block);
+          const int status = owner_->entity().get_vector_by_key(key, block);
+          if (status == IndexError_NoExist) continue;
+          if (status != 0) {
+            group_results_[idx].clear();
+            return status;
+          }
+          docs.emplace_back(key, score, key, std::move(block));
         } else {
-          group_results_[idx][i].mutable_docs()->emplace_back(id, score, id);
+          docs.emplace_back(key, score, key);
         }
       }
     }
+    return 0;
   }
 
   //! Get if group by search

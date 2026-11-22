@@ -173,6 +173,51 @@ TEST_F(BufferStorageWriteTest, FailedCloseCanRetryMetadataAndCheckpoint) {
   EXPECT_EQ("saved", std::string(payload, sizeof(payload)));
 }
 
+TEST_F(BufferStorageWriteTest, FailedDirectoryRollbackStopsWriteback) {
+  auto storage = open_writable();
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->append("original", 16));
+  auto retained = storage->get("original");
+  ASSERT_TRUE(retained);
+  ASSERT_EQ(5u, retained->write(0, "saved", 5));
+  ASSERT_EQ(0, storage->flush());
+  auto pool = storage->vec_buffer_pool();
+  ASSERT_TRUE(ailego::VecBufferPoolTestPeer::has_writeback_worker(*pool));
+
+  // Fail both the attempt to publish the new directory and its disk rollback.
+  auto *read_only = std::fopen(file_path_.c_str(), "rb");
+  ASSERT_NE(nullptr, read_only);
+  AILEGO_DEFER([&] { std::fclose(read_only); });
+#ifdef _WIN32
+  const int read_fd = _fileno(read_only);
+#else
+  const int read_fd = fileno(read_only);
+#endif
+  ASSERT_GE(read_fd, 0);
+  {
+    const int original_fd =
+        ailego::VecBufferPoolTestPeer::exchange_metadata_fd(*pool, read_fd);
+    AILEGO_DEFER([&] {
+      ailego::VecBufferPoolTestPeer::exchange_metadata_fd(*pool, original_fd);
+    });
+    EXPECT_EQ(IndexError_WriteData, storage->append("failed", 16));
+    EXPECT_TRUE(storage->has("original"));
+    EXPECT_FALSE(storage->has("failed"));
+    EXPECT_FALSE(ailego::VecBufferPoolTestPeer::has_writeback_worker(*pool));
+    EXPECT_TRUE(pool->writeback_quarantined());
+    EXPECT_EQ(0u, retained->write(0, "x", 1));
+  }
+  EXPECT_NE(0, storage->close());
+  EXPECT_EQ(nullptr, storage->vec_buffer_pool());
+  char payload[5];
+  ASSERT_EQ(sizeof(payload), retained->fetch(0, payload, sizeof(payload)));
+  EXPECT_EQ("saved", std::string(payload, sizeof(payload)));
+  auto reopened = open_read_only();
+  ASSERT_TRUE(reopened);
+  EXPECT_TRUE(reopened->has("original"));
+  EXPECT_FALSE(reopened->has("failed"));
+}
+
 TEST_F(BufferStorageWriteTest, ShortWritePublishesProgressBeforeReopen) {
   const size_t page = ailego::kVectorPageSize;
   auto storage = open_writable();
@@ -221,10 +266,19 @@ TEST_F(BufferStorageWriteTest, ShortWritePublishesProgressBeforeReopen) {
 TEST_F(BufferStorageWriteTest, QuarantinedCloseReportsErrorAndReleasesFile) {
   auto storage = open_writable();
   ASSERT_TRUE(storage);
-  storage->refresh(123);
+  ASSERT_EQ(0, storage->append("data", 16));
+  auto segment = storage->get("data");
+  ASSERT_TRUE(segment);
+  ASSERT_EQ(1u, segment->write(0, "x", 1));
+  ASSERT_EQ(0, storage->flush());
   ailego::VecBufferPoolTestPeer::quarantine_writeback(
       *storage->vec_buffer_pool());
-  EXPECT_NE(0, storage->close());
+  EXPECT_EQ(IndexError_WriteData, storage->flush());
+  EXPECT_NE(0, storage->append("rejected", 16));
+  EXPECT_EQ(0u, segment->write(0, "y", 1));
+  EXPECT_EQ(0u, segment->resize(2));
+  EXPECT_EQ(1u, segment->data_size());
+  EXPECT_EQ(IndexError_WriteData, storage->close());
   EXPECT_TRUE(storage->file_path().empty());
   EXPECT_EQ(0, storage->close());
 }
@@ -385,6 +439,38 @@ TEST_F(BufferStorageWriteTest, CreateBudgetDenialLeavesPathRetryable) {
     ASSERT_EQ(0, storage->open(file_path_, true));
     EXPECT_TRUE(storage->has("IndexVersion"));
     EXPECT_EQ(0, storage->close());
+  }
+}
+
+TEST_F(BufferStorageWriteTest, ExclusiveCreatePreservesConcurrentPublisher) {
+  for (int init_result : std::array<int, 2>{IndexError_NoMemory, 0}) {
+    SCOPED_TRACE(init_result);
+    ailego::File::Delete(file_path_);
+    const int ret = IndexMapping::CreateExclusive(
+        file_path_, 4096, [&](IndexMapping &) -> int {
+          EXPECT_FALSE(ailego::File::IsExist(file_path_));
+          auto competitor = open_writable();
+          if (!competitor || competitor->append("competing", 8) != 0) {
+            ADD_FAILURE() << "Could not create the competing index";
+            return IndexError_Runtime;
+          }
+          auto segment = competitor->get("competing");
+          if (!segment || segment->write(0, "original", 8) != 8 ||
+              competitor->close() != 0) {
+            ADD_FAILURE() << "Could not persist the competing index";
+            return IndexError_Runtime;
+          }
+          return init_result;
+        });
+    EXPECT_EQ(init_result ? init_result : IndexError_CreateFile, ret);
+    auto installed = open_read_only();
+    ASSERT_NE(nullptr, installed);
+    EXPECT_TRUE(installed->has("IndexVersion"));
+    auto segment = installed->get("competing");
+    ASSERT_NE(nullptr, segment);
+    char bytes[8];
+    ASSERT_EQ(sizeof(bytes), segment->fetch(0, bytes, sizeof(bytes)));
+    EXPECT_EQ("original", std::string(bytes, sizeof(bytes)));
   }
 }
 

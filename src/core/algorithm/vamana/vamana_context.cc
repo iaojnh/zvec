@@ -194,19 +194,24 @@ std::pair<uint32_t, uint32_t> VamanaContext::resolve_query_prefetch(
   return {resolved_offset, resolved_lines};
 }
 
-void VamanaContext::topk_to_result(uint32_t idx) {
+int VamanaContext::topk_to_result(uint32_t idx) {
   ailego_assert_with(idx < results_.size(), "invalid idx");
   results_[idx].clear();
+  int status = 0;
   collect_search_result([&](node_id_t id, dist_t score) {
+    if (status != 0) return;
     if (fetch_vector_) {
       IndexStorage::MemoryBlock block;
-      entity_->get_vector(id, block);
+      status = entity_->get_vector(id, block);
+      if (status != 0) return;
       results_[idx].emplace_back(entity_->get_key(id), score, id,
                                  std::move(block));
     } else {
       results_[idx].emplace_back(entity_->get_key(id), score, id);
     }
   });
+  if (status != 0) results_[idx].clear();
+  return status;
 }
 
 void VamanaContext::topk_to_keys(std::vector<uint64_t> &keys,

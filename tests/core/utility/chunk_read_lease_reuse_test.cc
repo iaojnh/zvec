@@ -83,6 +83,47 @@ class ChunkReadLeaseReuseTest : public testing::Test {
   IndexStorage::Segment::Pointer segment;
 };
 
+TEST_F(ChunkReadLeaseReuseTest, WritableBufferStorageReclaimsChunkBacking) {
+  const std::string index_path = std::string(path) + ".writable";
+  const auto cleanup =
+      ailego::ScopeGuard::Make([&] { ailego::File::Delete(index_path); });
+  auto writer = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_TRUE(writer);
+  ASSERT_EQ(0, writer->init(ailego::Params{}));
+  ASSERT_EQ(0, writer->open(index_path, true));
+  ASSERT_EQ(0, writer->append("payload", page));
+  const size_t file_pages = writer->vec_buffer_pool()->file_size() / page;
+  const size_t metadata =
+      ailego::VecBufferPool::metadata_bytes_for_page_count(file_pages, true);
+  ASSERT_EQ(0, writer->close());
+
+  ASSERT_EQ(0, segment->set_read_chunks({{0, payload.size()}}));
+  {
+    IndexStorage::MemoryBlock cached;
+    ASSERT_EQ(1u, segment->read(0, cached, 1));
+    check(cached, 0, 1);
+  }
+  const size_t evictable = pool.evictable_cache_used();
+  ASSERT_EQ(payload.size(), evictable);
+
+  // Leave room for the directory to parse, but fund the page-table metadata
+  // only after the unpinned chunk mapping is reclaimed.
+  ASSERT_GT(metadata, page);
+  const size_t room = metadata - page;
+  ASSERT_GT(pool.available(), room);
+  const size_t held = pool.available() - room;
+  ASSERT_TRUE(pool.try_charge_metadata_without_reclaim(held));
+  const auto release =
+      ailego::ScopeGuard::Make([&] { pool.release_metadata(held); });
+  ASSERT_EQ(0,
+            writer->open(index_path, IndexStorage::OpenOptions{false, false}));
+  EXPECT_LT(pool.evictable_cache_used(), evictable);
+  auto writable = writer->get("payload");
+  ASSERT_TRUE(writable);
+  EXPECT_EQ(1u, writable->write(0, "x", 1));
+  ASSERT_EQ(0, writer->close());
+}
+
 TEST_F(ChunkReadLeaseReuseTest, MetadataUsesCallerBufferWhenWorkspaceIsBusy) {
   const std::string index_path = std::string(path) + ".meta";
   const auto cleanup =
@@ -767,7 +808,7 @@ TEST_F(MetadataAdmissionTest, NestedDirectoryAdmissionRollbackAndRetry) {
     parent->fail_at = parent->calls - 1;
     parent->calls = 0;
     const auto used = pool.external_used();
-    EXPECT_EQ(IndexError_UnpackIndex, leaf.open("", false));
+    EXPECT_EQ(IndexError_ReadData, leaf.open("", false));
     EXPECT_EQ(used, pool.external_used());
     EXPECT_TRUE(leaf.has(names.back()));
     parent->fail_at = std::numeric_limits<size_t>::max();
@@ -1424,7 +1465,8 @@ TEST_F(ParserOwnershipTest, ReadAndFormatErrorsStopImmediately) {
     auto observed = std::make_shared<FailingParent>(parent);
     if (io_failure) observed->fail_at = 0;
     IndexSegmentStorage nested(observed);
-    EXPECT_EQ(IndexError_UnpackIndex, nested.open("", false));
+    EXPECT_EQ(io_failure ? IndexError_ReadData : IndexError_UnpackIndex,
+              nested.open("", false));
     EXPECT_EQ(1u, observed->calls);
     EXPECT_EQ(0u, observed->fetched_headers);
     EXPECT_FALSE(nested.has("child"));
@@ -2129,6 +2171,7 @@ TEST_F(ParserPrimitiveAdmissionTest, ParsingScopeBalancesNestedAndFailedOpens) {
       }
       EXPECT_EQ(failure == 0   ? 0
                 : failure == 3 ? IndexError_NoMemory
+                : failure == 1 ? IndexError_ReadData
                                : IndexError_UnpackIndex,
                 result);
       EXPECT_TRUE(nested.has("child"));

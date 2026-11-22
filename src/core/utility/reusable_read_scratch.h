@@ -92,11 +92,17 @@ class ReusableReadScratch {
     return backing;
   } catch (const std::bad_alloc &) {
     // Idle cache backing is optional. Return it before retrying a required
-    // allocation; never discard a buffer still referenced by a result.
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (auto &entry : entries_) {
-      if (entry.worker) entry.worker->discard_idle();
+    // allocation. Without newly available backing, another admission can
+    // only repeat the wait that just failed.
+    bool reclaimed = false;
+    {
+      std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+      if (!lock) throw;
+      for (auto &entry : entries_) {
+        if (entry.worker && entry.worker->try_discard_idle()) reclaimed = true;
+      }
     }
+    if (!reclaimed) throw;
     return allocate();
   }
 
@@ -220,6 +226,11 @@ class ReusableReadScratch {
       discard_idle_locked();
     }
 
+    bool try_discard_idle() {
+      std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+      return lock && discard_idle_locked();
+    }
+
     bool is_dead_block(size_t key, size_t version) override {
       return key != version ||
              membership_.load(std::memory_order_relaxed) != version;
@@ -309,17 +320,16 @@ class ReusableReadScratch {
         referenced_ = false;
         return false;  // The inactive-sampling caller requeues this membership.
       }
-      const auto before = retained_;
-      discard_idle_locked();
-      const bool reclaimed = retained_ < before;
+      const bool reclaimed = discard_idle_locked();
       // A remaining live reader keeps its own backing and queue membership.
       // Inactive sampling requeues a failed probe itself; other pops do not.
       if (retained_ && (!second_chance || reclaimed)) requeue(version);
       return reclaimed;
     }
 
-    void discard_idle_locked() {
+    bool discard_idle_locked() {
       uint64_t idle = allocated_ & ~busy_;
+      const bool reclaimed = idle != 0;
       while (idle) {
         const size_t index = first_slot(idle);
         auto &cached = slot(index);
@@ -332,6 +342,7 @@ class ReusableReadScratch {
       if (!(allocated_ & ~uint64_t{1})) overflow_.reset();
       if (!retained_ && membership_.exchange(0, std::memory_order_relaxed))
         ailego::BlockEvictionQueue::get_instance().request_dead_entry_cleanup();
+      return reclaimed;
     }
 
     struct Slot : Block::ScratchLease {

@@ -284,7 +284,7 @@ class IndexSegmentStorage : public IndexStorage {
     IndexParsingInput fallback;
     IndexUnpacker unpacker;
     const size_t total = parent_->data_size();
-    int read_error = IndexError_ReadData;
+    int read_error = 0;
     Strategy active = Strategy::kOwned;
     auto read_owned = [&](size_t offset, const void **data, size_t len,
                           bool retry) {
@@ -302,6 +302,7 @@ class IndexSegmentStorage : public IndexStorage {
     auto read_data = [&, this](size_t offset, const void **data, size_t len,
                                bool retry = false) {
       if (!retry) {
+        read_error = 0;
         excluded = 0;
       } else if (active == Strategy::kOwned) {
         return read_owned(offset, data, len, true);
@@ -344,7 +345,7 @@ class IndexSegmentStorage : public IndexStorage {
     };
     if (!unpacker.unpack(read_data, total, false,
                          /*report_errors=*/false, /*retry_private=*/true)) {
-      if (read_error == IndexError_NoMemory) return read_error;
+      if (read_error != 0) return read_error;
       LOG_ERROR("Failed to unpack segment data");
       return IndexError_UnpackIndex;
     }

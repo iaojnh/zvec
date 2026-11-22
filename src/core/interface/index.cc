@@ -265,18 +265,15 @@ core::IndexContext::Pointer &Index::acquire_context() {
 
 std::pair<core::IndexContext::Pointer &, int> Index::acquire_query_context() {
   int status = 0;
-  if (!init_context(&status) && status != core::IndexError_NoMemory) {
-    status = core::IndexError_Runtime;
-  }
+  init_context(&status);
   return {context_list[context_index_], status};
 }
 
 int Index::ensure_trained_for_query() {
   if (is_trained_) return 0;
   const int status = train();
-  if (status == 0 || status == core::IndexError_NoMemory) return status;
-  LOG_ERROR("Failed to train index before querying");
-  return core::IndexError_Runtime;
+  if (status != 0) LOG_ERROR("Failed to train index before querying");
+  return status;
 }
 
 int Index::train() {
@@ -653,11 +650,13 @@ int Index::open(const std::string &file_path, StorageOptions storage_options) {
   if (ret != 0) {
     return ret;
   }
-  if (!pending_quantizer_training_ &&
-      (streamer_ == nullptr ||
-       streamer_->open(storage_, storage_options.read_only) != 0)) {
-    LOG_ERROR("Failed to open streamer, path: %s", file_path.c_str());
-    return core::IndexError_Runtime;
+  if (!pending_quantizer_training_) {
+    ret = streamer_ ? streamer_->open(storage_, storage_options.read_only)
+                    : core::IndexError_NoReady;
+    if (ret != 0) {
+      LOG_ERROR("Failed to open streamer, path: %s", file_path.c_str());
+      return ret;
+    }
   }
 
   // If a converter exists but reformer was not created during init() because
@@ -708,9 +707,9 @@ int Index::open(const std::string &file_path, StorageOptions storage_options) {
   }
 
   // TODO: context pool
-  if (!pending_quantizer_training_ && !init_context()) {
+  if (!pending_quantizer_training_ && !init_context(&ret)) {
     LOG_ERROR("Failed to init context");
-    return core::IndexError_Runtime;
+    return ret;
   }
 
   is_open_ = true;
@@ -724,15 +723,25 @@ int Index::close() {
     return core::IndexError_Runtime;
   }
 
+  const auto pool = storage_->vec_buffer_pool();
+  const auto terminal = [&] {
+    return pool && pool->writeback_quarantined() &&
+           !core::HnswGraphLock::active();
+  };
+  int status = 0;
   if (!is_read_only_ && !pending_quantizer_training_) {
-    if (const int ret = flush(); ailego_unlikely(ret != 0)) {
+    status = flush();
+    if (status != 0) {
       LOG_ERROR("Failed to flush index before close");
-      return ret;
+      if (!terminal()) return status;
     }
   }
-  if (const int ret = streamer_->cleanup(); ailego_unlikely(ret != 0)) {
-    LOG_ERROR("Failed to cleanup streamer");
-    return ret;
+  if (status == 0) {
+    status = streamer_->cleanup();
+    if (status != 0) {
+      LOG_ERROR("Failed to cleanup streamer");
+      if (!terminal()) return status;
+    }
   }
   // Contexts are cached per index type in thread-local storage. IVF contexts
   // own cloned storage segments, so leaving the current thread's context in
@@ -742,12 +751,13 @@ int Index::close() {
     context_list[context_index_].reset();
     context_index_ = std::numeric_limits<size_t>::max();
   }
-  if (const int ret = storage_->close(); ailego_unlikely(ret != 0)) {
+  const int close_status = storage_->close();
+  if (close_status != 0) {
     LOG_ERROR("Failed to close storage");
-    return ret;
+    if (!terminal()) return close_status;
   }
   is_open_ = false;
-  return 0;
+  return status != 0 ? status : close_status;
 }
 
 int Index::flush() {
@@ -764,6 +774,12 @@ int Index::flush() {
   if (const int ret = streamer_->flush(0); ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to flush streamer");
     return ret;
+  }
+  // Dense buffered HNSW flushes its storage under the graph lock.
+  if (!is_sparse_ && param_.index_type == IndexType::kHNSW &&
+      storage_->memory_block_type() ==
+          core::IndexStorage::MemoryBlock::MBT_BUFFERPOOL) {
+    return 0;
   }
   if (const int ret = storage_->flush(); ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to flush storage");
@@ -932,8 +948,7 @@ int Index::search(const VectorData &vector_data,
         if (context) {
           context->reset();
         }
-        return ret == core::IndexError_NoMemory ? ret
-                                                : core::IndexError_Runtime;
+        return ret;
       }
       result->reverted_vector_list_.clear();
       ret = reference_index->_refine_dense_candidates(vector_data, search_param,
@@ -964,12 +979,7 @@ int Index::_dense_fetch(const uint32_t doc_id,
   int ret = streamer_->get_vector_by_id(doc_id, vector_block);
   if (ret != 0) {
     LOG_ERROR("Failed to fetch vector, doc_id: %u", doc_id);
-    if (ret == core::IndexError_NoMemory ||
-        (ret == core::IndexError_NoReady &&
-         param_.index_type == IndexType::kHNSW)) {
-      return ret;
-    }
-    return core::IndexError_Runtime;
+    return ret;
   }
   const void *vector = vector_block.data();
 
@@ -1019,11 +1029,12 @@ int Index::_sparse_fetch(const uint32_t doc_id,
                          VectorDataBuffer *vector_data_buffer) {
   SparseVectorBuffer sparse_vector_buffer;
 
-  if (0 != streamer_->get_sparse_vector_by_id(
-               doc_id, &sparse_vector_buffer.count,
-               &sparse_vector_buffer.indices, &sparse_vector_buffer.values)) {
+  const int ret = streamer_->get_sparse_vector_by_id(
+      doc_id, &sparse_vector_buffer.count, &sparse_vector_buffer.indices,
+      &sparse_vector_buffer.values);
+  if (ret != 0) {
     LOG_ERROR("Failed to fetch vector");
-    return core::IndexError_Runtime;
+    return ret;
   }
 
   if (reformer_ != nullptr) {
@@ -1072,10 +1083,7 @@ int Index::_dense_add(const VectorData &vector_data, const uint32_t doc_id,
   }
   if (ret == 0) return 0;
   LOG_ERROR("Failed to add vector");
-  return ret == core::IndexError_NoReady &&
-                 param_.index_type == IndexType::kHNSW
-             ? ret
-             : core::IndexError_Runtime;
+  return ret;
 }
 
 
@@ -1199,13 +1207,13 @@ int Index::_execute_dense_search(
         new_meta, 1, context);
     if (ret != 0) {
       LOG_ERROR("Failed to search_bf_by_p_keys_impl vector");
-      return ret == core::IndexError_NoMemory ? ret : core::IndexError_Runtime;
+      return ret;
     }
   } else if (search_param->is_linear) {
     const int ret = streamer_->search_bf_impl(vector, new_meta, 1, context);
     if (ret != 0) {
       LOG_ERROR("Failed to search vector");
-      return ret == core::IndexError_NoMemory ? ret : core::IndexError_Runtime;
+      return ret;
     }
   } else if (candidate_keys) {
     return streamer_->search_candidates_impl(vector, new_meta, *candidate_keys,
@@ -1214,7 +1222,7 @@ int Index::_execute_dense_search(
     const int ret = streamer_->search_impl(vector, new_meta, 1, context);
     if (ret != 0) {
       LOG_ERROR("Failed to search vector");
-      return ret == core::IndexError_NoMemory ? ret : core::IndexError_Runtime;
+      return ret;
     }
   }
 
@@ -1479,26 +1487,22 @@ int Index::_sparse_search(const VectorData &vector_data,
     values = converted_sparse_values_buffer.data();
   }
 
+  int ret;
   if (search_param->bf_pks != nullptr) {
-    if (streamer_->search_bf_by_p_keys_impl(
-            sparse_vector.count, indices, values,
-            std::vector<std::vector<uint64_t>>{*search_param->bf_pks}, new_meta,
-            context) != 0) {
-      LOG_ERROR("Failed to search_bf_by_p_keys_impl vector");
-      return core::IndexError_Runtime;
-    }
+    ret = streamer_->search_bf_by_p_keys_impl(
+        sparse_vector.count, indices, values,
+        std::vector<std::vector<uint64_t>>{*search_param->bf_pks}, new_meta,
+        context);
   } else if (search_param->is_linear) {
-    if (streamer_->search_bf_impl(sparse_vector.count, indices, values,
-                                  new_meta, context) != 0) {
-      LOG_ERROR("Failed to search vector");
-      return core::IndexError_Runtime;
-    }
+    ret = streamer_->search_bf_impl(sparse_vector.count, indices, values,
+                                    new_meta, context);
   } else {
-    if (streamer_->search_impl(sparse_vector.count, indices, values, new_meta,
-                               context) != 0) {
-      LOG_ERROR("Failed to search vector");
-      return core::IndexError_Runtime;
-    }
+    ret = streamer_->search_impl(sparse_vector.count, indices, values, new_meta,
+                                 context);
+  }
+  if (ret != 0) {
+    LOG_ERROR("Failed to search sparse index");
+    return ret;
   }
   // Retrieve group_by results if applicable
   const bool has_group_by = has_group_by_search(search_param);

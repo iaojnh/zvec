@@ -50,9 +50,11 @@ bool HnswGraphLock::active() {
   return active_ != nullptr;
 }
 
-bool HnswGraphLock::has_writer() {
+bool HnswGraphLock::has_writer(const HnswGraphMutex *mutex) {
   for (auto *guard = active_; guard; guard = guard->previous_) {
-    if (guard->mode_ == Mode::kWrite) return true;
+    if (guard->mode_ == Mode::kWrite && (!mutex || guard->mutex_ == mutex)) {
+      return true;
+    }
   }
   return false;
 }

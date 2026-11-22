@@ -1,6 +1,8 @@
 // Copyright 2025-present the zvec project
 // SPDX-License-Identifier: Apache-2.0
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -28,6 +30,43 @@ struct MemoryLimitPoolTestPeer {
 
 namespace zvec::core {
 namespace {
+struct StalledReadAhead {
+  static thread_local StalledReadAhead *active;
+
+  static int getevents(io_context_t, long min, long, io_event *,
+                       timespec *timeout) {
+    auto &state = *active;
+    EXPECT_NE(nullptr, timeout);
+    if (!timeout) return -EIO;
+    ++state.polls;
+    const auto remaining = std::chrono::seconds(timeout->tv_sec) +
+                           std::chrono::nanoseconds(timeout->tv_nsec);
+    EXPECT_LE(remaining.count(), state.last_wait.count());
+    state.last_wait = remaining;
+    if (min == 0) {
+      state.polled_after_deadline = true;
+      return 0;
+    }
+    if (!state.interrupt) return 0;
+    if (state.polls > 200) return -EIO;  // Bound a broken retry loop in the test.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    return -EINTR;
+  }
+
+  static int destroy(io_context_t ctx) {
+    ++active->destructions;
+    return active->real_destroy(ctx);
+  }
+
+  aio_destroy_fn real_destroy;
+  bool interrupt;
+  size_t polls{0};
+  size_t destructions{0};
+  bool polled_after_deadline{false};
+  std::chrono::nanoseconds last_wait{std::chrono::nanoseconds::max()};
+};
+thread_local StalledReadAhead *StalledReadAhead::active = nullptr;
+
 class ChunkReadPrefetchTest : public testing::Test {
  protected:
   void SetUp() override {
@@ -76,6 +115,52 @@ class ChunkReadPrefetchTest : public testing::Test {
     for (size_t i = 0; i < 256 && storage->stats().cache_bytes; ++i)
       queue.reclaim_for_allocation(page);
   }
+  void check_stalled_read_ahead(bool parsing) {
+    using Priority = IndexStorage::Segment::CachePriority;
+    ASSERT_TRUE(segment->try_prefetch(0, 3 * page, Priority::kNormal));
+    ASSERT_EQ(3u, storage->stats().prefetch_submitted);
+    const auto backing = pool.evictable_cache_used();
+    ASSERT_GT(backing, 0u);
+    auto &aio = LibAioLoader::Instance();
+    const auto getevents = aio.io_getevents;
+    StalledReadAhead failure{aio.io_destroy, /*interrupt=*/!parsing};
+    StalledReadAhead::active = &failure;
+    const auto restore = ailego::ScopeGuard::Make([&] {
+      aio.io_getevents = getevents;
+      aio.io_destroy = failure.real_destroy;
+      StalledReadAhead::active = nullptr;
+    });
+    aio.io_getevents = StalledReadAhead::getevents;
+    aio.io_destroy = StalledReadAhead::destroy;
+
+    IndexStorage::MemoryBlock block;
+    std::array<char, 64> output{};
+    if (parsing) {
+      segment->begin_parsing();
+      segment->end_parsing();
+      ASSERT_EQ(output.size(), segment->fetch(17, output.data(), output.size()));
+    } else {
+      ASSERT_EQ(output.size(), segment->read(17, block, output.size()));
+      std::memcpy(output.data(), block.data(), output.size());
+    }
+    EXPECT_EQ(0, std::memcmp(payload.data() + 17, output.data(), output.size()));
+    EXPECT_EQ(0u, failure.destructions);
+    EXPECT_GT(failure.polls, 0u);
+    EXPECT_LT(failure.polls, 200u);
+    if (!parsing) {
+      EXPECT_TRUE(failure.polled_after_deadline);
+    }
+    EXPECT_EQ(3u, storage->stats().prefetch_failed);
+    EXPECT_EQ(0u, storage->stats().prefetch_pending_requests);
+    EXPECT_FALSE(segment->try_prefetch(3 * page, page, Priority::kNormal));
+    EXPECT_GE(pool.evictable_cache_used(), backing);
+
+    block.reset();
+    segment.reset();
+    ASSERT_EQ(0, storage->close());
+    EXPECT_EQ(1u, failure.destructions);
+    EXPECT_EQ(0u, pool.evictable_cache_used());
+  }
   ailego::MemoryLimitPool &pool = ailego::MemoryLimitPool::get_instance();
   size_t page = ailego::MemoryLimitPool::page_buffer_size();
   const char *path = "chunk-read-prefetch-test.bin";
@@ -109,6 +194,14 @@ TEST_F(ChunkReadPrefetchTest, FailedAioTeardownQuarantinesAndAllowsDemandRead) {
   EXPECT_FALSE(segment->try_prefetch(page, page, Priority::kNormal));
   EXPECT_GE(pool.evictable_cache_used(), backing);
   EXPECT_EQ(metadata, storage->stats().metadata_bytes);
+}
+
+TEST_F(ChunkReadPrefetchTest, InterruptedDemandUsesOneReadAheadDeadline) {
+  check_stalled_read_ahead(/*parsing=*/false);
+}
+
+TEST_F(ChunkReadPrefetchTest, ParsingReleasesHintsWhenReadAheadTimesOut) {
+  check_stalled_read_ahead(/*parsing=*/true);
 }
 
 TEST_F(ChunkReadPrefetchTest, ReplacingLayoutReleasesStagedOverlappingHints) {

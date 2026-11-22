@@ -55,23 +55,34 @@ int HnswRabitqQueryAlgorithm::search(HnswRabitqQueryEntity *entity,
   }
 
   EstimateRecord curest;
-  get_bin_est(entity_.get_vector(entry_point), curest, *entity);
+  IndexStorage::MemoryBlock entry_vector;
+  const int entry_status = entity_.get_vector(entry_point, entry_vector);
+  if (ailego_unlikely(entry_status != 0)) return entry_status;
+  get_bin_est(entry_vector.data(), curest, *entity);
+  entry_vector.reset();
 
   for (level_t cur_level = max_level; cur_level >= 1; --cur_level) {
-    select_entry_point(cur_level, &entry_point, &curest, ctx, entity);
+    const int ret =
+        select_entry_point(cur_level, &entry_point, &curest, ctx, entity);
+    if (ailego_unlikely(ret != 0)) return ret;
   }
 
   if (ex_bits_ > 0) {
     // Use all quantization bits for the final entry before inserting it.
-    get_full_est(entity_.get_vector(entry_point), curest, *entity);
+    const int status = entity_.get_vector(entry_point, entry_vector);
+    if (ailego_unlikely(status != 0)) return status;
+    get_full_est(entry_vector.data(), curest, *entity);
+    entry_vector.reset();
   }
 
   auto &topk_heap = ctx->topk_heap();
   topk_heap.clear();
-  search_neighbors(0, &entry_point, &curest, topk_heap, ctx, entity);
+  const int ret =
+      search_neighbors(0, &entry_point, &curest, topk_heap, ctx, entity);
+  if (ailego_unlikely(ret != 0)) return ret;
 
   if (ctx->group_by_search()) {
-    expand_neighbors_by_group(topk_heap, ctx, entity);
+    return expand_neighbors_by_group(topk_heap, ctx, entity);
   }
 
   return 0;
@@ -79,12 +90,13 @@ int HnswRabitqQueryAlgorithm::search(HnswRabitqQueryEntity *entity,
 
 
 //! select_entry_point on hnsw level, ef = 1
-void HnswRabitqQueryAlgorithm::select_entry_point(
+int HnswRabitqQueryAlgorithm::select_entry_point(
     level_t level, node_id_t *entry_point, EstimateRecord *curest,
     HnswRabitqContext *ctx, HnswRabitqQueryEntity *query_entity) const {
   auto &entity = ctx->get_entity();
   while (true) {
     const Neighbors neighbors = entity.get_neighbors(level, *entry_point);
+    if (ailego_unlikely(neighbors.status != 0)) return neighbors.status;
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_neighbors())++;
     }
@@ -97,7 +109,10 @@ void HnswRabitqQueryAlgorithm::select_entry_point(
     bool find_closer = false;
     for (uint32_t i = 0; i < size; ++i) {
       EstimateRecord candest;
-      get_bin_est(entity_.get_vector(neighbors[i]), candest, *query_entity);
+      IndexStorage::MemoryBlock vector;
+      const int status = entity_.get_vector(neighbors[i], vector);
+      if (ailego_unlikely(status != 0)) return status;
+      get_bin_est(vector.data(), candest, *query_entity);
 
       if (candest.est_dist < curest->est_dist) {
         *curest = candest;
@@ -111,10 +126,10 @@ void HnswRabitqQueryAlgorithm::select_entry_point(
     }
   }
 
-  return;
+  return 0;
 }
 
-void HnswRabitqQueryAlgorithm::search_neighbors(
+int HnswRabitqQueryAlgorithm::search_neighbors(
     level_t level, node_id_t *entry_point, EstimateRecord *dist, TopkHeap &topk,
     HnswRabitqContext *ctx, HnswRabitqQueryEntity *query_entity) const {
   const auto &entity = ctx->get_entity();
@@ -144,6 +159,7 @@ void HnswRabitqQueryAlgorithm::search_neighbors(
 
     candidates.pop();
     const Neighbors neighbors = entity.get_neighbors(level, main_node);
+    if (ailego_unlikely(neighbors.status != 0)) return neighbors.status;
     ailego_prefetch(neighbors.data);
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_neighbors())++;
@@ -169,7 +185,10 @@ void HnswRabitqQueryAlgorithm::search_neighbors(
     for (uint32_t i = 0; i < size; ++i) {
       node_id_t node = neighbor_ids[i];
       EstimateRecord candest;
-      auto *cand_vector = entity_.get_vector(node);
+      IndexStorage::MemoryBlock vector;
+      const int status = entity_.get_vector(node, vector);
+      if (ailego_unlikely(status != 0)) return status;
+      const void *cand_vector = vector.data();
       ailego_prefetch(cand_vector);
       get_bin_est(cand_vector, candest, *query_entity);
 
@@ -202,14 +221,14 @@ void HnswRabitqQueryAlgorithm::search_neighbors(
     }  // end for
   }  // while
 
-  return;
+  return 0;
 }
 
-void HnswRabitqQueryAlgorithm::expand_neighbors_by_group(
+int HnswRabitqQueryAlgorithm::expand_neighbors_by_group(
     TopkHeap &topk, HnswRabitqContext *ctx,
     HnswRabitqQueryEntity *query_entity) const {
   if (!ctx->group_by().is_valid()) {
-    return;
+    return 0;
   }
 
   const auto &entity = ctx->get_entity();
@@ -260,6 +279,7 @@ void HnswRabitqQueryAlgorithm::expand_neighbors_by_group(
 
       candidates.pop();
       const Neighbors neighbors = entity.get_neighbors(0, main_node);
+      if (ailego_unlikely(neighbors.status != 0)) return neighbors.status;
       ailego_prefetch(neighbors.data);
       if (ailego_unlikely(ctx->debugging())) {
         (*ctx->mutable_stats_get_neighbors())++;
@@ -285,7 +305,10 @@ void HnswRabitqQueryAlgorithm::expand_neighbors_by_group(
       for (uint32_t i = 0; i < size; ++i) {
         node_id_t node = neighbor_ids[i];
         EstimateRecord candest;
-        auto *cand_vector = entity_.get_vector(node);
+        IndexStorage::MemoryBlock vector;
+        const int status = entity_.get_vector(node, vector);
+        if (ailego_unlikely(status != 0)) return status;
+        const void *cand_vector = vector.data();
         ailego_prefetch(cand_vector);
         get_full_est(cand_vector, candest, *query_entity);
 
@@ -306,6 +329,7 @@ void HnswRabitqQueryAlgorithm::expand_neighbors_by_group(
       }  // end for
     }  // end while
   }  // end if
+  return 0;
 }
 
 void HnswRabitqQueryAlgorithm::get_bin_est(

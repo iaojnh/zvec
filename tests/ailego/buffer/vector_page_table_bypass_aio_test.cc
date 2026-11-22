@@ -13,6 +13,7 @@
 #include <vector>
 #include <ailego/io/libaio_loader.h>
 #include <gtest/gtest.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include "pool_payload_budget.h"
 
@@ -22,6 +23,13 @@ struct VecBufferPoolTestPeer {
   static void use_libaio(VecBufferPool &pool) {
     pool.aio_enabled_ = true;
     pool.io_backend_type_ = IOBackendType::kLibAio;
+  }
+  static bool load_pages(VecBufferPool &pool) {
+    const block_id_t pages[] = {0, 1, 2, 3};
+    return pool.load_pages_aio(pages, 4, VecBufferPool::kLowPriority);
+  }
+  static void evict_pages(VecBufferPool &pool) {
+    pool.page_table_.force_evict_all_loaded();
   }
 };
 
@@ -44,10 +52,12 @@ struct FakeAio {
   std::array<iocb *, 16> request_addresses{};
   size_t submitted{0};
   size_t pending{0};
+  size_t setup_calls{0};
   size_t submit_calls{0};
   size_t destroy_calls{0};
 
   static int setup(int, io_context_t *context) {
+    ++active->setup_calls;
     if (active->mode == Mode::REJECTED_RING) active->header[4] = 0;
     *context = reinterpret_cast<io_context_t>(active->header.data());
     return 0;
@@ -136,19 +146,20 @@ class BypassAioTest : public ::testing::Test {
     FakeAio::active = nullptr;
     if (!path_.empty()) std::remove(path_.c_str());
   }
-  void check_read(VecBufferPool &pool) {
-    std::vector<char> output(4 * kVectorPageSize, 'X');
+  void check_read(VecBufferPool &pool, size_t cached_pages) {
+    std::vector<char> output(4 * kVectorPageSize + 1, 'X');
+    char *base = output.data();
+    if (reinterpret_cast<uintptr_t>(base) % kVectorPageSize == 0) ++base;
     std::array<VecBufferPool::ReadRange, 4> ranges{};
     for (size_t i = 0; i < ranges.size(); ++i)
       ranges[i] = {i * kVectorPageSize, kVectorPageSize,
-                   output.data() + i * kVectorPageSize};
+                   base + i * kVectorPageSize};
     ASSERT_TRUE(pool.read_ranges_bypass(ranges.data(), ranges.size()));
     for (size_t i = 0; i < ranges.size(); ++i) {
       EXPECT_TRUE(std::all_of(
-          output.begin() + i * kVectorPageSize,
-          output.begin() + (i + 1) * kVectorPageSize,
+          base + i * kVectorPageSize, base + (i + 1) * kVectorPageSize,
           [i](char byte) { return byte == static_cast<char>(i + 1); }));
-      EXPECT_FALSE(pool.is_page_resident(i));
+      EXPECT_EQ(i < cached_pages, pool.is_page_resident(i));
     }
   }
   void run(FakeAio::Mode mode) {
@@ -163,20 +174,24 @@ class BypassAioTest : public ::testing::Test {
     ASSERT_EQ(warm.size(), memory.batch_acquire_buffers(
                                kVectorPageSize, warm.data(), warm.size()));
     for (char *page : warm) memory.release_buffer(page, kVectorPageSize);
-    const auto before = MemoryLimitPool::get_instance().used();
-    size_t after = 0;
+    auto &payload = PoolPayloadBudget::get_instance();
+    const size_t before = payload.used();
+    const size_t cached_pages = mode == FakeAio::Mode::PARTIAL ? 2 : 0;
+    const size_t quarantined_pages =
+        mode == FakeAio::Mode::DESTROY_ERROR ||
+                mode == FakeAio::Mode::DUPLICATE
+            ? 4
+            : 0;
+    const bool retried_destroy =
+        quarantined_pages || mode == FakeAio::Mode::REJECTED_RING;
     std::thread worker([&] {
-      check_read(pool);
-      after = MemoryLimitPool::get_instance().used();
-      if (mode == FakeAio::Mode::DESTROY_ERROR ||
-          mode == FakeAio::Mode::DUPLICATE ||
-          mode == FakeAio::Mode::REJECTED_RING) {
-        EXPECT_EQ(before + (mode == FakeAio::Mode::REJECTED_RING
-                                ? 0
-                                : 4 * kVectorPageSize),
-                  after);
+      EXPECT_FALSE(VecBufferPoolTestPeer::load_pages(pool));
+      EXPECT_EQ(before + (cached_pages + quarantined_pages) * kVectorPageSize,
+                payload.used());
+      check_read(pool, cached_pages);
+      if (retried_destroy) {
         const auto calls = fake_.submit_calls;
-        check_read(pool);
+        EXPECT_FALSE(VecBufferPoolTestPeer::load_pages(pool));
         EXPECT_EQ(calls,
                   fake_.submit_calls);  // Quarantined context not reused.
       }
@@ -185,10 +200,8 @@ class BypassAioTest : public ::testing::Test {
     EXPECT_EQ(mode == FakeAio::Mode::REJECTED_RING ? 0u : 1u,
               fake_.submit_calls);
     EXPECT_EQ(0u, fake_.pending);
-    EXPECT_EQ(before, MemoryLimitPool::get_instance().used());
-    const bool retried_destroy = mode == FakeAio::Mode::DESTROY_ERROR ||
-                                 mode == FakeAio::Mode::DUPLICATE ||
-                                 mode == FakeAio::Mode::REJECTED_RING;
+    VecBufferPoolTestPeer::evict_pages(pool);
+    EXPECT_EQ(before, payload.used());
     EXPECT_EQ(retried_destroy ? 2u : 1u, fake_.destroy_calls);
   }
 
@@ -200,14 +213,53 @@ class BypassAioTest : public ::testing::Test {
   aio_getevents_fn getevents_{nullptr};
 };
 
-TEST_F(BypassAioTest, DrainsPartialSubmissionBeforeFallback) {
+TEST_F(BypassAioTest, CacheAioDrainsPartialSubmissionBeforeFallback) {
   run(FakeAio::Mode::PARTIAL);
 }
-TEST_F(BypassAioTest, QuarantinesUntilDestroyWithoutReusingContext) {
+TEST_F(BypassAioTest, CacheAioRejectsShortReadWithoutPublishingPages) {
+  run(FakeAio::Mode::SHORT_READ);
+}
+TEST_F(BypassAioTest, CacheAioRejectsRingWithoutSubmittingRequests) {
+  run(FakeAio::Mode::REJECTED_RING);
+}
+TEST_F(BypassAioTest, CacheAioRetiresContextOnCompletionError) {
+  run(FakeAio::Mode::WAIT_ERROR);
+}
+TEST_F(BypassAioTest, CacheAioQuarantinesUntilDestroyWithoutReusingContext) {
   run(FakeAio::Mode::DESTROY_ERROR);
 }
-TEST_F(BypassAioTest, DuplicateCompletionDoesNotReleaseKernelDestinations) {
+TEST_F(BypassAioTest, CacheAioDuplicateCompletionKeepsKernelDestinations) {
   run(FakeAio::Mode::DUPLICATE);
+}
+TEST_F(BypassAioTest, BypassWithNativeBackendReadsCrossPageAtFullBudget) {
+  VecBufferPool pool(path_, false);
+  ASSERT_EQ(0, pool.init());
+  VecBufferPoolTestPeer::use_libaio(pool);
+  auto &memory = MemoryLimitPool::get_instance();
+  std::array<BudgetedAlignedBuffer, 64> pressure;
+  for (auto &buffer : pressure) {
+    const size_t bytes = std::min(memory.available(), size_t{128} << 10);
+    buffer.resize(bytes, AILEGO_CACHE_LINE_SIZE);
+    if (bytes) std::memset(buffer.data(), 'p', bytes);
+  }
+  ASSERT_EQ(0u, memory.available());
+
+  // The aligned file ranges were eligible for native AIO even though their
+  // destinations require a bounce page with O_DIRECT.
+  check_read(pool, 0);
+
+  std::array<char, 53> across{}, other{};
+  const VecBufferPool::ReadRange ranges[] = {
+      {kVectorPageSize - 19, across.size(), across.data()},
+      {3 * kVectorPageSize + 7, other.size(), other.data()}};
+  ASSERT_TRUE(pool.read_ranges_bypass(ranges, 2));
+  EXPECT_EQ(std::string(19, '\1') + std::string(across.size() - 19, '\2'),
+            std::string(across.data(), across.size()));
+  EXPECT_EQ(std::string(other.size(), '\4'),
+            std::string(other.data(), other.size()));
+  EXPECT_EQ(0u, fake_.setup_calls);
+  EXPECT_EQ(0u, fake_.submit_calls);
+  EXPECT_EQ(0u, memory.available());
 }
 }  // namespace
 }  // namespace zvec::ailego

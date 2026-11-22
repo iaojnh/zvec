@@ -190,8 +190,11 @@ bool File::create(const char *path, size_t len, bool direct) {
 
 #ifdef F_NOCACHE
   // Direct IO canonical solution for Mac OSX
-  if (direct) {
-    ailego_false_if_ne_zero(fcntl(fd, F_NOCACHE, 1));
+  if (direct && fcntl(fd, F_NOCACHE, 1) != 0) {
+    const int error = errno;
+    CloseSafely(fd);
+    errno = error;
+    return false;
   }
 #endif
 
@@ -233,8 +236,11 @@ bool File::open(const char *path, bool rdonly, bool direct) {
 
 #ifdef F_NOCACHE
   // Direct IO canonical solution for Mac OSX
-  if (direct) {
-    ailego_false_if_ne_zero(fcntl(fd, F_NOCACHE, 1));
+  if (direct && fcntl(fd, F_NOCACHE, 1) != 0) {
+    const int error = errno;
+    CloseSafely(fd);
+    errno = error;
+    return false;
   }
 #endif
 

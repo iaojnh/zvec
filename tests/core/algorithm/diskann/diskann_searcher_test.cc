@@ -1500,7 +1500,7 @@ TEST_F(DiskAnnSearcherTest, TestFetchVector) {
       diskann_searcher,
       std::make_shared<FailingAlignedFileReader>(original_reader));
   std::string vector_after_failure;
-  EXPECT_EQ(IndexError_Runtime,
+  EXPECT_EQ(IndexError_ReadData,
             searcher->get_vector(key_for_id(doc_cnt - 1), linear_ctx,
                                  vector_after_failure));
   EXPECT_TRUE(vector_after_failure.empty());
@@ -1526,8 +1526,12 @@ TEST_F(DiskAnnSearcherTest, TestFetchVector) {
   };
   ASSERT_EQ(0, fetch());
   const auto expected_vector = vector_after_failure;
-  EXPECT_EQ(IndexError_NoMemory, fail_read(Phase::kRead, fetch));
-  EXPECT_TRUE(vector_after_failure.empty());
+  for (int error : {IndexError_NoMemory, IndexError_NoReady, IndexError_IO,
+                    IndexError_InvalidFormat}) {
+    SCOPED_TRACE(error);
+    EXPECT_EQ(error, fail_read(Phase::kRead, fetch, error));
+    EXPECT_TRUE(vector_after_failure.empty());
+  }
   ASSERT_EQ(0, fetch());
   EXPECT_EQ(expected_vector, vector_after_failure);
 
@@ -1539,8 +1543,12 @@ TEST_F(DiskAnnSearcherTest, TestFetchVector) {
   const auto expected_key = knn_ctx->result().front().key();
   for (auto phase : {Phase::kSubmit, Phase::kCompletion}) {
     SCOPED_TRACE(static_cast<int>(phase));
-    EXPECT_EQ(IndexError_NoMemory, fail_read(phase, graph_search));
-    EXPECT_TRUE(knn_ctx->result().empty());
+    for (int error : {IndexError_NoMemory, IndexError_NoReady, IndexError_IO,
+                      IndexError_InvalidFormat}) {
+      SCOPED_TRACE(error);
+      EXPECT_EQ(error, fail_read(phase, graph_search, error));
+      EXPECT_TRUE(knn_ctx->result().empty());
+    }
     ASSERT_EQ(0, graph_search());
     ASSERT_EQ(topk, knn_ctx->result().size());
     EXPECT_EQ(expected_key, knn_ctx->result().front().key());
@@ -2595,7 +2603,7 @@ TEST_F(DiskAnnSearcherTest, TestFetchVectorTurbo) {
       diskann_searcher, std::make_shared<FailingAlignedFileReader>(
                             DiskAnnCacheTestPeer::reader(diskann_searcher)));
   std::string vector_after_failure;
-  EXPECT_EQ(IndexError_Runtime,
+  EXPECT_EQ(IndexError_ReadData,
             searcher->get_vector(key_for_id(doc_cnt - 1), linear_ctx,
                                  vector_after_failure));
   EXPECT_TRUE(vector_after_failure.empty());

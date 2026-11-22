@@ -108,6 +108,7 @@ int64_t VamanaEntity::dump_neighbors(
   for (node_id_t i = 0; i < doc_cnt(); ++i) {
     node_id_t old_id = reorder_mapping[i];
     const Neighbors nbrs = get_neighbors(old_id);
+    if (nbrs.status != 0) return nbrs.status;
 
     auto *hd = reinterpret_cast<NeighborsHeader *>(
         buffer.data() + static_cast<size_t>(i) * nbr_size);

@@ -131,17 +131,14 @@ class HnswSparseContext : public IndexContext {
     }
   }
 
-  inline void topk_to_result() {
+  inline int topk_to_result() {
     return topk_to_result(0);
   }
 
   //! Construct result from topk heap, result will be normalized
-  inline void topk_to_result(uint32_t idx) {
-    if (group_by_search()) {
-      topk_to_group_result(idx);
-    } else {
-      topk_to_single_result(idx);
-    }
+  inline int topk_to_result(uint32_t idx) {
+    return group_by_search() ? topk_to_group_result(idx)
+                             : topk_to_single_result(idx);
   }
 
   inline void recal_topk_dist() {
@@ -155,13 +152,13 @@ class HnswSparseContext : public IndexContext {
     }
   }
 
-  inline void topk_to_single_result(uint32_t idx) {
+  inline int topk_to_single_result(uint32_t idx) {
     if (force_padding_topk_ && !topk_heap_.full() &&
         topk_heap_.size() < entity_->doc_cnt()) {
       this->fill_random_to_topk_full();
     }
     if (ailego_unlikely(topk_heap_.size() == 0)) {
-      return;
+      return 0;
     }
 
     ailego_assert_with(idx < results_.size(), "invalid idx");
@@ -178,10 +175,18 @@ class HnswSparseContext : public IndexContext {
       node_id_t id = topk_heap_[i].first;
       if (fetch_vector_) {
         IndexStorage::MemoryBlock meta_block;
-        entity_->get_vector_meta(id, meta_block);
-        IndexSparseDocument sparse_doc;
+        int status = entity_->get_vector_meta(id, meta_block);
         IndexStorage::MemoryBlock vec_block;
-        entity_->get_sparse_data(id, vec_block);
+        int sparse_length = 0;
+        if (status == 0) {
+          status = entity_->get_sparse_data_from_vector(
+              meta_block.data(), vec_block, sparse_length);
+        }
+        if (status != 0) {
+          results_[idx].clear();
+          return status;
+        }
+        IndexSparseDocument sparse_doc;
         const void *sparse_data = vec_block.data();
         if (sparse_data != nullptr) {
           SparseUtility::ReverseSparseFormat(sparse_data, sparse_doc,
@@ -195,11 +200,11 @@ class HnswSparseContext : public IndexContext {
       }
     }
 
-    return;
+    return 0;
   }
 
   //! Construct result from topk heap, result will be normalized
-  inline void topk_to_group_result(uint32_t idx) {
+  inline int topk_to_group_result(uint32_t idx) {
     ailego_assert_with(idx < group_results_.size(), "invalid idx");
 
     group_results_[idx].clear();
@@ -252,10 +257,18 @@ class HnswSparseContext : public IndexContext {
 
         if (fetch_vector_) {
           IndexStorage::MemoryBlock meta_block;
-          entity_->get_vector_meta(id, meta_block);
-          IndexSparseDocument sparse_doc;
+          int status = entity_->get_vector_meta(id, meta_block);
           IndexStorage::MemoryBlock vec_block;
-          entity_->get_sparse_data(id, vec_block);
+          int sparse_length = 0;
+          if (status == 0) {
+            status = entity_->get_sparse_data_from_vector(
+                meta_block.data(), vec_block, sparse_length);
+          }
+          if (status != 0) {
+            group_results_[idx].clear();
+            return status;
+          }
+          IndexSparseDocument sparse_doc;
           const void *sparse_data = vec_block.data();
           if (sparse_data != nullptr) {
             SparseUtility::ReverseSparseFormat(sparse_data, sparse_doc,
@@ -270,6 +283,7 @@ class HnswSparseContext : public IndexContext {
         }
       }
     }
+    return 0;
   }
 
   inline void reset_query(const void *query) {
@@ -425,6 +439,11 @@ class HnswSparseContext : public IndexContext {
 
   inline bool error() const {
     return dc_.error();
+  }
+
+  void clear_insert_heaps() noexcept {
+    for (auto &heap : level_topks_) heap.clear();
+    update_heap_.clear();
   }
 
   inline void clear() {

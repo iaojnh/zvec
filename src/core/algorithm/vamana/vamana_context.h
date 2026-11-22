@@ -112,11 +112,11 @@ class VamanaContext : public IndexContext {
     results_.resize(size);
   }
 
-  inline void topk_to_result() {
-    topk_to_result(0);
+  inline int topk_to_result() {
+    return topk_to_result(0);
   }
 
-  void topk_to_result(uint32_t idx);
+  int topk_to_result(uint32_t idx);
 
   void topk_to_keys(std::vector<uint64_t> &keys,
                     std::vector<float> *scores = nullptr);

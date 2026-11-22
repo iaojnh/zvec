@@ -148,6 +148,7 @@ struct NeighborsHeader {
 
 struct Neighbors {
   Neighbors() : cnt{0}, data{nullptr} {}
+  explicit Neighbors(int error) : cnt{0}, status{error}, data{nullptr} {}
 
   Neighbors(uint32_t cnt_in, const node_id_t *data_in)
       : cnt{cnt_in}, data{data_in} {}
@@ -168,6 +169,7 @@ struct Neighbors {
   }
 
   uint32_t cnt;
+  int status{0};
   const node_id_t *data;
   IndexStorage::MemoryBlock neighbor_block;
 };
@@ -200,6 +202,7 @@ using BufferPoolMemoryBlock = IndexStorage::MemoryBlock;
 template <typename MemBlockType>
 struct NeighborsT {
   NeighborsT() : cnt{0}, data{nullptr} {}
+  explicit NeighborsT(int error) : cnt{0}, status{error}, data{nullptr} {}
 
   NeighborsT(uint32_t cnt_in, const node_id_t *data_in)
       : cnt{cnt_in}, data{data_in} {}
@@ -227,6 +230,7 @@ struct NeighborsT {
   }
 
   uint32_t cnt;
+  int status{0};
   const node_id_t *data;
   MemBlockType neighbor_block;
 };

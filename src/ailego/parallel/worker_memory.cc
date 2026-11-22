@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <cassert>
 #include <mutex>
-#include <zvec/ailego/buffer/memory_reservation.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/parallel/worker_memory.h>
 
 namespace zvec::ailego {
@@ -22,15 +22,19 @@ class WorkerMemoryBudget {
     if (bytes > std::numeric_limits<size_t>::max() - active_)
       throw std::bad_alloc();
     const size_t target = active_ + bytes;
-    if (target > reservation_.bytes()) {
-      reservation_.add(target - reservation_.bytes(), bytes);
-    } else if (!pool.try_materialize(bytes)) {
+    if (target > reserved_) {
+      if (!pool.try_charge_process_backing(target - reserved_, bytes,
+                                           /*pending_copy=*/true))
+        throw std::bad_alloc();
+      reserved_ = target;
+    } else if (!pool.try_reserve_materialization(bytes)) {
       throw std::bad_alloc();
     }
     active_ = target;
   }
   void started(size_t bytes) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
+    MemoryLimitPool::get_instance().finish_materialization(bytes, true);
     started_ += bytes;
     assert(started_ <= active_);
     retained_ = std::max(retained_, started_);
@@ -38,14 +42,23 @@ class WorkerMemoryBudget {
   void release(size_t bytes, size_t started) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     assert(active_ >= bytes && started_ >= started);
+    auto &pool = MemoryLimitPool::get_instance();
+    if (started < bytes) pool.finish_materialization(bytes - started, false);
     active_ -= bytes;
     started_ -= started;
-    reservation_.retain_at_most(std::max(active_, retained_));
+    const size_t remaining = std::max(active_, retained_);
+    if (reserved_ > remaining) {
+      pool.release_heap_process_backing(reserved_ - remaining,
+                                        ProcessRssBudget::HeapProjection{});
+      reserved_ = remaining;
+    }
   }
 
  private:
   std::mutex mutex_;
-  MemoryReservation reservation_;
+  // Stack backing can outlive the worker, and belongs to the process RSS
+  // ledger. It must not keep the native page cache's capacity reserved.
+  size_t reserved_{0};
   size_t active_{0};
   size_t started_{0};
   size_t retained_{0};

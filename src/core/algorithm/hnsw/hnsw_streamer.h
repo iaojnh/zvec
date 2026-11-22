@@ -242,6 +242,7 @@ class HnswStreamer : public IndexStreamer {
   //! Bind the distance functions and inline record layout used for search
   void bind_search_dist_space(HnswContext *ctx) const;
   HnswGraphMutex *buffered_graph_mutex() const;
+  bool search_blocked_in_callback() const;
 
  private:
   enum State { STATE_INIT = 0, STATE_INITED = 1, STATE_OPENED = 2 };

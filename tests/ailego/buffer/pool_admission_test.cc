@@ -17,6 +17,7 @@
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/io/file.h>
+#include <zvec/ailego/parallel/worker_memory.h>
 #if defined(__APPLE__)
 #include <sys/mman.h>
 #include <TargetConditionals.h>
@@ -52,6 +53,9 @@ struct MemoryLimitPoolTestPeer {
   static void sample_rss(MemoryLimitPool &pool, size_t rss) {
     rss_sample = rss;
     pool.process_rss_.refresh(true);
+  }
+  static size_t rss_available(const MemoryLimitPool &pool) {
+    return pool.process_rss_.available();
   }
   static bool confirm_rss(MemoryLimitPool &pool, size_t owned) {
     return pool.process_rss_.publish_resident_sample(
@@ -306,6 +310,51 @@ TEST_F(PoolAdmissionTest, RequiredWritePageUsesRemainingRssRoom) {
   EXPECT_FALSE(pool_.try_acquire_buffer(page_, buffer, /*required=*/true));
   pool_.set_memory_pressure(Pressure::kNormal);
 }
+
+#if defined(__APPLE__) || defined(__linux__) || defined(_WIN32)
+TEST_F(PoolAdmissionTest, WorkerStackChargeSurvivesNativeCapacityReset) {
+  constexpr size_t kRss = 64UL << 20;
+  constexpr size_t kLimit = 128UL << 20;
+  const size_t worker_bytes = DefaultNativeWorkerStackBytes();
+  ASSERT_GT(worker_bytes, 0u);
+  ASSERT_EQ(0, pool_.init(64UL << 20));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, kLimit, kRss));
+  const size_t available = MemoryLimitPoolTestPeer::rss_available(pool_);
+  ASSERT_LE(3 * worker_bytes, available);
+  {
+    WorkerMemoryLease lease(1);
+    const size_t after_reserve = MemoryLimitPoolTestPeer::rss_available(pool_);
+    EXPECT_GE(after_reserve, available - 2 * worker_bytes);
+    EXPECT_LE(after_reserve, available - worker_bytes);
+    std::thread worker([] {});
+    lease.worker_started();
+    worker.join();
+  }
+
+  EXPECT_EQ(0u, pool_.external_used());
+  ASSERT_EQ(0, pool_.init(128UL << 20));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, kLimit, kRss));
+  EXPECT_EQ(kLimit - kRss - pool_.used() - worker_bytes,
+            MemoryLimitPoolTestPeer::rss_available(pool_));
+
+  const size_t before_abandoned_start =
+      MemoryLimitPoolTestPeer::rss_available(pool_);
+  {
+    WorkerMemoryLease lease(2);
+    EXPECT_EQ(before_abandoned_start - 3 * worker_bytes,
+              MemoryLimitPoolTestPeer::rss_available(pool_));
+    // Neither worker was started, as after a thread-creation failure.
+  }
+  EXPECT_EQ(before_abandoned_start,
+            MemoryLimitPoolTestPeer::rss_available(pool_));
+
+  const size_t too_small = kRss + pool_.used() + 2 * worker_bytes - 1;
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::configure_rss(pool_, too_small, kRss));
+  EXPECT_THROW(WorkerMemoryLease{1}, std::bad_alloc);
+}
+#endif
 
 TEST_F(PoolAdmissionTest, ConcurrentMixedAdmissionStaysWithinBothLimits) {
   ASSERT_EQ(0, pool_.init(baseline_ + 32 * page_));

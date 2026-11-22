@@ -87,7 +87,7 @@ class ZVEC_AILEGO_API File {
   //! Create a local file
   bool create(const char *path, size_t size, bool direct);
 
-  //! Create an empty file only if the path does not already exist.
+  //! Create an empty local file if the path does not already exist.
   bool create_exclusive(const char *path);
 
   //! Open a local file

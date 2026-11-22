@@ -160,10 +160,10 @@ jobs:
           apk info -e libaio
         shell: sh
 
-      - name: Run DiskAnn C++ Tests (w/ libaio)
+      - name: Run DiskAnn and libaio storage C++ tests
         run: |
           cd "$GITHUB_WORKSPACE/build"
-          ctest -R diskann --output-on-failure --parallel $NPROC
+          ctest -R "diskann|vector_page_table_bypass_aio|chunk_read_prefetch" --output-on-failure --parallel $NPROC
         shell: sh
 
       - name: Run DiskAnn Python Tests (w/ libaio)

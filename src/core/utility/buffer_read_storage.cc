@@ -705,12 +705,12 @@ class BufferReadStorage : public IndexStorage {
 
       // IndexUnpacker requires a stable pointer until its next callback.
       IndexParsingInput scratch;
-      int read_error = IndexError_ReadData;
+      int read_error = 0;
       auto read_data = [&candidate_handle, &scratch, &read_error,
                         candidate_index_offset, container_size](
                            size_t offset, const void **data, size_t len,
                            bool retry = false) -> size_t {
-        read_error = IndexError_ReadData;
+        read_error = 0;
         if (offset > container_size) {
           offset = container_size;
           len = 0;
@@ -729,6 +729,7 @@ class BufferReadStorage : public IndexStorage {
         if (candidate_handle->get_meta(
                 file_offset, len, reinterpret_cast<char *>(scratch.data())) !=
             0) {
+          read_error = IndexError_ReadData;
           return 0;
         }
         return len;
@@ -737,7 +738,7 @@ class BufferReadStorage : public IndexStorage {
       IndexUnpacker unpacker;
       if (!unpacker.unpack(read_data, container_size, checksum_validation_,
                            /*report_errors=*/false, /*retry_private=*/true)) {
-        if (read_error == IndexError_NoMemory) return read_error;
+        if (read_error != 0) return read_error;
         LOG_ERROR("Failed to unpack file: %s", path.c_str());
         return IndexError_UnpackIndex;
       }

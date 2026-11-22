@@ -102,6 +102,12 @@ struct MetadataCharge {
 
 struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
                                  std::enable_shared_from_this<State> {
+  using Clock = std::chrono::steady_clock;
+
+  Clock::time_point wait_deadline() const {
+    return Clock::now() + std::chrono::milliseconds(wait_ms);
+  }
+
   // Negative ref values exclusively own loading/eviction transitions. Pinning
   // precedes pointer access; only a successful 0 -> kEvicting may free backing.
   struct Layout;
@@ -282,7 +288,8 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       ready = true;
     }
     ~ReadAhead() {
-      while (inflight) reap(true);
+      const auto deadline = owner.wait_deadline();
+      while (inflight) reap(&deadline);
       for (auto &slot : slots)
         if (slot.item) {
           if (!slot.done) cancel(slot);
@@ -313,11 +320,8 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
         if (slots[i].item && !slots[i].submitted && !slots[i].done)
           controls[count++] = &slots[i].control;
       if (!count) return;
-      int submitted;
-      do {
-        submitted =
-            LibAioLoader::Instance().io_submit(context, count, controls.data());
-      } while (submitted == -EINTR);
+      const int submitted =
+          LibAioLoader::Instance().io_submit(context, count, controls.data());
       if (submitted > 0) {
         for (int i = 0; i < submitted; ++i)
           slots[reinterpret_cast<uintptr_t>(controls[i]->data)].submitted =
@@ -334,18 +338,37 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
           finish(slots[reinterpret_cast<uintptr_t>(controls[i]->data)], -1);
       }
     }
-    void reap(bool wait) {
+    void reap(const Clock::time_point *deadline = nullptr) {
       if (!inflight) return;
       std::array<io_event, 64> events{};
-      timespec timeout{};
       int count;
-      do {
+      for (;;) {
+        const auto remaining =
+            deadline ? *deadline - Clock::now() : Clock::duration::zero();
+        const bool wait = remaining > Clock::duration::zero();
+        timespec timeout{};
+        if (wait) {
+          const auto seconds =
+              std::chrono::duration_cast<std::chrono::seconds>(remaining);
+          timeout.tv_sec = seconds.count();
+          timeout.tv_nsec =
+              std::chrono::duration_cast<std::chrono::nanoseconds>(remaining -
+                                                                   seconds)
+                  .count();
+        }
         count = LibAioLoader::Instance().io_getevents(
             context, wait ? 1 : 0, static_cast<long>(inflight), events.data(),
-            wait ? nullptr : &timeout);
-      } while (count == -EINTR);
-      if (count < 0 || static_cast<size_t>(count) > inflight ||
-          (wait && count == 0)) {
+            &timeout);
+        if (count != -EINTR || !wait) break;
+      }
+      if (count == -EINTR && !deadline) return;
+      if (deadline && (count == 0 || count == -EINTR)) {
+        // io_destroy can wait for requests the kernel cannot cancel. Retire
+        // the optional queue now and defer destruction until storage close.
+        fail_pending_reads(-ETIMEDOUT, /*destroy_now=*/false);
+        return;
+      }
+      if (count < 0 || static_cast<size_t>(count) > inflight) {
         fail_pending_reads(count);
         return;
       }
@@ -365,24 +388,27 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       }
     }
 
-    void fail_pending_reads(int result) {
+    void fail_pending_reads(int result, bool destroy_now = true) {
       ready = false;
-      const int destroyed =
-          LibAioLoader::Instance().destroy_budgeted(context, ring_memory);
-      if (destroyed == 0) {
+      const int destroy_error =
+          destroy_now
+              ? LibAioLoader::Instance().destroy_budgeted(context, ring_memory)
+              : 0;
+      const bool destroyed = destroy_now && destroy_error == 0;
+      if (destroyed) {
         ring_charge.reset();
         ring_bytes.store(0, std::memory_order_relaxed);
-      } else {
+      } else if (destroy_now) {
         LOG_ERROR(
             "ChunkReadStorage: AIO completion failed (%d), teardown "
             "failed (%d)",
-            result, destroyed);
+            result, destroy_error);
       }
       for (size_t i = 0; i < depth; ++i) {
         auto &slot = slots[i];
         if (!slot.item) continue;
         if (!slot.done) {
-          if (destroyed && slot.submitted) {
+          if (!destroyed && slot.submitted) {
             // Leave kernel destinations charged and out of the allocator.
             // Demand can retry in separate storage and this queue stays
             // disabled.
@@ -434,22 +460,26 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       owner.prefetch_pending_requests.store(occupied,
                                             std::memory_order_release);
     }
-    Entry *take(Entry *item, bool record_miss = true) {
-      std::lock_guard<std::mutex> lock(mutex);
+    Entry *take(Entry *item, const Clock::time_point &deadline,
+                bool record_miss = true) {
+      std::unique_lock<std::timed_mutex> lock(mutex, std::defer_lock);
+      if (!lock.try_lock_until(deadline)) return nullptr;
       for (size_t i = 0; i < depth; ++i) {
         auto &slot = slots[i];
         if (slot.item != item) continue;
-        const auto start = std::chrono::steady_clock::now();
+        const auto start = Clock::now();
+        const auto account_wait = ailego::ScopeGuard::Make([&] {
+          owner.prefetch_wait_ns.fetch_add(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  Clock::now() - start)
+                  .count(),
+              std::memory_order_relaxed);
+        });
         while (!slot.done) {
           flush();
-          if (!slot.done) reap(true);
+          if (!slot.done) reap(&deadline);
           if (!slot.item) return nullptr;
         }
-        owner.prefetch_wait_ns.fetch_add(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - start)
-                .count(),
-            std::memory_order_relaxed);
         Entry *result =
             owner.pin(*item, reinterpret_cast<size_t>(item), slot.resident)
                 ? item
@@ -464,36 +494,36 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       return nullptr;
     }
     // Metadata admission must not compete with this segment's optional hint
-    // pins, including hints beyond the first header. Complete kernel writes
-    // before releasing their pins; real demand readers retain their own pins.
+    // pins, including hints beyond the first header. Keep unconfirmed kernel
+    // destinations isolated and leave independent demand pins intact.
     void yield_for_parsing(size_t offset, size_t length) {
-      std::lock_guard<std::mutex> lock(mutex);
-      yield_for_parsing_locked(offset, length);
+      const auto deadline = owner.wait_deadline();
+      std::lock_guard<std::timed_mutex> lock(mutex);
+      yield_for_parsing_locked(offset, length, deadline);
     }
-    void yield_for_parsing_locked(size_t offset, size_t length) {
+    void yield_for_parsing_locked(size_t offset, size_t length,
+                                  const Clock::time_point &deadline) {
       for (size_t i = 0; i < depth; ++i) {
         auto &slot = slots[i];
         if (!slot.item || slot.item->offset >= offset + length ||
             slot.item->offset + slot.item->bytes <= offset)
           continue;
-        while (!slot.done) {
-          flush();
-          if (!slot.done) reap(true);
-          if (!slot.item) break;
-        }
+        if (!slot.done && !slot.submitted) cancel(slot);
+        while (slot.item && !slot.done) reap(&deadline);
         if (slot.item) release(slot);
       }
     }
     void begin_parsing() {
-      std::lock_guard<std::mutex> lock(mutex);
+      const auto deadline = owner.wait_deadline();
+      std::lock_guard<std::timed_mutex> lock(mutex);
       ++parsers;
       // No new hints can enter until the last parser exits. Retire completed
       // and in-flight optional slots across this source, including other
       // segments; demand readers keep their independent pins.
-      yield_for_parsing_locked(0, owner.file_size);
+      yield_for_parsing_locked(0, owner.file_size, deadline);
     }
     void end_parsing() noexcept {
-      std::lock_guard<std::mutex> lock(mutex);
+      std::lock_guard<std::timed_mutex> lock(mutex);
       assert(parsers != 0);
       --parsers;
     }
@@ -510,9 +540,9 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     }
     bool hint(size_t offset, size_t length,
               const std::shared_ptr<Layout> &layout, bool retire_stale) {
-      std::lock_guard<std::mutex> lock(mutex);
-      if (parsers) return false;
-      reap(false);
+      std::unique_lock<std::timed_mutex> lock(mutex, std::try_to_lock);
+      if (!lock || parsers) return false;
+      reap();
       if (!ready) return false;
       size_t begin = offset;
       for (; begin < offset + length;) {
@@ -613,7 +643,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     bool ready{false};
     std::array<Slot, 64> slots{};
     std::array<Pool::CacheBuffer *, 64> quarantined{};
-    std::mutex mutex;
+    std::timed_mutex mutex;
   };
 #endif
 
@@ -951,7 +981,8 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     io_bytes.fetch_add(got, std::memory_order_relaxed);
     return got >= required;
   }
-  Entry *cached(Entry *item) {
+  Entry *cached(Entry *item,
+                [[maybe_unused]] const Clock::time_point &deadline) {
     const size_t key = reinterpret_cast<size_t>(item);
     if (!item) {
       misses.fetch_add(1, std::memory_order_relaxed);
@@ -959,7 +990,8 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     }
 #if defined(__linux__) && !defined(__ANDROID__)
     if (read_ahead && prefetch_pending_requests.load(std::memory_order_acquire))
-      if (auto *prefetched = read_ahead->take(item)) return prefetched;
+      if (auto *prefetched = read_ahead->take(item, deadline))
+        return prefetched;
 #endif
     if (pin(*item, key)) return item;
     misses.fetch_add(1, std::memory_order_relaxed);
@@ -972,7 +1004,8 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       // A hint can claim the entry between take() and this CAS. Join it
       // rather than issuing a duplicate synchronous read into scratch.
       if (expected == kLoading && read_ahead)
-        if (auto *prefetched = read_ahead->take(item, false)) return prefetched;
+        if (auto *prefetched = read_ahead->take(item, deadline, false))
+          return prefetched;
 #endif
       return nullptr;  // Another loader/evictor owns this residency cycle.
     }
@@ -1026,8 +1059,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     return item;
   }
   View *acquire_view(size_t bytes, bool funded_only = false) {
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+    const auto deadline = wait_deadline();
     for (;;) {
       View *fit = nullptr, *fallback = nullptr;
       size_t fit_size = std::numeric_limits<size_t>::max(), fallback_size = 0;
@@ -1056,14 +1088,16 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
           }
           return candidate;
         }
-        if (funded_only) return nullptr;
+        if (funded_only || Clock::now() >= deadline) return nullptr;
         continue;
       }
       if (funded_only) return nullptr;
       workspace_waits.fetch_add(1, std::memory_order_relaxed);
       std::unique_lock<std::mutex> lock(wait_mutex);
-      if (std::chrono::steady_clock::now() >= deadline) return nullptr;
-      changed.wait_for(lock, std::chrono::milliseconds(1));
+      const auto now = Clock::now();
+      if (now >= deadline) return nullptr;
+      changed.wait_until(
+          lock, std::min(deadline, now + std::chrono::milliseconds(1)));
     }
   }
   bool ensure_workspace(View &view, size_t bytes, bool parsing = false) {
@@ -1134,14 +1168,15 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
                  ? layout->find(position)
                  : entry(position / chunk_bytes, populate && cache_limit != 0);
     };
+    const auto deadline = wait_deadline();
     const auto source = [&](Entry *item) -> Entry * {
-      if (populate) return cached(item);
+      if (populate) return cached(item, deadline);
         // Parsing may borrow an already-funded cache hit, but must not add
         // optional cache mappings/tables before its directory is admitted.
 #if defined(__linux__) && !defined(__ANDROID__)
       if (item && read_ahead &&
           prefetch_pending_requests.load(std::memory_order_acquire)) {
-        if (auto *ready = read_ahead->take(item)) return ready;
+        if (auto *ready = read_ahead->take(item, deadline)) return ready;
       }
 #endif
       if (item && pin(*item, reinterpret_cast<size_t>(item))) return item;
@@ -1296,10 +1331,11 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       return layout ? layout->find(position)
                     : entry(position / chunk_bytes, cache_limit != 0);
     };
+    const auto deadline = wait_deadline();
     auto *first = locate(offset);
     const bool single = first && len <= first->bytes - (offset - first->offset);
     if (single) {
-      if (auto *item = cached(first)) {
+      if (auto *item = cached(first, deadline)) {
         out.lease =
             lease(out, nullptr, layout, item, reinterpret_cast<size_t>(item));
         out.spans.push_back(
@@ -1344,7 +1380,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
           source
               ? std::min(source->offset + source->bytes, offset + len)
               : std::min((begin / chunk_bytes + 1) * chunk_bytes, offset + len);
-      Entry *item = single ? nullptr : cached(source);
+      Entry *item = single ? nullptr : cached(source, deadline);
       if (item) {
         // Record the pin before any descriptor growth or I/O can throw.
         const size_t key = reinterpret_cast<size_t>(item);
@@ -1876,10 +1912,10 @@ int ChunkReadStorage::open(const std::string &path, bool) {
     {
       auto &workspace = candidate->views.front()->workspace;
       IndexParsingInput metadata(workspace.data(), workspace.mapped_size());
-      int read_error = IndexError_ReadData;
+      int read_error = 0;
       auto read = [&](size_t offset, const void **data, size_t length,
                       bool retry = false) {
-        read_error = IndexError_ReadData;
+        read_error = 0;
         if (offset > container_size || length > container_size - offset)
           return size_t{0};
         if (!metadata.prepare(length, retry)) {
@@ -1887,15 +1923,16 @@ int ChunkReadStorage::open(const std::string &path, bool) {
           return size_t{0};
         }
         *data = metadata.data();
-        return candidate->meta_file.read(
+        const size_t got = candidate->meta_file.read(
             static_cast<ssize_t>(candidate->index_offset + offset),
             metadata.data(), length);
+        if (got != length) read_error = IndexError_ReadData;
+        return got;
       };
       IndexUnpacker unpacker;
       if (!unpacker.unpack(read, container_size, checksum_,
                            /*report_errors=*/false, /*retry_private=*/true))
-        return read_error == IndexError_NoMemory ? read_error
-                                                 : IndexError_UnpackIndex;
+        return read_error != 0 ? read_error : IndexError_UnpackIndex;
       for (const auto &item : unpacker.segments()) {
         const auto &meta = item.second;
         if (meta.data_offset() > container_size ||

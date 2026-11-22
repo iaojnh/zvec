@@ -57,7 +57,7 @@ int VamanaAlgorithm<EntityType>::add_node(node_id_t id, VamanaContext *ctx) {
   }
   ctx->reset_query(query_block.data());
 
-  int ret = greedy_search(entry_point, ctx, /*use_pool=*/false);
+  int ret = greedy_search(entry_point, ctx, /*building=*/true);
   if (ailego_unlikely(ret != 0)) {
     return ret;
   }
@@ -141,7 +141,7 @@ int VamanaAlgorithm<EntityType>::search(VamanaContext *ctx) const {
     search_heap.reset<TopkHeap>(ef_search);
   }
 
-  return greedy_search(entry_point, ctx, /*use_pool=*/true);
+  return greedy_search(entry_point, ctx, /*building=*/false);
 }
 
 // ============================================================================
@@ -260,6 +260,10 @@ void fast_greedy_search(const EntityType &entity, HeapType &pool,
       prefetch_graph_row(entity, before);
     }
     const auto neighbors = entity.get_neighbors_typed(before);
+    if (ailego_unlikely(neighbors.status != 0)) {
+      dc.set_error(neighbors.status);
+      return;
+    }
     compute_neighbor_row(neighbors);
     if (ailego_unlikely(dc.error())) {
       return;
@@ -277,6 +281,10 @@ void fast_greedy_search(const EntityType &entity, HeapType &pool,
   // Preserve this insertion order and visited deduplication: ties and
   // capacity pruning depend on them.
   const auto start_neighbors = entity.get_neighbors_typed(start);
+  if (ailego_unlikely(start_neighbors.status != 0)) {
+    dc.set_error(start_neighbors.status);
+    return;
+  }
   // The depth limit can leave the cached row at the preceding node.
   if (cached_row != start) {
     compute_neighbor_row(start_neighbors);
@@ -320,6 +328,10 @@ void fast_greedy_search(const EntityType &entity, HeapType &pool,
     }
 
     const auto neighbors = entity.get_neighbors_typed(current_node);
+    if (ailego_unlikely(neighbors.status != 0)) {
+      dc.set_error(neighbors.status);
+      return;
+    }
     if constexpr (kPrefetchGraph) {
       if (ailego_unlikely(!entity.is_contiguous())) {
         ailego_prefetch(neighbors.data);
@@ -390,7 +402,7 @@ void fast_greedy_search(const EntityType &entity, HeapType &pool,
 template <typename EntityType, typename MemBlockType, typename FilterFn>
 void dual_heap_greedy_search(const EntityType &entity, VamanaContext *ctx,
                              VamanaDistCalculator &dc, node_id_t entry_point,
-                             FilterFn &&filter) {
+                             bool strict_reads, FilterFn &&filter) {
   const uint32_t prefetch_offset = ctx->po();
   const size_t vector_lines =
       ailego_cache_line_count(entity.vector_data_size());
@@ -443,6 +455,11 @@ void dual_heap_greedy_search(const EntityType &entity, VamanaContext *ctx,
 
     // Expand neighbors using typed access (no virtual dispatch)
     const auto neighbors = entity.get_neighbors_typed(current_node);
+    if (ailego_unlikely(neighbors.status != 0)) {
+      if (!strict_reads) continue;
+      dc.set_error(neighbors.status);
+      return;
+    }
     ailego_prefetch(neighbors.data);
 
     // Resize buffers if this node has more neighbors than expected
@@ -470,7 +487,10 @@ void dual_heap_greedy_search(const EntityType &entity, VamanaContext *ctx,
     neighbor_vec_blocks.clear();
     int ret = entity.get_vector_typed(neighbor_ids.data(), unvisited_count,
                                       neighbor_vec_blocks);
-    if (ailego_unlikely(ret != 0)) break;
+    if (ailego_unlikely(ret != 0)) {
+      if (strict_reads) dc.set_error(ret);
+      return;
+    }
 
     for (uint32_t i = 0; i < std::min(prefetch_offset, unvisited_count); ++i) {
       const void *vector = neighbor_vec_blocks[i].data();
@@ -511,7 +531,7 @@ void dual_heap_greedy_search(const EntityType &entity, VamanaContext *ctx,
 template <typename EntityType>
 int VamanaAlgorithm<EntityType>::greedy_search(node_id_t entry_point,
                                                VamanaContext *ctx,
-                                               bool use_pool) const {
+                                               bool building) const {
   const auto &entity = static_cast<const EntityType &>(ctx->get_entity());
   VamanaDistCalculator &dc = ctx->dist_calculator();
 
@@ -523,12 +543,17 @@ int VamanaAlgorithm<EntityType>::greedy_search(node_id_t entry_point,
   const uint32_t prefetch_lines =
       ctx->pl() > 0 ? std::min<size_t>(ctx->pl(), vector_lines) : vector_lines;
 
-  if (!use_pool || index_filter.is_valid()) {
-    // Fallback path used by add_node (use_pool=false) and filtered search.
+  // Construction already published the vector and has no graph rollback.
+  // Keep the candidates it could read and let its caller handle distance
+  // errors.
+  const bool strict_reads = !building;
+  if (building || index_filter.is_valid()) {
+    // Fallback path used by construction and filtered search.
     // Dispatched to dual_heap_greedy_search (plain batch_dist).
     auto run_with_filter = [&](auto &&filter) {
       dual_heap_greedy_search<EntityType, MemBlockType>(
-          entity, ctx, dc, entry_point, std::forward<decltype(filter)>(filter));
+          entity, ctx, dc, entry_point, strict_reads,
+          std::forward<decltype(filter)>(filter));
     };
 
     if (index_filter.is_valid()) {
@@ -570,11 +595,11 @@ int VamanaAlgorithm<EntityType>::greedy_search(node_id_t entry_point,
     } else {
       // BufferPool entities: fallback to dual-heap path.
       auto filter = [](node_id_t) { return false; };
-      dual_heap_greedy_search<EntityType, MemBlockType>(entity, ctx, dc,
-                                                        entry_point, filter);
+      dual_heap_greedy_search<EntityType, MemBlockType>(
+          entity, ctx, dc, entry_point, strict_reads, filter);
     }
   }
-  return 0;
+  return strict_reads ? dc.error_code() : 0;
 }
 
 template <typename EntityType>
@@ -607,12 +632,14 @@ int VamanaAlgorithm<EntityType>::refine_node(node_id_t id, float alpha,
   ctx->dist_calculator().clear_compare_cnt();
   ctx->reset_query(query_block.data());
 
-  int ret = greedy_search(entry_point, ctx, /*use_pool=*/false);
+  int ret = greedy_search(entry_point, ctx, /*building=*/true);
   if (ailego_unlikely(ret != 0)) {
     return ret;
   }
 
   const Neighbors current_neighbors = entity_.get_neighbors(id);
+  // Keep the current row if it could not be read for refinement.
+  if (ailego_unlikely(current_neighbors.status != 0)) return 0;
 
   // Unlike add_node(), the node being refined is already visible in the
   // graph, so GreedySearch can return `id` itself with distance zero. Remove
@@ -844,6 +871,7 @@ void VamanaAlgorithm<EntityType>::reverse_update_neighbor(node_id_t id,
   std::lock_guard<std::mutex> lock(lock_pool_[neighbor_id & kLockMask]);
 
   const Neighbors current_neighbors = entity_.get_neighbors(neighbor_id);
+  if (ailego_unlikely(current_neighbors.status != 0)) return;
   uint32_t current_size = current_neighbors.size();
   uint32_t max_deg = entity_.max_degree();
 

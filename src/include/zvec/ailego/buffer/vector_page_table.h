@@ -778,6 +778,7 @@ class ZVEC_AILEGO_API VecBufferPool {
 
   //! Extend the backing file and page table to `new_size`.
   bool extend_file(size_t new_size);
+  PageWriteStatus extend_file_status(size_t new_size);
 
   bool writable() const {
     return writable_;
@@ -801,7 +802,7 @@ class ZVEC_AILEGO_API VecBufferPool {
   void stop_writeback();
 
   // Permanently abandon writeback after the storage becomes inconsistent.
-  // Call once from the thread reporting the failure, before its owners retire.
+  // Stop the writeback worker before retiring the file owner.
   void quarantine_writeback();
 
   // The pool cannot retry writes after corruption or unconfirmed kernel I/O.
@@ -882,11 +883,14 @@ class ZVEC_AILEGO_API VecBufferPool {
                            uint8_t priority);
   bool load_pages_aio(const block_id_t *page_ids, size_t count,
                       uint8_t priority);
-  bool read_ranges_bypass_aio(const ReadRange *ranges, size_t count);
   bool enqueue_writeback(block_id_t page_id);
   void start_writeback();
   void drain_writeback();
   void writeback_loop();
+  void mark_writeback_quarantined();
+  // Finish any in-flight eviction before pinning a dirty page for writeback.
+  // With wait disabled, the caller completes its current batch and retries.
+  bool pin_dirty_writeback_page(block_id_t page_id, bool wait, char *&buffer);
   // The caller supplies sorted, distinct page IDs.
   bool flush_writeback_batch(const block_id_t *page_ids, size_t count,
                              char *staging);
@@ -971,6 +975,7 @@ class ZVEC_AILEGO_API VecBufferPool {
   std::condition_variable writeback_drained_cv_{};
   std::deque<block_id_t> writeback_queue_{};
   std::mutex writeback_flush_mutex_{};
+  std::shared_mutex eviction_writeback_mutex_{};
   size_t writeback_inflight_{0};
   bool writeback_stopping_{false};
 };

@@ -128,7 +128,7 @@ const Neighbors HnswRabitqStreamerEntity::get_neighbors(level_t level,
   size_t size = chunk->read(offset, neighbor_block, neighbor_size);
   if (ailego_unlikely(size != neighbor_size)) {
     LOG_ERROR("Read neighbor header failed, ret=%zu", size);
-    return Neighbors();
+    return Neighbors(chunk->read_error());
   }
   return Neighbors(std::move(neighbor_block));
 }

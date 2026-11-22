@@ -107,7 +107,7 @@ class HnswAlgorithm : public HnswAlgorithmBase {
  private:
   //! Select in upper layer to get entry point for next layer search
   void select_entry_point(level_t level, node_id_t *entry_point, dist_t *dist,
-                          HnswContext *ctx) const;
+                          HnswContext *ctx, bool fail_on_read_error) const;
 
   //! update node id neighbors from topkHeap, and reverse link is also updated
   int add_neighbors(node_id_t id, level_t level, TopkHeap &topk_heap,
@@ -122,7 +122,8 @@ class HnswAlgorithm : public HnswAlgorithmBase {
   //! add_node, filtered queries, and upper levels for every backend.
   //! Note: entry_point and dist will be updated to current level nearest node.
   void search_neighbors(level_t level, node_id_t *entry_point, dist_t *dist,
-                        TopkHeap &topk, HnswContext *ctx) const;
+                        TopkHeap &topk, HnswContext *ctx,
+                        bool fail_on_read_error) const;
 
   //! Update the node's neighbors
   int update_neighbors(HnswDistCalculator &dc, node_id_t id, level_t level,
@@ -143,6 +144,9 @@ class HnswAlgorithm : public HnswAlgorithmBase {
   HnswAlgorithm &operator=(const HnswAlgorithm &) = delete;
 
  private:
+  static constexpr bool kTransactionalBuild =
+      std::is_same_v<EntityType, HnswBufferPoolStreamerEntity>;
+
   // A full reverse-neighbor update performs diversity pruning while holding
   // the node stripe.  BufferStorage uses more stripes so unrelated high-M
   // updates do not serialize; leave every other backend's scheduling intact.

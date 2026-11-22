@@ -64,7 +64,7 @@ class HnswGraphLock {
   HnswGraphLock &operator=(const HnswGraphLock &) = delete;
 
   static bool active();
-  static bool has_writer();
+  static bool has_writer(const HnswGraphMutex *mutex = nullptr);
 
   bool owns_lock() const {
     return mutex_ != nullptr;

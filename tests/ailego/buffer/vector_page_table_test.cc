@@ -906,6 +906,81 @@ TEST_F(BufferPoolTest, DirtyFlushFailureKeepsPageResident) {
   EXPECT_FALSE(table.is_block_dirty(/*block_id=*/0));
 }
 
+TEST_F(BufferPoolTest, ExplicitFlushRetriesFailedSynchronousEviction) {
+  init_vec_pool(/*capacity_pages=*/16, /*file_pages=*/1, /*writable=*/true);
+  QueueResidentSampleTestPeer::stop_background();
+  const std::string file = new_file(1);
+  std::promise<void> eviction_entered;
+  std::promise<void> resume_eviction;
+  std::promise<void> flush_entered;
+  auto entered = eviction_entered.get_future();
+  auto resume = resume_eviction.get_future();
+  auto flushing = flush_entered.get_future();
+  std::atomic<bool> first_flush{true};
+  VecBufferPool pool(file, /*writable=*/true);
+  ASSERT_EQ(0, pool.init());
+  pool.stop_writeback();
+
+  const char replacement = 'x';
+  ASSERT_EQ(0, pool.write_range(0, 1, &replacement));
+  pool.page_table_.set_flush_callback([&](block_id_t, char *, size_t, size_t) {
+    if (first_flush.exchange(false)) {
+      eviction_entered.set_value();
+      resume.wait();
+    }
+    return -1;
+  });
+  std::future<bool> eviction;
+  std::future<int> flush;
+  bool resumed = false;
+  auto resume_if_needed = ScopeGuard::Make([&] {
+    if (!resumed) resume_eviction.set_value();
+  });
+  eviction = std::async(std::launch::async,
+                        [&] { return pool.page_table_.evict_block(0); });
+  ASSERT_EQ(std::future_status::ready,
+            entered.wait_for(std::chrono::seconds(5)));
+
+  flush = std::async(std::launch::async, [&] {
+    flush_entered.set_value();
+    return pool.flush_all();
+  });
+  ASSERT_EQ(std::future_status::ready,
+            flushing.wait_for(std::chrono::seconds(5)));
+  const auto before_eviction_finishes =
+      flush.wait_for(std::chrono::milliseconds(100));
+  resume_eviction.set_value();
+  resumed = true;
+  EXPECT_EQ(std::future_status::timeout, before_eviction_finishes);
+  EXPECT_FALSE(eviction.get());
+  EXPECT_EQ(0, flush.get());
+  EXPECT_FALSE(pool.page_table_.is_block_dirty(0));
+
+  FILE *input = std::fopen(file.c_str(), "rb");
+  ASSERT_NE(nullptr, input);
+  EXPECT_EQ(replacement, std::fgetc(input));
+  std::fclose(input);
+}
+
+#if defined(__linux__) && !defined(__ANDROID__)
+TEST_F(BufferPoolTest, OptionalWritebackRingLeavesRoomForData) {
+  if (current_io_backend_type() != IOBackendType::kIoUring) {
+    GTEST_SKIP() << "io_uring unavailable";
+  }
+  const size_t fixed = VecBufferPool::metadata_bytes_for_page_count(1, true);
+  constexpr size_t optional =
+      VecBufferPool::kWritebackBatchPages * kVectorPageSize;
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(fixed + optional));
+  const std::string path = new_file(1);
+  VecBufferPool pool(path, true);
+  ASSERT_EQ(0, pool.init());
+  EXPECT_EQ(0u, pool.stats().writeback_io_staging_bytes);
+  const char marker = 'w';
+  EXPECT_EQ(0, pool.write_range(0, 1, &marker));
+  EXPECT_EQ(0, pool.flush_all());
+}
+#endif
+
 TEST_F(BufferPoolTest, ConcurrentWritablePressureUsesBackgroundWriteback) {
   constexpr size_t kFilePages = 64;
   constexpr size_t kThreadCount = 8;
@@ -1261,7 +1336,8 @@ TEST_F(BufferPoolTest, FailedFileExtendDoesNotGrowBackingFile) {
   ASSERT_EQ(pool.init(), 0);
   const size_t old_size = pool.file_size();
   const size_t old_entries = pool.page_table_.entry_num();
-  EXPECT_FALSE(pool.extend_file(kSecondSegmentEntry * kVectorPageSize));
+  EXPECT_EQ(PageWriteStatus::kNoMemory,
+            pool.extend_file_status(kSecondSegmentEntry * kVectorPageSize));
   EXPECT_EQ(old_size, pool.file_size());
   EXPECT_EQ(old_entries, pool.page_table_.entry_num());
 
@@ -2421,24 +2497,26 @@ TEST_F(BufferPoolTest, BatchAcquireRollsBackPinsOnInvalidPage) {
 }
 
 #if defined(__APPLE__)
-TEST_F(BufferPoolTest, DarwinBypassDrainsShortBatchBeforeRetry) {
+TEST_F(BufferPoolTest, DarwinBypassRetriesShortBatchWithCrossPageRange) {
   init_vec_pool(/*capacity_pages=*/16, /*file_pages=*/4);
   const std::string file = new_file(/*num_pages=*/4);
   VecBufferPool pool(file, /*writable=*/false);
   ASSERT_EQ(0, pool.init());
-  std::array<char, 71> short_read{}, good_read{};
+  std::array<char, 71> short_read{}, cross_page{};
+  cross_page.fill('X');
   const VecBufferPool::ReadRange ranges[] = {
       {3 * kVectorPageSize, short_read.size(), short_read.data()},
-      {kVectorPageSize + 17, good_read.size(), good_read.data()}};
+      {kVectorPageSize - 17, cross_page.size(), cross_page.data()}};
   ASSERT_EQ(0, ::truncate(file.c_str(), 3 * kVectorPageSize));
   EXPECT_FALSE(pool.read_ranges_bypass(ranges, 2));
-  // A failed first request must not return while later destinations are used.
-  EXPECT_EQ(std::string(good_read.size(), '\1'),
-            std::string(good_read.data(), good_read.size()));
+  EXPECT_EQ(std::string(cross_page.size(), 'X'),
+            std::string(cross_page.data(), cross_page.size()));
   ASSERT_EQ(0, ::truncate(file.c_str(), 4 * kVectorPageSize));
   ASSERT_TRUE(pool.read_ranges_bypass(ranges, 2));
   EXPECT_EQ(std::string(short_read.size(), '\0'),
             std::string(short_read.data(), short_read.size()));
+  EXPECT_EQ(std::string(17, '\0') + std::string(cross_page.size() - 17, '\1'),
+            std::string(cross_page.data(), cross_page.size()));
 }
 
 #endif

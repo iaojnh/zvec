@@ -21,6 +21,7 @@
 #include <thread>
 #include <ailego/pattern/defer.h>
 #include <ailego/utility/memory_helper.h>
+#include <core/utility/reusable_read_scratch.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
@@ -337,6 +338,44 @@ TEST_F(BufferReadStorageTest, CrossPageReadReusesExclusiveScratchAtFullBudget) {
   EXPECT_EQ(charged, pool.external_used());
   EXPECT_EQ(0, std::memcmp(payload_.data() + offset + 7, block.data(), length));
   EXPECT_EQ(0, std::memcmp(payload_.data() + offset, copy.data(), length));
+}
+
+TEST_F(BufferReadStorageTest, ScratchRetriesOnlyAfterReleasingIdleBacking) {
+  using Block = IndexStorage::MemoryBlock;
+  ReusableReadScratch scratch;
+  size_t attempts = 0;
+  auto refuse = [&]() -> Block {
+    ++attempts;
+    throw std::bad_alloc();
+  };
+  EXPECT_THROW(scratch.acquire(64, 0, true, refuse), std::bad_alloc);
+  EXPECT_EQ(1u, attempts);
+  attempts = 0;
+  EXPECT_THROW(scratch.acquire(ReusableReadScratch::kMaxBytes + 1, 0, true,
+                               refuse),
+               std::bad_alloc);
+  EXPECT_EQ(1u, attempts);
+
+  auto held =
+      scratch.acquire(64, 0, true, [] { return Block::AllocateOwned(64); });
+  ASSERT_EQ(Block::MBT_REUSABLE_SCRATCH, held.type_);
+  attempts = 0;
+  EXPECT_THROW(scratch.acquire(128, 0, true, refuse, /*populate=*/false),
+               std::bad_alloc);
+  EXPECT_EQ(1u, attempts);
+  ASSERT_NE(nullptr, held.data());
+
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const auto before = pool.external_used();
+  held.reset();
+  attempts = 0;
+  auto replacement = scratch.acquire(128, 0, true, [&] {
+    if (++attempts == 1) throw std::bad_alloc();
+    EXPECT_LT(pool.external_used(), before);
+    return Block::AllocateOwned(128);
+  });
+  EXPECT_NE(nullptr, replacement.data());
+  EXPECT_EQ(2u, attempts);
 }
 
 TEST_F(BufferReadStorageTest, MemoryBlockPinsUntilReset) {
