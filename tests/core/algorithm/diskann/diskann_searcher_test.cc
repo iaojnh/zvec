@@ -22,6 +22,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_set>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/container/vector.h>
@@ -53,6 +54,10 @@ class DiskAnnCacheTestPeer {
   static void set_reader(DiskAnnStreamer *streamer,
                          std::shared_ptr<AlignedFileReader> reader) {
     streamer->diskann_indexer_->reader_ = std::move(reader);
+  }
+
+  static int load_entrypoints(DiskAnnSearcher *searcher) {
+    return searcher->diskann_indexer_->use_medroids_data_as_centroids();
   }
 
   static int configure_cache(DiskAnnSearcher *searcher,
@@ -101,6 +106,62 @@ static_assert(!std::is_copy_assignable_v<PlatformAlignedFileReader>);
 constexpr size_t static dim = 64;
 
 namespace {
+
+class RefuseLateAllocationStorage final : public IndexStorage {
+ public:
+  explicit RefuseLateAllocationStorage(Pointer storage)
+      : storage_(std::move(storage)) {}
+
+  int init(const Params &params) override {
+    return storage_->init(params);
+  }
+  int cleanup() override {
+    return storage_->cleanup();
+  }
+  int open(const std::string &path, bool create) override {
+    return storage_->open(path, create);
+  }
+  int flush() override {
+    return storage_->flush();
+  }
+  int close() override {
+    return storage_->close();
+  }
+  int append(const std::string &id, size_t size) override {
+    return storage_->append(id, size);
+  }
+  void refresh(uint64_t checkpoint) override {
+    storage_->refresh(checkpoint);
+  }
+  uint64_t check_point() const override {
+    return storage_->check_point();
+  }
+  Segment::Pointer get(const std::string &id, int level) override {
+    return storage_->get(id, level);
+  }
+  bool has(const std::string &id) const override {
+    return storage_->has(id);
+  }
+  uint32_t magic() const override {
+    return storage_->magic();
+  }
+  std::shared_ptr<File> file() const override {
+    return storage_->file();
+  }
+  std::string file_path() const override {
+    if (refuse_next_open_) {
+      refuse_next_open_ = false;
+      auto &rss = MemoryLimitPool::get_instance();
+      EXPECT_TRUE(rss.configure_process_rss_limit(1));
+      EXPECT_GT(rss.process_rss(), rss.process_rss_limit());
+    }
+    return storage_->file_path();
+  }
+
+ private:
+  Pointer storage_;
+  mutable bool refuse_next_open_{true};
+};
 
 class CountingAlignedFileReader final : public AlignedFileReader {
  public:
@@ -152,8 +213,12 @@ class CountingAlignedFileReader final : public AlignedFileReader {
 
 class FailingAlignedFileReader final : public AlignedFileReader {
  public:
-  explicit FailingAlignedFileReader(std::shared_ptr<AlignedFileReader> reader)
-      : reader_(std::move(reader)) {}
+  enum class Phase { kAll, kRead, kSubmit, kCompletion };
+
+  explicit FailingAlignedFileReader(std::shared_ptr<AlignedFileReader> reader,
+                                    int error = IndexError_ReadData,
+                                    Phase phase = Phase::kAll)
+      : reader_(std::move(reader)), error_(error), phase_(phase) {}
 
   void open(const std::string &fname) override {
     reader_->open(fname);
@@ -163,28 +228,51 @@ class FailingAlignedFileReader final : public AlignedFileReader {
     reader_->close();
   }
 
-  int read(std::vector<AlignedRead> & /*read_reqs*/, IOContext & /*ctx*/,
-           bool /*async*/ = false) override {
-    return IndexError_ReadData;
+  int read(std::vector<AlignedRead> &read_reqs, IOContext &ctx,
+           bool async = false) override {
+    if (phase_ == Phase::kAll || phase_ == Phase::kRead) return fail();
+    return reader_->read(read_reqs, ctx, async);
   }
 
-  int submit(PendingBatch & /*batch*/, std::vector<AlignedRead> & /*read_reqs*/,
-             IOContext & /*ctx*/) override {
-    return IndexError_ReadData;
+  int submit(PendingBatch &batch, std::vector<AlignedRead> &read_reqs,
+             IOContext &ctx) override {
+    if (phase_ == Phase::kAll || phase_ == Phase::kSubmit) return fail();
+    return reader_->submit(batch, read_reqs, ctx);
   }
 
-  int get_completed(PendingBatch & /*batch*/, IOContext & /*ctx*/,
-                    int /*min_completed*/,
-                    std::vector<uint32_t> & /*completed_indices*/) override {
-    return IndexError_ReadData;
+  int get_completed(PendingBatch &batch, IOContext &ctx, int min_completed,
+                    std::vector<uint32_t> &completed_indices) override {
+    if (phase_ == Phase::kAll) return fail();
+    const int ret =
+        reader_->get_completed(batch, ctx, min_completed, completed_indices);
+    // Inject the completion error after draining native requests, as a reader
+    // that reports a terminal error must no longer own the caller's buffer.
+    if (ret >= 0 && phase_ == Phase::kCompletion &&
+        batch.n_reaped == batch.n_submitted) {
+      completed_indices.clear();
+      return fail();
+    }
+    return ret;
   }
 
   void release_io_ctx(IOContext &ctx) override {
     reader_->release_io_ctx(ctx);
   }
 
+  size_t failure_count() const {
+    return failure_count_;
+  }
+
  private:
+  int fail() {
+    ++failure_count_;
+    return error_;
+  }
+
   std::shared_ptr<AlignedFileReader> reader_;
+  int error_;
+  Phase phase_;
+  size_t failure_count_{0};
 };
 
 class CorruptibleDiskAnnSearcherEntity final : public DiskAnnSearcherEntity {
@@ -283,6 +371,41 @@ TEST_F(DiskAnnSearcherTest, TestGeneral) {
   ASSERT_EQ(0, builder->dump(dumper));
   ASSERT_EQ(0, dumper->close());
 
+  // Resident tables and quantizer input must honor process pressure even
+  // with no native cache configured. A rejected load can be retried.
+  {
+    auto storage = IndexFactory::CreateStorage("FileReadStorage");
+    ASSERT_NE(storage, nullptr);
+    ASSERT_EQ(0, storage->open(path, false));
+    auto &pool = MemoryLimitPool::get_instance();
+    using Pressure = ProcessRssBudget::PressureLevel;
+    DiskAnnSearcherEntity entity;
+    {
+      const auto restore = ScopeGuard::Make(
+          [&] { pool.set_memory_pressure(Pressure::kNormal); });
+      pool.set_memory_pressure(Pressure::kCritical);
+      EXPECT_EQ(IndexError_NoMemory, entity.load(*_index_meta_ptr, storage));
+      EXPECT_EQ(nullptr, entity.pq_codes());
+    }
+    ASSERT_EQ(0, entity.load(*_index_meta_ptr, storage));
+    zvec::turbo::Quantizer::Pointer quantizer;
+    {
+      const auto restore = ScopeGuard::Make(
+          [&] { EXPECT_TRUE(pool.configure_process_rss_limit(0)); });
+      ASSERT_TRUE(pool.configure_process_rss_limit(1));
+      ASSERT_GT(pool.process_rss(), pool.process_rss_limit());
+      EXPECT_EQ(IndexError_NoMemory, entity.load_quantizer(quantizer));
+      EXPECT_EQ(nullptr, quantizer);
+    }
+    ASSERT_EQ(0, entity.load_quantizer(quantizer));
+    EXPECT_NE(nullptr, quantizer);
+    const auto clone = entity.clone();
+    ASSERT_NE(nullptr, clone);
+    entity.clear();
+    EXPECT_EQ(1u, clone->get_key(1));
+    EXPECT_EQ(1u, clone->get_id(1));
+  }
+
   // A fetch context now allocates only the sectors required for one node, so
   // the on-disk packing fields must be mutually consistent. Otherwise a
   // forged nodes-per-sector value can put the computed node offset beyond
@@ -301,15 +424,8 @@ TEST_F(DiskAnnSearcherTest, TestGeneral) {
     malformed_entity.set_node_layout(max_node_size,
                                      expected_node_per_sector + 1);
 
-    // The indexer now receives an externally built quantizer, exactly like the
-    // searcher does; the layout checks below still run before it is used.
-    std::string quantizer_meta_buffer;
-    ASSERT_EQ(0, malformed_entity.read_pq_quantizer_meta_buffer(
-                     &quantizer_meta_buffer));
-    auto pq_quantizer = DiskAnnUtil::create_quantizer_from_meta_buffer(
-        quantizer_meta_buffer, *_index_meta_ptr,
-        static_cast<uint32_t>(malformed_entity.pq_chunk_num()),
-        malformed_entity.legacy_pq_layout());
+    zvec::turbo::Quantizer::Pointer pq_quantizer;
+    ASSERT_EQ(0, malformed_entity.load_quantizer(pq_quantizer));
     ASSERT_NE(pq_quantizer, nullptr);
 
     DiskAnnIndexer malformed_indexer(*_index_meta_ptr);
@@ -681,7 +797,17 @@ TEST_F(DiskAnnSearcherTest, TestNodeCache) {
 
   auto storage = IndexFactory::CreateStorage("FileReadStorage");
   ASSERT_EQ(0, storage->open(path, false));
-  ASSERT_EQ(0, searcher->load(storage, IndexMetric::Pointer()));
+  auto late_failure = std::make_shared<RefuseLateAllocationStorage>(storage);
+  {
+    auto &rss = MemoryLimitPool::get_instance();
+    const size_t saved_limit = rss.process_rss_limit();
+    const auto restore = ScopeGuard::Make(
+        [&] { EXPECT_TRUE(rss.configure_process_rss_limit(saved_limit)); });
+    EXPECT_EQ(IndexError_NoMemory,
+              searcher->load(late_failure, IndexMetric::Pointer()));
+    EXPECT_NE(nullptr, storage->file());
+  }
+  ASSERT_EQ(0, searcher->load(late_failure, IndexMetric::Pointer()));
 
   // Count all reads made by a second cache build. BFS-expanded nodes are
   // written directly into their final cache slots, so every selected node is
@@ -1136,9 +1262,10 @@ TEST_F(DiskAnnSearcherTest, TestFetchVector) {
   auto *diskann_search_context =
       dynamic_cast<DiskAnnContext *>(linear_ctx.get());
   ASSERT_NE(diskann_search_context, nullptr);
-  EXPECT_EQ(static_cast<size_t>(DiskAnnUtil::kMaxSectorReadNum) *
-                DiskAnnUtil::kSectorSize,
-            diskann_search_context->sector_buffer_size());
+  EXPECT_EQ(0u, diskann_search_context->sector_buffer_size());
+  auto *graph_context = dynamic_cast<DiskAnnContext *>(knn_ctx.get());
+  ASSERT_NE(graph_context, nullptr);
+  EXPECT_EQ(0u, graph_context->sector_buffer_size());
   knn_ctx->set_fetch_vector(true);
 
   for (size_t i = 0; i < doc_cnt; i += doc_cnt / 10) {
@@ -1150,6 +1277,9 @@ TEST_F(DiskAnnSearcherTest, TestFetchVector) {
     std::memcpy(&vector_value, vec_value.data(), sizeof(vector_value));
     ASSERT_EQ(vector_value, i);
   }
+
+  EXPECT_EQ(expected_fetch_buffer_size(*diskann_search_context),
+            diskann_search_context->sector_buffer_size());
 
   size_t topk = 200;
   linear_ctx->set_topk(topk);
@@ -1183,6 +1313,10 @@ TEST_F(DiskAnnSearcherTest, TestFetchVector) {
                                       expected_vector));
     ASSERT_EQ(vector_string, expected_vector);
   }
+
+  // A list size of 500 uses the maximum adaptive beam of 32 nodes.
+  EXPECT_EQ(32u * expected_fetch_buffer_size(*graph_context),
+            graph_context->sector_buffer_size());
 
   std::string missing_vector;
   EXPECT_EQ(IndexError_NoExist,
@@ -1361,14 +1495,147 @@ TEST_F(DiskAnnSearcherTest, TestFetchVector) {
 
   auto *diskann_searcher = dynamic_cast<DiskAnnSearcher *>(searcher.get());
   ASSERT_NE(diskann_searcher, nullptr);
+  const auto original_reader = DiskAnnCacheTestPeer::reader(diskann_searcher);
   DiskAnnCacheTestPeer::set_reader(
-      diskann_searcher, std::make_shared<FailingAlignedFileReader>(
-                            DiskAnnCacheTestPeer::reader(diskann_searcher)));
+      diskann_searcher,
+      std::make_shared<FailingAlignedFileReader>(original_reader));
   std::string vector_after_failure;
-  EXPECT_EQ(IndexError_Runtime,
+  EXPECT_EQ(IndexError_ReadData,
             searcher->get_vector(key_for_id(doc_cnt - 1), linear_ctx,
                                  vector_after_failure));
   EXPECT_TRUE(vector_after_failure.empty());
+  DiskAnnCacheTestPeer::set_reader(diskann_searcher, original_reader);
+
+  using Phase = FailingAlignedFileReader::Phase;
+  auto fail_read = [&](Phase phase, const auto &operation,
+                       int error = IndexError_NoMemory) {
+    auto failing = std::make_shared<FailingAlignedFileReader>(original_reader,
+                                                              error, phase);
+    DiskAnnCacheTestPeer::set_reader(diskann_searcher, failing);
+    const auto restore = ScopeGuard::Make([&] {
+      DiskAnnCacheTestPeer::set_reader(diskann_searcher, original_reader);
+    });
+    const int ret = operation();
+    EXPECT_EQ(1u, failing->failure_count());
+    return ret;
+  };
+
+  const auto fetch_key = key_for_id(doc_cnt - 1);
+  auto fetch = [&] {
+    return searcher->get_vector(fetch_key, linear_ctx, vector_after_failure);
+  };
+  ASSERT_EQ(0, fetch());
+  const auto expected_vector = vector_after_failure;
+  for (int error : {IndexError_NoMemory, IndexError_NoReady, IndexError_IO,
+                    IndexError_InvalidFormat}) {
+    SCOPED_TRACE(error);
+    EXPECT_EQ(error, fail_read(Phase::kRead, fetch, error));
+    EXPECT_TRUE(vector_after_failure.empty());
+  }
+  ASSERT_EQ(0, fetch());
+  EXPECT_EQ(expected_vector, vector_after_failure);
+
+  auto graph_search = [&] {
+    return searcher->search_impl(vec.data(), qmeta, knn_ctx);
+  };
+  ASSERT_EQ(0, graph_search());
+  ASSERT_FALSE(knn_ctx->result().empty());
+  const auto expected_key = knn_ctx->result().front().key();
+  for (auto phase : {Phase::kSubmit, Phase::kCompletion}) {
+    SCOPED_TRACE(static_cast<int>(phase));
+    for (int error : {IndexError_NoMemory, IndexError_NoReady, IndexError_IO,
+                      IndexError_InvalidFormat}) {
+      SCOPED_TRACE(error);
+      EXPECT_EQ(error, fail_read(phase, graph_search, error));
+      EXPECT_TRUE(knn_ctx->result().empty());
+    }
+    ASSERT_EQ(0, graph_search());
+    ASSERT_EQ(topk, knn_ctx->result().size());
+    EXPECT_EQ(expected_key, knn_ctx->result().front().key());
+  }
+
+  auto linear_search = [&] {
+    return searcher->search_bf_impl(vec.data(), qmeta, linear_ctx);
+  };
+  EXPECT_EQ(IndexError_NoMemory, fail_read(Phase::kRead, linear_search));
+  EXPECT_TRUE(linear_ctx->result().empty());
+  ASSERT_EQ(0, linear_search());
+  EXPECT_EQ(topk, linear_ctx->result().size());
+
+  const std::vector<std::vector<uint64_t>> keys{{fetch_key}};
+  linear_by_p_keys_ctx->set_topk(1);
+  auto keyed_search = [&] {
+    return searcher->search_bf_by_p_keys_impl(vec.data(), keys, qmeta,
+                                              linear_by_p_keys_ctx);
+  };
+  EXPECT_EQ(IndexError_NoMemory, fail_read(Phase::kRead, keyed_search));
+  EXPECT_TRUE(linear_by_p_keys_ctx->result().empty());
+  ASSERT_EQ(0, keyed_search());
+  ASSERT_EQ(1u, linear_by_p_keys_ctx->result().size());
+  EXPECT_EQ(fetch_key, linear_by_p_keys_ctx->result().front().key());
+
+  // Submit and completion go to the real reader. With fewer groups than
+  // requested, the first direct read through the wrapper is the expansion.
+  auto grouped_ctx = searcher->create_context();
+  ASSERT_NE(nullptr, grouped_ctx);
+  grouped_ctx->set_group_params(2, 3);
+  grouped_ctx->set_group_by([](uint64_t) { return std::string("only-group"); });
+  auto group_search = [&] {
+    return searcher->search_impl(vec.data(), qmeta, grouped_ctx);
+  };
+  EXPECT_EQ(IndexError_NoMemory, fail_read(Phase::kRead, group_search));
+  EXPECT_TRUE(grouped_ctx->group_result().empty());
+  ASSERT_EQ(0, group_search());
+  ASSERT_EQ(1u, grouped_ctx->group_result().size());
+  EXPECT_EQ(3u, grouped_ctx->group_result().front().docs().size());
+
+  // A context retained from the other searcher must survive refusal while
+  // allocating its replacement and remain usable on the next attempt.
+  cached_ctx->set_topk(1);
+  const auto *old_context = cached_ctx.get();
+  auto &budget = MemoryLimitPool::get_instance();
+  const auto previous_limit = budget.process_rss_limit();
+  {
+    const auto restore = ScopeGuard::Make([&] {
+      EXPECT_TRUE(budget.configure_process_rss_limit(previous_limit));
+    });
+    ASSERT_TRUE(budget.configure_process_rss_limit(1));
+    ASSERT_GT(budget.process_rss(), budget.process_rss_limit());
+    EXPECT_EQ(IndexError_NoMemory,
+              searcher->search_impl(vec.data(), qmeta, cached_ctx));
+    EXPECT_EQ(old_context, cached_ctx.get());
+  }
+  ASSERT_EQ(0, searcher->search_impl(vec.data(), qmeta, cached_ctx));
+  EXPECT_NE(old_context, cached_ctx.get());
+  EXPECT_EQ(1u, cached_ctx->result().size());
+
+  auto load_entrypoints = [&] {
+    return DiskAnnCacheTestPeer::load_entrypoints(diskann_searcher);
+  };
+  EXPECT_EQ(IndexError_NoMemory, fail_read(Phase::kRead, load_entrypoints));
+  EXPECT_EQ(IndexError_ReadData,
+            fail_read(Phase::kRead, load_entrypoints, IndexError_ReadData));
+  ASSERT_EQ(0, load_entrypoints());
+
+  auto preload_cache = [&] {
+    return DiskAnnCacheTestPeer::configure_cache(diskann_searcher, 1);
+  };
+  EXPECT_EQ(0, fail_read(Phase::kRead, preload_cache));
+  EXPECT_EQ(0u, DiskAnnCacheTestPeer::coordinate_cache_size(diskann_searcher));
+  {
+    const auto restore = ScopeGuard::Make([&] {
+      EXPECT_TRUE(budget.configure_process_rss_limit(previous_limit));
+    });
+    ASSERT_TRUE(budget.configure_process_rss_limit(1));
+    ASSERT_GT(budget.process_rss(), budget.process_rss_limit());
+    EXPECT_NO_THROW(EXPECT_EQ(0, preload_cache()));
+    EXPECT_EQ(0u, DiskAnnCacheTestPeer::coordinate_cache_size(diskann_searcher));
+    EXPECT_EQ(0u, DiskAnnCacheTestPeer::neighbor_cache_size(diskann_searcher));
+  }
+  ASSERT_EQ(0, fetch());
+  EXPECT_EQ(expected_vector, vector_after_failure);
+  ASSERT_EQ(0, preload_cache());
+  EXPECT_EQ(1u, DiskAnnCacheTestPeer::coordinate_cache_size(diskann_searcher));
 }
 
 TEST_F(DiskAnnSearcherTest, TestFp16Entrypoint) {
@@ -2336,7 +2603,7 @@ TEST_F(DiskAnnSearcherTest, TestFetchVectorTurbo) {
       diskann_searcher, std::make_shared<FailingAlignedFileReader>(
                             DiskAnnCacheTestPeer::reader(diskann_searcher)));
   std::string vector_after_failure;
-  EXPECT_EQ(IndexError_Runtime,
+  EXPECT_EQ(IndexError_ReadData,
             searcher->get_vector(key_for_id(doc_cnt - 1), linear_ctx,
                                  vector_after_failure));
   EXPECT_TRUE(vector_after_failure.empty());

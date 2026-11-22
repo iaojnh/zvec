@@ -853,8 +853,9 @@ int BufferPoolAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
     // one page exceeds its budget. Keep batched direct I/O in this case and
     // never enter page-cache operations that require initialized entries.
     if (!pool_->cache_enabled()) {
-      if (ctx == nullptr && setup_io_ctx(ctx) != 0) {
-        return IndexError_Runtime;
+      if (ctx == nullptr) {
+        const int status = setup_io_ctx(ctx);
+        if (status != 0) return status;
       }
       const int ret = bypass_reader_.read(read_reqs, ctx);
       if (ret == 0) {
@@ -1020,8 +1021,9 @@ int BufferPoolAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
     flush_bypass_run();
 
     if (!bypass_requests.empty()) {
-      if (ctx == nullptr && setup_io_ctx(ctx) != 0) {
-        return IndexError_Runtime;
+      if (ctx == nullptr) {
+        const int status = setup_io_ctx(ctx);
+        if (status != 0) return status;
       }
       const int read_ret = bypass_reader_.read(bypass_requests, ctx);
       if (read_ret != 0) {

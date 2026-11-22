@@ -31,18 +31,20 @@ DiskAnnContext::DiskAnnContext(const IndexMeta &meta,
 
 DiskAnnContext::Pointer DiskAnnContext::create_fetch_context(
     const IndexMeta &meta, const IndexMetric::Pointer &measure,
-    const DiskAnnEntity::Pointer &entity) {
+    const DiskAnnEntity::Pointer &entity, int *status) try {
   if (!measure || !entity) {
+    if (status) *status = IndexError_InvalidArgument;
     return nullptr;
   }
 
-  Pointer context(new (std::nothrow) DiskAnnContext(meta, measure, entity));
-  if (!context ||
-      context->init(kFetchContext, entity->max_degree(), entity->pq_chunk_num(),
-                    meta.element_size()) != 0) {
-    return nullptr;
-  }
-  return context;
+  auto context = std::make_unique<DiskAnnContext>(meta, measure, entity);
+  const int ret = context->init(kFetchContext, entity->max_degree(),
+                                entity->pq_chunk_num(), meta.element_size());
+  if (status) *status = ret;
+  return ret == 0 ? std::move(context) : nullptr;
+} catch (const std::bad_alloc &) {
+  if (status) *status = IndexError_NoMemory;
+  return nullptr;
 }
 
 int DiskAnnContext::resize_fetch_sector_buffer(
@@ -64,29 +66,25 @@ int DiskAnnContext::resize_fetch_sector_buffer(
     return IndexError_InvalidArgument;
   }
 
-  const size_t required_size =
-      static_cast<size_t>(sector_num_per_node) * DiskAnnUtil::kSectorSize;
-  if (sector_buffer_ != nullptr && sector_buffer_size_ == required_size) {
-    return 0;
-  }
+  return ensure_sector_buffer(static_cast<size_t>(sector_num_per_node));
+}
 
-  void *replacement = nullptr;
-  DiskAnnUtil::alloc_aligned(&replacement, required_size,
-                             DiskAnnUtil::kSectorSize);
-  if (!replacement) {
-    LOG_ERROR("Failed to allocate DiskAnn fetch buffer");
-    return IndexError_NoMemory;
+int DiskAnnContext::ensure_sector_buffer(size_t sectors) try {
+  if (sectors == 0 || sectors > DiskAnnUtil::kMaxSectorReadNum) {
+    return IndexError_InvalidArgument;
   }
-
-  DiskAnnUtil::free_aligned(sector_buffer_);
-  sector_buffer_ = replacement;
-  sector_buffer_size_ = required_size;
+  if (sector_buffer_.size() < sectors * DiskAnnUtil::kSectorSize) {
+    sector_buffer_.resize_array(sectors, DiskAnnUtil::kSectorSize,
+                                DiskAnnUtil::kSectorSize);
+  }
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnContext::init(ContextType type, uint32_t /*graph_degree*/,
                          uint32_t pq_chunk_num, uint32_t element_size,
-                         bool setup_io_context) {
+                         bool setup_io_context) try {
   if (!entity_ || element_size == 0) {
     LOG_ERROR("Invalid DiskAnn context parameters");
     return IndexError_InvalidArgument;
@@ -95,13 +93,10 @@ int DiskAnnContext::init(ContextType type, uint32_t /*graph_degree*/,
   element_size_ = element_size;
   pq_chunk_num_ = pq_chunk_num;
 
+  ailego::ProcessRssAlignedBuffer query_memory;
+  const size_t stride = DiskAnnUtil::round_up(element_size_, 256);
   if (type != kFetchContext) {
-    DiskAnnUtil::alloc_aligned((void **)&query_, element_size_, 32);
-    DiskAnnUtil::alloc_aligned((void **)&query_rotated_, element_size_, 32);
-    if (!query_ || !query_rotated_) {
-      LOG_ERROR("Failed to allocate DiskAnn query buffers");
-      return IndexError_NoMemory;
-    }
+    query_memory.resize_array(type == kSearcherContext ? 3 : 2, stride, 256);
   }
 
   int ret;
@@ -121,21 +116,14 @@ int DiskAnnContext::init(ContextType type, uint32_t /*graph_degree*/,
         return IndexError_InvalidArgument;
       }
 
-      ret = visit_filter_.init(filter_mode_, entity_->doc_cnt(),
-                               entity_->doc_cnt(), negative_probility_);
+      {
+        const ailego::ProcessRssAllocationScope visit_budget;
+        ret = visit_filter_.init(filter_mode_, entity_->doc_cnt(),
+                                 entity_->doc_cnt(), negative_probility_);
+      }
       if (ret != 0) {
         LOG_ERROR("Create filter failed,  mode %d", filter_mode_);
         return ret;
-      }
-
-      DiskAnnUtil::alloc_aligned((void **)&coord_buffer_, element_size_, 256);
-      sector_buffer_size_ = static_cast<size_t>(DiskAnnUtil::kMaxSectorReadNum *
-                                                DiskAnnUtil::kSectorSize);
-      DiskAnnUtil::alloc_aligned((void **)&sector_buffer_, sector_buffer_size_,
-                                 DiskAnnUtil::kSectorSize);
-      if (!coord_buffer_ || !sector_buffer_) {
-        LOG_ERROR("Failed to allocate DiskAnn search buffers");
-        return IndexError_NoMemory;
       }
 
       if (setup_io_context) {
@@ -167,7 +155,14 @@ int DiskAnnContext::init(ContextType type, uint32_t /*graph_degree*/,
       return IndexError_Runtime;
   }
 
+  query_memory_ = std::move(query_memory);
+  auto *data = static_cast<uint8_t *>(query_memory_.data());
+  query_ = data;
+  query_rotated_ = data ? data + stride : nullptr;
+  coord_buffer_ = type == kSearcherContext ? data + 2 * stride : nullptr;
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 DiskAnnContext::~DiskAnnContext() {
@@ -179,10 +174,6 @@ DiskAnnContext::~DiskAnnContext() {
   }
 
   visit_filter_.destroy();
-  DiskAnnUtil::free_aligned(query_);
-  DiskAnnUtil::free_aligned(query_rotated_);
-  DiskAnnUtil::free_aligned(coord_buffer_);
-  DiskAnnUtil::free_aligned(sector_buffer_);
 }
 
 int DiskAnnContext::update(const ailego::Params &params) {

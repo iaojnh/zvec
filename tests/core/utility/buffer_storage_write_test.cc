@@ -2499,7 +2499,7 @@ TEST_F(BufferStorageWriteTest, ParsingLeavesColdPagesUnpopulated) {
               segment->write(0, payload.data(), payload.size()));
     ASSERT_EQ(0, storage->close());
   }
-  for (const char *backend : {"BufferStorage"}) {
+  for (const char *backend : {"BufferReadStorage", "BufferStorage"}) {
     SCOPED_TRACE(backend);
     auto storage = IndexFactory::CreateStorage(backend);
     ailego::Params params;
@@ -2543,7 +2543,7 @@ TEST_F(BufferStorageWriteTest, ParserReadsReuseButDoNotPopulateScratch) {
               segment->write(0, payload.data(), payload.size()));
     ASSERT_EQ(0, storage->close());
   }
-  for (const char *backend : {"BufferStorage"}) {
+  for (const char *backend : {"BufferReadStorage", "BufferStorage"}) {
     SCOPED_TRACE(backend);
     auto storage = IndexFactory::CreateStorage(backend);
     ailego::Params params;

@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <limits>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_meta.h>
@@ -242,21 +243,24 @@ class PqInt8Quantizer : public Quantizer, public PrecomputeTableQuantizer {
   //! comes from meta_, and a default-constructed IndexMeta silently reports
   //! "SquaredEuclidean", so its value cannot tell initialized from fresh.
   bool initialized_{false};
+  bool process_rss_workspace_{false};
 
   IndexMeta meta_{};
   uint32_t original_dim_{0};
   uint32_t num_chunk_{0};
-  std::vector<uint32_t> chunk_offsets_;
+  template <typename T>
+  using ModelVector = std::vector<T, ailego::ScopedRssAllocator<T>>;
+  ModelVector<uint32_t> chunk_offsets_;
 
   //! Centroids stored as raw bytes in the original data type:
   //! consecutive [kNumCentroids][chunk_dim(m)] blocks, totaling
   //! kNumCentroids * original_dim_ * sizeof(T) bytes.
   //! T = float for kFp32, ailego::Float16 for kFp16.
-  std::vector<uint8_t> centroids_;
+  ModelVector<uint8_t> centroids_;
 
   //! Global centroid (per-dimension mean) for zero-mean centering.
   //! Size: original_dim_ floats.  Only populated when use_zero_mean_ = true.
-  std::vector<float> centroid_;
+  ModelVector<float> centroid_;
 
   //! Centroid-to-centroid distance table for SDC:
   //! [num_chunk * kNumCentroids * kNumCentroids]
@@ -266,13 +270,13 @@ class PqInt8Quantizer : public Quantizer, public PrecomputeTableQuantizer {
   //! entry [m * 256 + j] = ||c_m[j]||^2.  Used by the precomputed
   //! residual distance table (build_centroid_distance_table /
   //! quantize_precomputed_query).
-  std::vector<float> sub_centroid_norms_;
+  ModelVector<float> sub_centroid_norms_;
 
   //! Pre-built centroid pointer arrays for each chunk.
   //! Layout: centroid_ptrs_cache_[sub_idx][centroid_idx] = pointer to centroid.
   //! Built once during init/deserialize, reused by compute_dist_table
   //! and quantize_query to avoid repeated allocations.
-  std::vector<std::vector<const void *>> centroid_ptrs_cache_;
+  ModelVector<ModelVector<const void *>> centroid_ptrs_cache_;
 
   //! ISA-dispatched kernel function pointers (ADC / SDC / Batch ADC).
   CodebookAsymmetricDistanceFunc adc_fn_{nullptr};

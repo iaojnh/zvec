@@ -103,6 +103,9 @@ int PqInt8Quantizer::setup_functions() {
 }
 
 int PqInt8Quantizer::init(const IndexMeta &meta, const ailego::Params &params) {
+  process_rss_workspace_ = false;
+  params.get(kQuantizerProcessRssWorkspace, &process_rss_workspace_);
+  const ailego::ProcessRssAllocationScope model_budget(process_rss_workspace_);
   initialized_ = false;
   meta_ = meta;
 
@@ -1103,6 +1106,7 @@ int PqInt8Quantizer::deserialize(std::string &in) {
 //! IVFResidualCodec) own the metric via the persisted IndexMeta and may even
 //! rewrite it before init().
 int PqInt8Quantizer::deserialize(const void *data, size_t len) {
+  const ailego::ProcessRssAllocationScope model_budget(process_rss_workspace_);
   if (!initialized_ || data == nullptr) return kErrUnsupported;
   if (len < sizeof(QuantizerSerHeader) + sizeof(PqInt8SerPayload)) {
     return kErrUnsupported;
@@ -1220,7 +1224,8 @@ int PqInt8Quantizer::deserialize(const void *data, size_t len) {
     ptr += centroid_bytes;
   }
   int opq_ret = opq_.deserialize(payload.rotate_type, original_dim_, ptr,
-                                 static_cast<size_t>(preprocessor_bytes));
+                                 static_cast<size_t>(preprocessor_bytes),
+                                 process_rss_workspace_);
   if (opq_ret != 0) return opq_ret;
   // ADC search only needs the codebook and a query LUT. Release the SDC table;
   // prepare_build() restores it before graph construction or inserts into a
@@ -1247,6 +1252,7 @@ int PqInt8Quantizer::deserialize(const void *data, size_t len) {
 }
 
 int PqInt8Quantizer::import_codebook(const void *data, size_t len) {
+  const ailego::ProcessRssAllocationScope model_budget(process_rss_workspace_);
   // init() owns the geometry, so the codebook size is fully determined; a
   // mismatch means the caller repacked against a different layout.
   if (!initialized_ || data == nullptr) return kErrUnsupported;
