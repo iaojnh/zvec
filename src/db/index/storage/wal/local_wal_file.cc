@@ -180,7 +180,7 @@ int LocalWalFile::write_record(std::string_view data, uint32_t crc) {
   std::lock_guard<std::mutex> lock(file_mutex_);
   if (append_failed_) return -1;
   const auto record_offset = file_.offset();
-  if (record_offset < 0) return -1;
+  if (record_offset < static_cast<ssize_t>(sizeof(header_))) return -1;
   do {
     write_size = file_.write(&length, LENGTH_SIZE);
     if (write_size != LENGTH_SIZE) {
@@ -228,7 +228,7 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
   // in complete records must still be reported as corruption.
   const auto repair_truncated_tail = [&] {
     const auto offset = file_.offset();
-    if (read_size < 0 || offset < 0 ||
+    if (read_size < 0 || offset < record_offset ||
         static_cast<size_t>(offset) != file_.size())
       return false;
     // Recovery reopens this same WAL for append. Remove the incomplete tail
@@ -242,8 +242,14 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
     read_size =
         file_.read(reinterpret_cast<void *>(&record.length_), LENGTH_SIZE);
     if (read_size == 0) {
-      ret = 0;
-      WLOG_INFO("Wal read finished. end of file");
+      // File::read reports zero for both EOF and a failed system read.
+      // Unread bytes still in the file make this a replay error.
+      if (static_cast<size_t>(record_offset) == file_.size()) {
+        ret = 0;
+        WLOG_INFO("Wal read finished. end of file");
+      } else {
+        WLOG_ERROR("Wal record length read failed before end of file");
+      }
       break;
     }
 

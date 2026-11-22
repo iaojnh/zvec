@@ -423,7 +423,7 @@ Result<DocIteratorPtr> FtsColumnIndexer::build_term_iterator(
     return DocIteratorPtr{nullptr};
   }
   if (!s.ok())
-    return tl::make_unexpected(FtsReadFailure(s, "Read full-text posting"));
+    return tl::make_unexpected(FtsRocksFailure(s, "Read full-text posting"));
 
   return create_term_iterator_from_raw(term, std::move(raw_data),
                                        term_node.boost);
@@ -451,7 +451,8 @@ Result<DocIteratorPtr> FtsColumnIndexer::build_phrase_iterator(
       return DocIteratorPtr{nullptr};
     }
     if (!status.ok())
-      return tl::make_unexpected(FtsReadFailure(status, "Read phrase posting"));
+      return tl::make_unexpected(
+          FtsRocksFailure(status, "Read phrase posting"));
     auto iter_result = create_term_iterator_from_raw(terms[i], std::move(raw),
                                                      phrase_node.boost);
     if (!iter_result.has_value()) {
@@ -639,9 +640,8 @@ Result<void> FtsColumnIndexer::insert(
   batch.Put(doc_len_cf_.load(), doc_id_key, doc_len_value);
 
   if (auto s = ctx_->write(&batch); !s.ok()) {
-    return tl::make_unexpected(Status::InternalError(
-        "FtsColumnIndexer::insert: write batch failed. field=", field_name_,
-        " status=", s.ToString()));
+    return tl::make_unexpected(
+        FtsRocksFailure(s, "Write FTS document batch", field_name_));
   }
 
   // 6. Update in-memory statistics atomically so concurrent search() calls
@@ -689,16 +689,14 @@ Result<void> FtsColumnIndexer::flush() {
   auto s = ctx_->put(stat_cf_, make_total_docs_key(field_name_),
                      encode_uint64_value(snapshot_total_docs));
   if (!s.ok()) {
-    return tl::make_unexpected(Status::InternalError(
-        "FtsColumnIndexer::flush: failed to write total_docs. field=",
-        field_name_, " status=", s.ToString()));
+    return tl::make_unexpected(
+        FtsRocksFailure(s, "Write total FTS documents", field_name_));
   }
   s = ctx_->put(stat_cf_, make_total_tokens_key(field_name_),
                 encode_uint64_value(snapshot_total_tokens));
   if (!s.ok()) {
-    return tl::make_unexpected(Status::InternalError(
-        "FtsColumnIndexer::flush: failed to write total_tokens. field=",
-        field_name_, " status=", s.ToString()));
+    return tl::make_unexpected(
+        FtsRocksFailure(s, "Write total FTS tokens", field_name_));
   }
 
   return {};
@@ -741,7 +739,7 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() try {
     const auto scan_status = iter->status();
     if (!scan_status.ok()) {
       return tl::make_unexpected(
-          FtsReadFailure(scan_status, "Validate FTS postings"));
+          FtsRocksFailure(scan_status, "Validate FTS postings"));
     }
     return {};
   }
@@ -786,7 +784,7 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() try {
     const auto scan_status = iter->status();
     if (!scan_status.ok()) {
       return tl::make_unexpected(
-          FtsReadFailure(scan_status, "Scan FTS document lengths"));
+          FtsRocksFailure(scan_status, "Scan FTS document lengths"));
     }
   }
 
@@ -816,13 +814,13 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() try {
     }
     if (!get_ret.ok() && !get_ret.IsNotFound())
       return tl::make_unexpected(
-          FtsReadFailure(get_ret, "Read existing FTS posting"));
+          FtsRocksFailure(get_ret, "Read existing FTS posting"));
     existing.Reset();
     auto packed = postings.encode(postings.size(), *scorer_);
-    if (!ctx_->put(postings_cf_, current_term, packed.data).ok()) {
-      return tl::make_unexpected(Status::InternalError(
-          "FtsColumnIndexer::convert_postings_to_bitpacked: put failed. field=",
-          field_name_, " term=", current_term));
+    auto status = ctx_->put(postings_cf_, current_term, packed.data);
+    if (!status.ok()) {
+      return tl::make_unexpected(
+          FtsRocksFailure(status, "Write converted FTS posting", field_name_));
     }
     return {};
   };
@@ -862,7 +860,7 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() try {
     const auto scan_status = iter->status();
     if (!scan_status.ok()) {
       return tl::make_unexpected(
-          FtsReadFailure(scan_status, "Scan FTS term frequencies"));
+          FtsRocksFailure(scan_status, "Scan FTS term frequencies"));
     }
   }
   // Flush the last term.
@@ -879,18 +877,16 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() try {
   flush_options.allow_write_stall = true;
   auto flush_status = ctx_->db_->Flush(flush_options, postings_cf_);
   if (!flush_status.ok()) {
-    return tl::make_unexpected(Status::InternalError(
-        "FtsColumnIndexer::convert_postings_to_bitpacked: flush failed. field=",
-        field_name_, " status=", flush_status.ToString()));
+    return tl::make_unexpected(FtsRocksFailure(
+        flush_status, "Flush converted FTS postings", field_name_));
   }
 
   // Statistics must also survive before $TF is dropped. Keep auxiliary data
   // intact until DropColumnFamily so a failed first drop can retry conversion.
   flush_status = ctx_->db_->Flush(flush_options, stat_cf_);
   if (!flush_status.ok()) {
-    return tl::make_unexpected(Status::InternalError(
-        "FtsColumnIndexer: flush statistics failed. field=", field_name_,
-        " status=", flush_status.ToString()));
+    return tl::make_unexpected(
+        FtsRocksFailure(flush_status, "Flush FTS statistics", field_name_));
   }
 
   return {};

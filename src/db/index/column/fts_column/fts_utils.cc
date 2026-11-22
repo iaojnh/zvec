@@ -18,10 +18,13 @@
 
 namespace zvec::fts {
 
-Status FtsReadFailure(const rocksdb::Status &status, const char *operation) {
+Status FtsRocksFailure(const rocksdb::Status &status, const char *operation,
+                       const std::string &field) {
   const auto code = status.IsMemoryLimit() ? StatusCode::RESOURCE_EXHAUSTED
                                            : StatusCode::INTERNAL_ERROR;
-  return Status(code, std::string(operation) + ": " + status.ToString());
+  std::string message(operation);
+  if (!field.empty()) message += " on field " + field;
+  return Status(code, message + ": " + status.ToString());
 }
 
 bool parse_doc_term_key(const std::string &key, std::string *term_out,

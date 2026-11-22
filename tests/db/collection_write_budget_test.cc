@@ -811,6 +811,45 @@ TEST_F(CollectionWriteBudgetTest, RolloverRequiresPublishedManifestBeforeWrites)
   EXPECT_EQ(rows.size(), fetched->at("next")->doc_id());
 }
 
+TEST_F(CollectionWriteBudgetTest, RolloverFailureReportsCommittedBatchPrefix) {
+  const auto collection_path = path("partial_write");
+  const auto small_segments = schema();
+  auto writer = Collection::CreateAndOpen(collection_path, small_segments,
+                                          {false, false, kMiB});
+  ASSERT_TRUE(writer.has_value()) << writer.error().message();
+  std::vector<Doc> prefix(small_segments.max_doc_count_per_segment() - 1);
+  for (size_t i = 0; i < prefix.size(); ++i) {
+    prefix[i].set_pk("row" + std::to_string(i));
+    prefix[i].set("payload", std::string("original"));
+  }
+  auto inserted = writer.value()->insert(prefix);
+  ASSERT_TRUE(inserted.has_value()) << inserted.error().message();
+  for (const auto &status : *inserted)
+    ASSERT_TRUE(status.ok()) << status.message();
+
+  const auto segment_path = FileHelper::MakeSegmentPath(collection_path, 0);
+  const auto blocked =
+      ailego::FileHelper::PathJoin(segment_path, ".zvec-seal-pending");
+  ASSERT_TRUE(std::filesystem::create_directory(blocked));
+  auto batch = docs("first");
+  auto tail = docs("second");
+  batch.push_back(std::move(tail.front()));
+  const auto partial = writer.value()->insert(batch);
+  ASSERT_TRUE(std::filesystem::remove(blocked));
+  ASSERT_TRUE(partial.has_value()) << partial.error().message();
+  ASSERT_EQ(2u, partial->size());
+  EXPECT_TRUE(partial->front().ok());
+  EXPECT_EQ(StatusCode::INTERNAL_ERROR, partial->back().code());
+  auto fetched = writer.value()->fetch({"first", "second"});
+  ASSERT_TRUE(fetched.has_value()) << fetched.error().message();
+  EXPECT_NE(nullptr, fetched->at("first"));
+  EXPECT_EQ(nullptr, fetched->at("second"));
+  auto remainder = docs("second");
+  auto retried = writer.value()->insert(remainder);
+  ASSERT_TRUE(retried.has_value()) << retried.error().message();
+  EXPECT_TRUE(retried->front().ok());
+}
+
 TEST_F(CollectionWriteBudgetTest, RecoversUnsealedFullTextSegmentBeforeCompact) {
   const auto collection_path = path("pending_full_text_seal");
   const CollectionOptions options{false, false, kMiB};
@@ -881,6 +920,42 @@ TEST_F(CollectionWriteBudgetTest, RecoversUnsealedFullTextSegmentBeforeCompact) 
   const auto stats = recovered.value()->stats();
   ASSERT_TRUE(stats.has_value()) << stats.error().message();
   EXPECT_EQ(3u, stats->doc_count);
+}
+
+TEST_F(CollectionWriteBudgetTest, FullTextSealReportsSharedWritePressure) {
+  const auto collection_path = path("full_text_pressure");
+  CollectionSchema full_text("full_text");
+  ASSERT_TRUE(full_text
+                  .add_field(std::make_shared<FieldSchema>(
+                      "content", DataType::STRING, false,
+                      std::make_shared<FtsIndexParams>()))
+                  .ok());
+  auto writer = Collection::CreateAndOpen(collection_path, full_text,
+                                          {false, false, kMiB});
+  ASSERT_TRUE(writer.has_value()) << writer.error().message();
+  std::vector<Doc> rows(1);
+  rows.front().set_pk("row");
+  rows.front().set("content", std::string("shared write pressure"));
+  auto inserted = writer.value()->insert(rows);
+  ASSERT_TRUE(inserted.has_value() && inserted->front().ok());
+  ASSERT_TRUE(writer.value()->flush().ok());
+
+  auto manager = GlobalResource::Instance().rocksdb_write_buffer_manager();
+  ASSERT_TRUE(manager && manager->enabled());
+  {
+    const auto reserved = manager->buffer_size();
+    manager->ReserveMem(reserved);
+    AILEGO_DEFER([&] {
+      manager->ScheduleFreeMem(reserved);
+      manager->FreeMem(reserved);
+    });
+    auto denied = writer.value()->create_iterator();
+    ASSERT_FALSE(denied.has_value());
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
+  }
+
+  auto retried = writer.value()->create_iterator();
+  ASSERT_TRUE(retried.has_value()) << retried.error().message();
 }
 
 TEST_F(CollectionWriteBudgetTest, BufferedVectorRefusalPrecedesWalAndMutation) {

@@ -125,7 +125,7 @@ bool PhraseDocIterator::verify_phrase_positions(uint32_t doc_id) const {
 
   for (const auto &status : statuses) {
     if (!status.ok() && !status.IsNotFound())
-      throw FtsReadError(FtsReadFailure(status, "Read FTS phrase positions"));
+      throw FtsReadError(FtsRocksFailure(status, "Read FTS phrase positions"));
   }
 
   // Decode every position list once. A missing entry means this doc cannot

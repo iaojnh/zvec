@@ -312,7 +312,7 @@ Result<void> FtsRocksdbReducer::collect_effective_stats(
     const auto scan_status = iter->status();
     if (!scan_status.ok()) {
       return tl::make_unexpected(
-          FtsReadFailure(scan_status, "Scan FTS posting statistics"));
+          FtsRocksFailure(scan_status, "Scan FTS posting statistics"));
     }
   }
 
@@ -353,7 +353,7 @@ Result<void> FtsRocksdbReducer::merge_and_flush_postings(
         const auto scan_status = c.iter->status();
         if (!scan_status.ok()) {
           return tl::make_unexpected(
-              FtsReadFailure(scan_status, "Scan FTS postings during merge"));
+              FtsRocksFailure(scan_status, "Scan FTS postings during merge"));
         }
         continue;
       }
@@ -416,10 +416,10 @@ Result<void> FtsRocksdbReducer::merge_and_flush_postings(
     // Only the budgeted serialized value is contiguous; input is pageable.
     auto packed = term_entries.encode(term_entries.size(), *scorer_);
 
-    if (!ctx_->put(dst_postings_cf_, min_term, packed.data).ok()) {
-      return tl::make_unexpected(Status::InternalError(
-          "FtsRocksdbReducer: failed to put bitpacked postings. field=",
-          field_name_));
+    const auto status = ctx_->put(dst_postings_cf_, min_term, packed.data);
+    if (!status.ok()) {
+      return tl::make_unexpected(
+          FtsRocksFailure(status, "Write merged FTS postings", field_name_));
     }
   }
 
@@ -457,15 +457,16 @@ Result<void> FtsRocksdbReducer::reduce_positions(
     }
     const std::string new_key = make_doc_term_key(term, new_doc_id);
 
-    if (!ctx_->put(dst_positions_cf_, new_key, iter->value().ToString()).ok()) {
-      return tl::make_unexpected(Status::InternalError(
-          "FtsRocksdbReducer: failed to write positions. field=", field_name_));
+    const auto status = ctx_->put(dst_positions_cf_, new_key, iter->value());
+    if (!status.ok()) {
+      return tl::make_unexpected(
+          FtsRocksFailure(status, "Write merged FTS positions", field_name_));
     }
   }
   const auto scan_status = iter->status();
   if (!scan_status.ok()) {
     return tl::make_unexpected(
-        FtsReadFailure(scan_status, "Scan FTS positions during merge"));
+        FtsRocksFailure(scan_status, "Scan FTS positions during merge"));
   }
 
   return {};
@@ -473,19 +474,18 @@ Result<void> FtsRocksdbReducer::reduce_positions(
 
 Result<void> FtsRocksdbReducer::flush_stat(uint64_t total_docs,
                                            uint64_t total_tokens) {
-  if (!ctx_->put(dst_stat_cf_, make_total_docs_key(field_name_),
-                 encode_uint64_value(total_docs))
-           .ok()) {
-    return tl::make_unexpected(Status::InternalError(
-        "FtsRocksdbReducer: failed to write total_docs. field=", field_name_));
+  auto status = ctx_->put(dst_stat_cf_, make_total_docs_key(field_name_),
+                          encode_uint64_value(total_docs));
+  if (!status.ok()) {
+    return tl::make_unexpected(FtsRocksFailure(
+        status, "Write merged FTS document count", field_name_));
   }
 
-  if (!ctx_->put(dst_stat_cf_, make_total_tokens_key(field_name_),
-                 encode_uint64_value(total_tokens))
-           .ok()) {
-    return tl::make_unexpected(Status::InternalError(
-        "FtsRocksdbReducer: failed to write total_tokens. field=",
-        field_name_));
+  status = ctx_->put(dst_stat_cf_, make_total_tokens_key(field_name_),
+                     encode_uint64_value(total_tokens));
+  if (!status.ok()) {
+    return tl::make_unexpected(
+        FtsRocksFailure(status, "Write merged FTS token count", field_name_));
   }
 
   return {};

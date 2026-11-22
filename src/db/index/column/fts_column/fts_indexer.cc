@@ -124,6 +124,8 @@ Status FtsIndexer::flush() {
   for (const auto &[name, indexer] : indexers_) {
     auto ret = indexer->flush();
     if (!ret.has_value()) {
+      if (ret.error().code() == StatusCode::RESOURCE_EXHAUSTED)
+        return ret.error();
       return Status::InternalError("FtsIndexer: flush failed: ", name, " ",
                                    ret.error().message());
     }
@@ -219,17 +221,21 @@ Status FtsIndexer::create_field_indexer(const FieldSchema &field) {
 }
 
 Status FtsIndexer::remove_field_indexer(const std::string &field_name) {
+  RocksdbContext::WriteAdmission metadata(
+      RocksdbContext::WriteAdmission::Purpose::kFlushMetadata);
   auto it = indexers_.find(field_name);
   if (it != indexers_.end()) {
     indexers_.erase(it);
   }
 
   // Drop all CFs belonging to this field.
-  fts_ctx_->drop_cf(field_name);
-  fts_ctx_->drop_cf(field_name + kFtsPositionsSuffix);
-  fts_ctx_->drop_cf(field_name + kFtsTfSuffix);
-  fts_ctx_->drop_cf(field_name + kFtsMaxTfSuffix);
-  fts_ctx_->drop_cf(field_name + kFtsDocLenSuffix);
+  auto dropped = fts_ctx_->drop_cf(field_name);
+  if (!dropped.ok()) return dropped;
+  for (const auto &suffix :
+       {kFtsPositionsSuffix, kFtsTfSuffix, kFtsMaxTfSuffix, kFtsDocLenSuffix}) {
+    dropped = fts_ctx_->drop_cf(field_name + suffix);
+    if (!dropped.ok()) return dropped;
+  }
 
   // Remove per-field stat keys.
   auto *stat_cf = fts_ctx_->get_cf(kFtsStatCfName);
@@ -240,7 +246,7 @@ Status FtsIndexer::remove_field_indexer(const std::string &field_name) {
           "FtsIndexer::remove_field_indexer: delete total_docs key "
           "failed for field[%s]: %s",
           field_name.c_str(), rs.ToString().c_str());
-      return Status::InternalError("delete total_docs key failed");
+      return fts::FtsRocksFailure(rs, "Delete total FTS documents", field_name);
     }
     rs = fts_ctx_->remove(stat_cf, fts::make_total_tokens_key(field_name));
     if (!rs.ok()) {
@@ -248,7 +254,7 @@ Status FtsIndexer::remove_field_indexer(const std::string &field_name) {
           "FtsIndexer::remove_field_indexer: delete total_tokens key "
           "failed for field[%s]: %s",
           field_name.c_str(), rs.ToString().c_str());
-      return Status::InternalError("delete total_tokens key failed");
+      return fts::FtsRocksFailure(rs, "Delete total FTS tokens", field_name);
     }
   }
 
@@ -280,6 +286,8 @@ Status FtsIndexer::seal(const std::string &field_name) {
 
   auto ret = indexer->flush();
   if (!ret.has_value()) {
+    if (ret.error().code() == StatusCode::RESOURCE_EXHAUSTED)
+      return ret.error();
     return Status::InternalError("FtsIndexer::seal flush failed: ", field_name,
                                  " ", ret.error().message());
   }
@@ -308,6 +316,8 @@ Status FtsIndexer::seal_all() {
   for (const auto &[name, indexer] : indexers_) {
     auto ret = indexer->flush();
     if (!ret.has_value()) {
+      if (ret.error().code() == StatusCode::RESOURCE_EXHAUSTED)
+        return ret.error();
       return Status::InternalError("FtsIndexer::seal_all flush failed: ", name,
                                    " ", ret.error().message());
     }

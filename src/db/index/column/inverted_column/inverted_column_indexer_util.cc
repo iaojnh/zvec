@@ -146,6 +146,10 @@ InvertedColumnIndexer::Ptr InvertedColumnIndexer::CreateAndOpen(
 
 
 Status InvertedColumnIndexer::drop_storage() {
+  // Retiring a field removes a fixed set of keys. Complete it even when
+  // another database is holding shared write-buffer pressure.
+  RocksdbContext::WriteAdmission metadata(
+      RocksdbContext::WriteAdmission::Purpose::kFlushMetadata);
   Status s = Status::OK();
   rocksdb::Status rs;
   AILEGO_DEFER([&]() {

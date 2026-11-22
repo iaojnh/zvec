@@ -304,7 +304,7 @@ Status InvertedColumnIndexer::generate_statistical_indexes() {
     rs = ctx_.put(cf_ranges_, range_key, range_value_str);
     if (!rs.ok()) {
       LOG_ERROR("Failed to put range slot: %s", rs.ToString().c_str());
-      return Status::InternalError();
+      return ReadFailure(rs);
     }
     num_range_slot_created++;
     return Status::OK();
@@ -360,11 +360,8 @@ Status InvertedColumnIndexer::generate_statistical_indexes() {
     range_slot_doc_count += term_doc_count;
     roaring_bitmap_or_inplace(bitmap_range, bitmap_cur);
     if (range_slot_doc_count >= num_doc_per_range_slot) {
-      if (create_range_slot().ok()) {
-        range_slot_initialized = false;
-      } else {
-        return Status::InternalError();
-      }
+      CHECK_RETURN_STATUS(create_range_slot());
+      range_slot_initialized = false;
     }
 
     // CDF
@@ -390,9 +387,7 @@ Status InvertedColumnIndexer::generate_statistical_indexes() {
 
   // Finalize
   if (range_slot_initialized) {
-    if (!create_range_slot().ok()) {
-      return Status::InternalError();
-    }
+    CHECK_RETURN_STATUS(create_range_slot());
   }
   if (num_range_slot_created >= term_count) {
     LOG_DEBUG(
@@ -422,7 +417,7 @@ Status InvertedColumnIndexer::generate_statistical_indexes() {
     LOG_ERROR("Failed to insert CDF of field[%s] to %s, code[%d], reason[%s]",
               field_.name().c_str(), id().c_str(), rs.code(),
               rs.ToString().c_str());
-    return Status::InternalError();
+    return ReadFailure(rs);
   }
 
   doc_range_stat_ =
@@ -463,7 +458,7 @@ Status InvertedColumnIndexer::seal() {
     return Status::OK();
   } else {
     LOG_ERROR("Failed to seal %s", id().c_str());
-    return Status::InternalError();
+    return ReadFailure(rs);
   }
 }
 

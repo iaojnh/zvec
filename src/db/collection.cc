@@ -632,13 +632,6 @@ Status CollectionImpl::open(const CollectionOptions &options) {
         "Unable to create collection with read-only mode.");
   }
 
-  // Native callers may use the default configuration without an explicit
-  // init(). Publish the budget before schema validation can load a dictionary
-  // or recovery can decode metadata; first RocksDB access is too late.
-  if (GlobalResource::Instance().initialize() != 0) {
-    return Status::InternalError("Failed to initialize shared memory budget");
-  }
-
   auto profiler = std::make_shared<Profiler>();
   sql_engine_ = sqlengine::SQLEngine::create(profiler);
 
@@ -1886,18 +1879,24 @@ Result<WriteResults> CollectionImpl::write_impl(std::vector<Doc> &docs,
         kMaxWriteBatchSize));
   }
 
+  results.reserve(docs.size());
   for (auto &&doc : docs) {
+    Status s;
     if (need_switch_to_new_segment()) {
-      auto s = switch_to_new_segment_for_writing();
-      CHECK_RETURN_STATUS_EXPECTED(s);
+      s = switch_to_new_segment_for_writing();
     }
 
     // Rotation/flush ends the active writer lease. Reacquire it under the write
     // lock before WAL, ID map or delete-store mutation (also update/upsert),
     // reusing retained backing, including during optimize's build phase.
-    CHECK_RETURN_STATUS_EXPECTED(acquire_write_buffer());
-
-    Status s;
+    if (s.ok()) s = acquire_write_buffer();
+    if (!s.ok()) {
+      if (results.empty()) return tl::make_unexpected(std::move(s));
+      // Keep the ordered outcomes for the prefix already processed, and
+      // report why the remaining rows could not be attempted.
+      results.resize(docs.size(), s);
+      return results;
+    }
 
     switch (mode) {
       case WriteMode::UPSERT:
@@ -1913,7 +1912,7 @@ Result<WriteResults> CollectionImpl::write_impl(std::vector<Doc> &docs,
         s = Status::InvalidArgument("Invalid write mode");
     }
 
-    results.push_back(s);
+    results.push_back(std::move(s));
   }
 
   return results;
@@ -2964,6 +2963,12 @@ Status CollectionImpl::recovery() {
     CHECK_RETURN_STATUS(s);
   }
 
+  // Initialize only after validating and locking the target, but before
+  // recovering metadata that can allocate against this budget.
+  if (GlobalResource::Instance().initialize() != 0) {
+    return Status::InternalError("Failed to initialize shared memory budget");
+  }
+
   // recovery version first
   auto version_manager = VersionManager::Recovery(path_);
   if (!version_manager.has_value()) {
@@ -3223,6 +3228,12 @@ Status CollectionImpl::create() {
     return Status::InvalidArgument("path validate failed: path[", path_,
                                    "] exists, create expects a path that does "
                                    "not exist");
+  }
+
+  // Schema validation can load a tokenizer dictionary on the default
+  // native path, so establish its budget before validating the schema.
+  if (GlobalResource::Instance().initialize() != 0) {
+    return Status::InternalError("Failed to initialize shared memory budget");
   }
 
   // check schema

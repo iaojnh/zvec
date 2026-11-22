@@ -40,7 +40,7 @@ Status BM25Scorer::load_segment_stats(const std::string &field_name,
     }
     if (!status.ok()) {
       return tl::make_unexpected(
-          FtsReadFailure(status, "Read FTS segment statistic"));
+          FtsRocksFailure(status, "Read FTS segment statistic"));
     }
     if (value.size() < sizeof(uint64_t)) {
       return tl::make_unexpected(
@@ -166,7 +166,7 @@ uint32_t WandOptimizer::read_max_tf(const std::string &term) const {
       ctx_->db_->Get(ctx_->read_opts_, max_tf_cf_, term, &max_tf_value);
   if (!status.ok() && !status.IsNotFound())
     throw FtsReadError(
-        FtsReadFailure(status, "Read FTS maximum term frequency"));
+        FtsRocksFailure(status, "Read FTS maximum term frequency"));
   if (max_tf_value.size() < sizeof(uint32_t)) {
     return 1;  // Default max term frequency is 1
   }

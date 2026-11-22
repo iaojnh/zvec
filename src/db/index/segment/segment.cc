@@ -6299,12 +6299,13 @@ Status SegmentImpl::drop_fts_index(const std::string &column,
     auto s = fts_indexer_->create_snapshot(new_fts_path);
     CHECK_RETURN_STATUS(s);
 
+    bool keep_snapshot = false;
+    AILEGO_DEFER([&] {
+      if (!keep_snapshot) FileHelper::RemoveDirectory(new_fts_path);
+    });
     auto new_fts_indexer = FtsIndexer::CreateAndOpen(
         new_fts_path, collection_schema_->fts_fields(), false, false, &s);
-    if (!new_fts_indexer) {
-      FileHelper::RemoveDirectory(new_fts_path);
-      return s;
-    }
+    if (!new_fts_indexer) return s;
 
     s = new_fts_indexer->remove_field_indexer(column);
     CHECK_RETURN_STATUS(s);
@@ -6318,6 +6319,7 @@ Status SegmentImpl::drop_fts_index(const std::string &column,
     new_segment_meta->add_persisted_block(block);
 
     *out_fts_indexer = new_fts_indexer;
+    keep_snapshot = true;
   } else {
     // Last FTS field removed — no new indexer.
     *out_fts_indexer = nullptr;

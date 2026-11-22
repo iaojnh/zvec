@@ -180,7 +180,7 @@ uint32_t TermDocIterator::read_term_freq(uint32_t doc_id) const {
   const auto status =
       ctx_->db_->Get(ctx_->read_opts_, term_freq_cf_, key, &value);
   if (!status.ok() && !status.IsNotFound())
-    throw FtsReadError(FtsReadFailure(status, "Read FTS term frequency"));
+    throw FtsReadError(FtsRocksFailure(status, "Read FTS term frequency"));
   if (value.size() < sizeof(uint32_t)) {
     return 1;  // Default term frequency is 1
   }
@@ -200,7 +200,7 @@ uint32_t TermDocIterator::read_doc_len(uint32_t doc_id) const {
   const auto status =
       ctx_->db_->Get(ctx_->read_opts_, doc_len_cf_, doc_id_key, &value);
   if (!status.ok() && !status.IsNotFound())
-    throw FtsReadError(FtsReadFailure(status, "Read FTS document length"));
+    throw FtsReadError(FtsRocksFailure(status, "Read FTS document length"));
   if (value.size() < sizeof(uint32_t)) {
     return 1;  // Default document length is 1
   }

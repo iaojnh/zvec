@@ -27,7 +27,8 @@ class Status;
 
 namespace zvec::fts {
 
-Status FtsReadFailure(const rocksdb::Status &status, const char *operation);
+Status FtsRocksFailure(const rocksdb::Status &status, const char *operation,
+                       const std::string &field = {});
 
 // The iterator interface returns scores and booleans directly. Preserve the
 // read status until the owning search returns it to the query engine.
