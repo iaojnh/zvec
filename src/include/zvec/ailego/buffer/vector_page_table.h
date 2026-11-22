@@ -796,6 +796,10 @@ class ZVEC_AILEGO_API VecBufferPool {
     return initialized_;
   }
 
+  // Stop background writes when the owner retires the backing file. Reads
+  // can continue through retained segments.
+  void stop_writeback();
+
   // Permanently abandon writeback after the storage becomes inconsistent.
   // Call once from the thread reporting the failure, before its owners retire.
   void quarantine_writeback();
@@ -881,7 +885,6 @@ class ZVEC_AILEGO_API VecBufferPool {
   bool read_ranges_bypass_aio(const ReadRange *ranges, size_t count);
   bool enqueue_writeback(block_id_t page_id);
   void start_writeback();
-  void stop_writeback();
   void drain_writeback();
   void writeback_loop();
   // The caller supplies sorted, distinct page IDs.

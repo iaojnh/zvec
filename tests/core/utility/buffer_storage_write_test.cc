@@ -40,6 +40,10 @@
 
 namespace zvec::ailego {
 struct VecBufferPoolTestPeer {
+  static bool has_writeback_worker(const VecBufferPool &pool) {
+    return pool.writeback_thread_.joinable();
+  }
+
   static void quarantine_writeback(VecBufferPool &pool) {
     pool.writeback_error_.store(VecBufferPool::kWritebackQuarantined);
   }
@@ -153,6 +157,7 @@ TEST_F(BufferStorageWriteTest, FailedCloseCanRetryMetadataAndCheckpoint) {
       ailego::VecBufferPoolTestPeer::exchange_metadata_fd(*pool, fd);
     });
     EXPECT_NE(0, storage->close());
+    EXPECT_TRUE(ailego::VecBufferPoolTestPeer::has_writeback_worker(*pool));
     EXPECT_EQ(0u, storage->check_point());
     EXPECT_TRUE(storage->has("data"));
     EXPECT_EQ(file_path_, storage->file_path());
@@ -1485,6 +1490,9 @@ TEST_F(BufferStorageWriteTest, ReadOnlyHandlesPreservePublishedMetadata) {
 TEST_F(BufferStorageWriteTest, RetainedSegmentsKeepTheirOriginalFile) {
   auto storage = open_writable();
   ASSERT_TRUE(storage);
+  std::weak_ptr<ailego::VecBufferPool> original_pool = storage->vec_buffer_pool();
+  ASSERT_TRUE(ailego::VecBufferPoolTestPeer::has_writeback_worker(
+      *original_pool.lock()));
   ASSERT_EQ(0, storage->append("same", 16));
   auto original = storage->get("same");
   ASSERT_TRUE(original);
@@ -1496,11 +1504,17 @@ TEST_F(BufferStorageWriteTest, RetainedSegmentsKeepTheirOriginalFile) {
   ASSERT_EQ(IndexError_OpenFile, storage->open(next_path, false));
   ASSERT_EQ(1u, original->write(3, "!", 1));
   ASSERT_EQ(0, storage->open(file_path_, false));
+  ASSERT_FALSE(original_pool.expired());
+  EXPECT_FALSE(ailego::VecBufferPoolTestPeer::has_writeback_worker(
+      *original_pool.lock()));
   auto reader = storage->get("same");
   ASSERT_TRUE(reader);
   IndexStorage::MemoryBlock borrowed;
   ASSERT_EQ(4u, reader->read_borrowed_immutable(0, borrowed, 4));
   ASSERT_EQ(0, storage->open(next_path, true));
+  std::weak_ptr<ailego::VecBufferPool> current_pool = storage->vec_buffer_pool();
+  ASSERT_TRUE(ailego::VecBufferPoolTestPeer::has_writeback_worker(
+      *current_pool.lock()));
   ASSERT_EQ(0, storage->append("same", 16));
   auto current = storage->get("same");
   ASSERT_TRUE(current);
@@ -1509,6 +1523,9 @@ TEST_F(BufferStorageWriteTest, RetainedSegmentsKeepTheirOriginalFile) {
   EXPECT_EQ(4u, original->resize(1));
   ASSERT_EQ(0, storage->close());
   storage.reset();
+  ASSERT_FALSE(current_pool.expired());
+  EXPECT_FALSE(ailego::VecBufferPoolTestPeer::has_writeback_worker(
+      *current_pool.lock()));
 
   char data[5]{};
   ASSERT_EQ(4u, original->fetch(0, data, sizeof(data)));

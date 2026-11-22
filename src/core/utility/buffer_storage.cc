@@ -1912,6 +1912,13 @@ class BufferStorageFile
   ReusableReadScratch read_scratch_;
   uint64_t pending_checkpoint_{0};
   uint64_t committed_checkpoint_{0};
+  // Called under the exclusive mapping latches after flushing accepted writes.
+  // A cloned segment may keep this file alive until its thread's TLS unwinds.
+  void retire() {
+    retired_ = true;
+    buffer_pool_->stop_writeback();
+  }
+
   bool retired_{false};
   // Raised after an unrecoverable rollback; blocks writes until close.
   std::atomic<bool> corrupted_{false};
@@ -1996,7 +2003,7 @@ class BufferStorage : public IndexStorage {
     replacement->segment_meta_capacity_ = segment_meta_capacity_;
     const int ret = replacement->open_file(path, options);
     if (ret != 0) return ret;
-    if (previous) previous->retired_ = true;
+    if (previous) previous->retire();
     file_ = std::move(replacement);
     return 0;
   } catch (const std::bad_alloc &) {
@@ -2088,7 +2095,7 @@ class BufferStorage : public IndexStorage {
         !previous->corrupted_.load(std::memory_order_acquire) &&
         !previous->buffer_pool_->writeback_quarantined())
       return ret;
-    previous->retired_ = true;
+    previous->retire();
     file_.reset();
     return ret;
   }
