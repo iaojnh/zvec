@@ -358,7 +358,7 @@ class SegmentImpl : public Segment,
 
   Result<VectorColumnIndexer::Ptr> create_vector_indexer(
       const std::string &field_name, const FieldSchema &field, BlockID block_id,
-      bool is_quantized = false);
+      std::vector<std::string> *pending_files, bool is_quantized = false);
 
   Result<VectorColumnIndexer::Ptr> merge_vector_indexer(
       const std::string &index_file_path, const FieldSchema &field,
@@ -5364,7 +5364,7 @@ Status SegmentImpl::load_vector_index_blocks() {
 
 Result<VectorColumnIndexer::Ptr> SegmentImpl::create_vector_indexer(
     const std::string &field_name, const FieldSchema &field, BlockID block_id,
-    bool is_quantized) {
+    std::vector<std::string> *pending_files, bool is_quantized) {
   std::string index_file_path;
   if (is_quantized) {
     index_file_path = FileHelper::MakeQuantizeVectorIndexPath(
@@ -5379,9 +5379,13 @@ Result<VectorColumnIndexer::Ptr> SegmentImpl::create_vector_indexer(
         "Index file[%s] already exists (possible crash residue); cleaning and "
         "overwriting.",
         index_file_path.c_str());
-    FileHelper::RemoveFile(index_file_path);
+    if (!FileHelper::RemoveFile(index_file_path)) {
+      return tl::make_unexpected(Status::InternalError(
+          "Failed to remove index file ", index_file_path));
+    }
   }
 
+  pending_files->push_back(index_file_path);
   auto vector_indexer =
       std::make_shared<VectorColumnIndexer>(index_file_path, field);
   vector_column_params::ReadOptions options{options_.enable_mmap_, true};
@@ -5403,6 +5407,8 @@ Status SegmentImpl::init_memory_components() {
   // Roll back any partially-created components on failure so a failed init
   // leaves memory_store_ null (the caller's `if (!memory_store_)` retry guard
   // depends on it) and never gets flushed on close.
+  std::vector<std::string> pending_files;
+  BlockID next_block_id = block_id_allocator_.load();
   bool committed = false;
   AILEGO_DEFER([&]() {
     if (!committed) {
@@ -5411,6 +5417,12 @@ Status SegmentImpl::init_memory_components() {
       quant_memory_vector_indexers_.clear();
       memory_vector_block_ids_.clear();
       quant_memory_vector_block_ids_.clear();
+      for (const auto &file : pending_files) {
+        if (FileHelper::FileExists(file) && !FileHelper::RemoveFile(file)) {
+          LOG_ERROR("Failed to remove incomplete writing block %s",
+                    file.c_str());
+        }
+      }
     }
   });
   // init memory block id
@@ -5424,8 +5436,11 @@ Status SegmentImpl::init_memory_components() {
         "ForwardBlock file[%s] already exists (possible crash residue); "
         "cleaning and overwriting.",
         mem_path.c_str());
-    FileHelper::RemoveFile(mem_path);
+    if (!FileHelper::RemoveFile(mem_path)) {
+      return Status::InternalError("Failed to remove forward block ", mem_path);
+    }
   }
+  pending_files.push_back(mem_path);
   memory_store_ = std::make_shared<MemForwardStore>(
       collection_schema_, mem_path,
       options_.enable_mmap_ ? FileFormat::IPC : FileFormat::PARQUET,
@@ -5443,8 +5458,8 @@ Status SegmentImpl::init_memory_components() {
         index_params->metric_type(), index_params->use_flat_contiguous_memory(),
         segment_detail::FlatStorageDataTypeForField(
             field->data_type(), index_params->flat_data_type())));
-    auto vector_indexer =
-        create_vector_indexer(field->name(), normal_field, allocate_block_id());
+    auto vector_indexer = create_vector_indexer(
+        field->name(), normal_field, next_block_id++, &pending_files);
     if (!vector_indexer) return vector_indexer.error();
     memory_vector_indexers_.emplace(field->name(), std::move(*vector_indexer));
 
@@ -5464,12 +5479,13 @@ Status SegmentImpl::init_memory_components() {
         index_params->metric_type(), quantize_type,
         index_params->quantizer_param()));
     auto quant_vector_indexer = create_vector_indexer(
-        field->name(), quant_field, allocate_block_id(), true);
+        field->name(), quant_field, next_block_id++, &pending_files, true);
     if (!quant_vector_indexer) return quant_vector_indexer.error();
     quant_memory_vector_indexers_.emplace(field->name(),
                                           std::move(*quant_vector_indexer));
   }
 
+  block_id_allocator_.store(next_block_id);
   committed = true;
   return Status::OK();
 }

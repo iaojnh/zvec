@@ -516,7 +516,7 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
     size_t size = header_chunk->write(0UL, &header(), header_size());
     if (ailego_unlikely(size != header_size())) {
       LOG_ERROR("Write header chunk failed");
-      return IndexError_WriteData;
+      return header_chunk->write_error();
     }
 
     return 0;

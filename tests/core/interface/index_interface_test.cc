@@ -5214,6 +5214,57 @@ TEST(IndexInterface, BufferPoolOpenPreservesCreationAndMemoryErrors) {
                                false}));
 }
 
+TEST(IndexInterface, FailedCreationDiscardsOnlyTheNewIndex) {
+  class FaultingIndex : public FlatIndex {
+   public:
+    using FlatIndex::init;
+    bool refuse{true};
+
+   protected:
+    int prepare_streamer_open(const StorageOptions &) override {
+      if (!refuse) return 0;
+      constexpr char meta_segment[] = "flat.linear_meta";
+      if (storage_->has(meta_segment)) return zvec::core::IndexError_NoMemory;
+      const int ret = storage_->append(meta_segment, 4096);
+      return ret == 0 ? zvec::core::IndexError_NoMemory : ret;
+    }
+  };
+
+  auto &pool = zvec::ailego::PoolPayloadBudget::get_instance();
+  const auto previous_capacity = pool.capacity();
+  auto restore = zvec::ailego::ScopeGuard::Make(
+      [&] { EXPECT_EQ(0, pool.init(previous_capacity)); });
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  const auto param = FlatIndexParamBuilder()
+                         .with_metric_type(MetricType::kL2sq)
+                         .with_data_type(DataType::DT_FP32)
+                         .with_dimension(16)
+                         .with_is_sparse(false)
+                         .build();
+  for (const auto &type : {StorageOptions::StorageType::kBufferPool,
+                           StorageOptions::StorageType::kMMAP}) {
+    const std::string path =
+        "failed_index_creation_" + std::to_string(static_cast<int>(type));
+    zvec::test_util::RemoveTestFiles(path);
+    auto remove = zvec::ailego::ScopeGuard::Make(
+        [&] { zvec::test_util::RemoveTestFiles(path); });
+    FaultingIndex index;
+    ASSERT_EQ(0, index.init(*param));
+    ASSERT_EQ(zvec::core::IndexError_NoMemory, index.open(path, {type, true}));
+    EXPECT_FALSE(zvec::ailego::File::IsExist(path));
+
+    index.refuse = false;
+    ASSERT_EQ(0, index.open(path, {type, true}));
+    ASSERT_EQ(0, index.close());
+    index.refuse = true;
+    EXPECT_EQ(zvec::core::IndexError_NoMemory, index.open(path, {type, true}));
+    EXPECT_TRUE(zvec::ailego::File::IsExist(path));
+    index.refuse = false;
+    ASSERT_EQ(0, index.open(path, {type, false}));
+    EXPECT_EQ(0, index.close());
+  }
+}
+
 TEST(IndexInterface, BuilderSetsAllBaseFields) {
   auto param =
       FlatIndexParamBuilder()

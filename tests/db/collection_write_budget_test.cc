@@ -97,6 +97,29 @@ class CollectionWriteBudgetTest : public testing::Test {
   std::filesystem::path root_;
 };
 
+TEST_F(CollectionWriteBudgetTest, FailedMmapCreateCanRetryAtTheSamePath) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto collection_path = path("failed_create") + "/child/";
+  const CollectionOptions options{false, true, kMiB};
+  {
+    ASSERT_GT(pool.available(), 64u << 10);
+    const size_t pressure = pool.available() - (64u << 10);
+    ASSERT_TRUE(pool.try_charge_external(pressure));
+    AILEGO_DEFER([&] { pool.release_external(pressure); });
+    const auto rejected =
+        Collection::CreateAndOpen(collection_path, schema(), options);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, rejected.error().code());
+    EXPECT_FALSE(std::filesystem::exists(collection_path));
+  }
+  auto created = Collection::CreateAndOpen(collection_path, schema(), options);
+  ASSERT_TRUE(created.has_value()) << created.error().message();
+  EXPECT_TRUE(created.value()->close().ok());
+  auto reopened = Collection::Open(collection_path, options);
+  ASSERT_TRUE(reopened.has_value()) << reopened.error().message();
+  EXPECT_TRUE(reopened.value()->close().ok());
+}
+
 TEST_F(CollectionWriteBudgetTest, RejectsBeforeWalReplayAndCanRetry) {
   auto created = Collection::CreateAndOpen(
       path("recovery"), schema(), CollectionOptions{false, false, kMiB});

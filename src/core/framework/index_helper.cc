@@ -52,9 +52,8 @@ int IndexHelper::SerializeToStorage(const IndexMeta &mt, IndexStorage *storage,
     size_t meta_size =
         (buffer.size() + align_size - 1) / align_size * align_size;
 
-    if (storage->append(key, meta_size) != 0) {
-      return IndexError_WriteData;
-    }
+    const int ret = storage->append(key, meta_size);
+    if (ret != 0) return ret;
 
     segment = storage->get(key);
     if (!segment) {
@@ -63,7 +62,7 @@ int IndexHelper::SerializeToStorage(const IndexMeta &mt, IndexStorage *storage,
   }
 
   if (segment->write(0, buffer.data(), buffer.size()) != buffer.size()) {
-    return IndexError_WriteData;
+    return segment->write_error();
   }
   segment->resize(buffer.size());
   segment->update_data_crc(
@@ -83,7 +82,7 @@ int IndexHelper::DeserializeFromStorage(IndexStorage *storage,
   size_t len = segment->data_size();
   IndexStorage::MemoryBlock block;
   if (segment->read(0, block, len) != len) {
-    return IndexError_ReadData;
+    return segment->read_error();
   }
   const void *data = block.data();
   if (crc != 0u && ailego::Crc32c::Hash(data, len, 0u) != crc) {

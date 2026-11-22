@@ -206,6 +206,7 @@ class CollectionImpl : public Collection {
   Status close_internal();
   Status close_locked();
   Status close_unsafe();
+  void release_write_resources();
 
   Status flush_unsafe(bool for_close = false);
 
@@ -469,6 +470,9 @@ Status CollectionImpl::open(const CollectionOptions &options) {
     return Status::InternalError("Failed to initialize shared memory budget");
   }
 
+  auto profiler = std::make_shared<Profiler>();
+  sql_engine_ = sqlengine::SQLEngine::create(profiler);
+
   Status s;
   if (schema_ == nullptr) {
     // recovery from disk
@@ -481,9 +485,6 @@ Status CollectionImpl::open(const CollectionOptions &options) {
   if (s.ok() && options_.read_only_) {
     prepare_query_internal_ids();
   }
-
-  auto profiler = std::make_shared<Profiler>();
-  sql_engine_ = sqlengine::SQLEngine::create(profiler);
 
   return s;
 }
@@ -545,7 +546,11 @@ Status CollectionImpl::close_unsafe() {
     }
   }
 
-  // always release resources regardless of flush outcome
+  release_write_resources();
+  return result;
+}
+
+void CollectionImpl::release_write_resources() {
   writing_segment_.reset();
   version_manager_.reset();
   id_map_.reset();
@@ -556,8 +561,6 @@ Status CollectionImpl::close_unsafe() {
   write_buffer_reservation_.release();
 
   lock_file_.close();
-
-  return result;
 }
 
 Status CollectionImpl::destroy() {
@@ -3000,11 +3003,31 @@ Status CollectionImpl::create() {
     CHECK_RETURN_STATUS(s);
   }
 
-  if (!ailego::FileHelper::MakePath(path_.c_str())) {
-    return Status::InvalidArgument(
-        "create collection path failed: ", path_,
-        ", error: ", ailego::FileHelper::GetLastErrorString());
+  namespace fs = std::filesystem;
+  auto owned_path = ailego::FileHelper::PathFromUtf8(path_);
+  while (owned_path.has_relative_path() && !owned_path.has_filename()) {
+    owned_path = owned_path.parent_path();
   }
+  std::error_code error;
+  const auto parent = owned_path.parent_path();
+  if (!parent.empty()) fs::create_directories(parent, error);
+  // Only the attempt that creates the leaf may discard its contents.
+  if (error || !fs::create_directory(owned_path, error)) {
+    if (!error) error = std::make_error_code(std::errc::file_exists);
+    return Status::InvalidArgument("create collection path failed: ", path_,
+                                   ", error: ", error.message());
+  }
+  bool created = false;
+  AILEGO_DEFER([&] {
+    if (!created) {
+      closed_ = true;
+      segment_manager_.reset();
+      release_write_resources();
+      if (!ailego::FileHelper::RemoveDirectory(path_.c_str())) {
+        LOG_ERROR("Failed to remove incomplete collection %s", path_.c_str());
+      }
+    }
+  });
 
   // init lock file
   s = acquire_file_lock(true);
@@ -3031,17 +3054,18 @@ Status CollectionImpl::create() {
   version.set_delete_snapshot_path_suffix(0);
   version.set_next_segment_id(1);
 
+  segment_manager_ = std::make_unique<SegmentManager>();
   version_manager_->apply(version);
   s = version_manager_->flush();
   CHECK_RETURN_STATUS(s);
 
   segment_id_allocator_.store(1);
-  segment_manager_ = std::make_unique<SegmentManager>();
 
   // Preserve create-time admission, but do not reserve a full write buffer for
   // an idle collection. The first mutation performs admission again.
   write_buffer_reservation_.release();
 
+  created = true;
   return Status::OK();
 }
 
@@ -3056,9 +3080,7 @@ Status CollectionImpl::create_idmap_and_delete_store() {
       FileHelper::MakeFilePath(path_, FileID::DELETE_FILE, 0);
   delete_store_ = std::make_shared<DeleteStore>(schema_->name());
   // when first create collection, delete store will flush a empty snapshot
-  delete_store_->flush(delete_store_path);
-
-  return Status::OK();
+  return delete_store_->flush(delete_store_path);
 }
 
 Status CollectionImpl::init_version_manager() {

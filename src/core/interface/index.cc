@@ -606,12 +606,21 @@ int Index::open(const std::string &file_path,
   }
   if (is_open_) return core::IndexError_NoReady;
   bool opened = false;
+  bool created_file = false;
   AILEGO_DEFER([&] {
     if (!opened) {
       contexts_->clear();
       if (reformer_) reformer_->unload();
       if (streamer_) streamer_->cleanup();
       if (storage_) storage_->close();
+      if (created_file) {
+        streamer_.reset();
+        storage_.reset();
+        if (!ailego::File::Delete(file_path)) {
+          LOG_ERROR("Failed to remove incomplete index file %s",
+                    file_path.c_str());
+        }
+      }
       streamer_needs_init_ = true;
     }
   });
@@ -670,11 +679,13 @@ int Index::open(const std::string &file_path,
       return core::IndexError_Unsupported;
   }
 
-  const core::IndexStorage::OpenOptions open_options{storage_options.create_new,
-                                                     storage_options.read_only};
-  int ret = storage_options.type == StorageOptions::StorageType::kBufferPool
-                ? storage_->open(file_path, open_options)
-                : storage_->open(file_path, storage_options.create_new);
+  const core::IndexStorage::OpenOptions open_options{
+      storage_options.create_new, storage_options.read_only, &created_file};
+  const bool read_only_mmap =
+      storage_options.type == StorageOptions::StorageType::kMMAP &&
+      storage_options.read_only;
+  int ret = read_only_mmap ? storage_->open(file_path, false)
+                           : storage_->open(file_path, open_options);
   if (ret != 0) {
     LOG_ERROR("Failed to open storage, path: %s, err: %s", file_path.c_str(),
               core::IndexError::What(ret));

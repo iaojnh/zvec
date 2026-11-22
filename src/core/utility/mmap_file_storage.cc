@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <mutex>
+#include <ailego/pattern/defer.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_mapping.h>
@@ -165,18 +166,37 @@ class MMapFileStorage : public IndexStorage {
 
   //! Open storage
   int open(const std::string &path, bool create_if_missing) override {
-    if (!ailego::File::IsExist(path) && create_if_missing) {
+    return open_with_options(path, OpenOptions{create_if_missing, false});
+  }
+
+  int open_with_options(const std::string &path,
+                        const OpenOptions &options) override {
+    if (options.read_only) return IndexError_Unsupported;
+    bool created_file = false;
+    bool opened = false;
+    AILEGO_DEFER([&] {
+      if (created_file && !opened) {
+        close_index();
+        if (!ailego::File::Delete(path)) {
+          LOG_ERROR("Failed to remove incomplete index file %s", path.c_str());
+        }
+      }
+    });
+    if (!ailego::File::IsExist(path) && options.create_if_missing) {
       size_t last_slash = path.rfind('/');
       if (last_slash != std::string::npos) {
         ailego::File::MakePath(path.substr(0, last_slash));
       }
 
-      int error_code = this->init_index(path);
+      int error_code = this->init_index(path, &created_file);
       if (error_code != 0) {
         return error_code;
       }
     }
-    return mapping_.open(path, copy_on_write_, force_flush_);
+    const int ret = mapping_.open(path, copy_on_write_, force_flush_);
+    opened = ret == 0;
+    if (opened && options.created_file) *options.created_file = created_file;
+    return ret;
   }
 
   //! Flush storage
@@ -250,11 +270,12 @@ class MMapFileStorage : public IndexStorage {
   }
 
   //! Initialize index file
-  int init_index(const std::string &path) {
-    int error_code = mapping_.create(path, segment_meta_capacity_);
+  int init_index(const std::string &path, bool *created_file) {
+    int error_code = mapping_.create_exclusive(path, segment_meta_capacity_);
     if (error_code != 0) {
       return error_code;
     }
+    *created_file = true;
 
     // Add index version
     error_code = this->init_version_segment();

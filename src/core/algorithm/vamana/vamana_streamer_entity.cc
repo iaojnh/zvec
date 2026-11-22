@@ -491,21 +491,24 @@ int VamanaStreamerEntity::init_chunks(const Chunk::Pointer &header_chunk) {
 int VamanaStreamerEntity::close() {
   LOG_DEBUG("close Vamana index");
   std::lock_guard<std::mutex> lock(mutex_);
-  flush_header();
+  const int header_status = flush_header();
+  if (header_status != 0) return header_status;
+  const int close_status = broker_->close();
+  if (close_status != 0) return close_status;
   mutable_header()->reset();
   keys_map_.reset();
   header_.clear();
   decltype(node_chunks_)().swap(node_chunks_);
   dist_chunks_.clear();
   dist_loaded_ = false;
-  return broker_->close();
+  return 0;
 }
 
 int VamanaStreamerEntity::flush(uint64_t checkpoint) {
   LOG_INFO("Flush Vamana index, curDocs=%u", doc_cnt());
   std::lock_guard<std::mutex> lock(mutex_);
-  flush_header();
-  return broker_->flush(checkpoint);
+  const int ret = flush_header();
+  return ret != 0 ? ret : broker_->flush(checkpoint);
 }
 
 int VamanaStreamerEntity::dump(const IndexDumper::Pointer &dumper) {

@@ -1327,7 +1327,17 @@ class BufferStorage : public IndexStorage {
     // parsing it, and keep the current directory until admission succeeds.
     int ret = flush_index_locked();
     if (ret != 0) return ret;
-    ret = candidate.open_unpublished(path, options);
+    bool created_file = false;
+    bool published = false;
+    AILEGO_DEFER([&] {
+      if (created_file && !published) {
+        candidate.close_index(/*force=*/true);
+        if (!ailego::File::Delete(path)) {
+          LOG_ERROR("Failed to remove incomplete index file %s", path.c_str());
+        }
+      }
+    });
+    ret = candidate.open_unpublished(path, options, &created_file);
     if (ret != 0) return ret;
 
     const bool preserve_handles = can_preserve_handles(candidate);
@@ -1348,6 +1358,8 @@ class BufferStorage : public IndexStorage {
     meta_chains_.swap(candidate.meta_chains_);
     std::swap(cache_enabled_, candidate.cache_enabled_);
     pending_check_point_.store(0, std::memory_order_relaxed);
+    published = true;
+    if (options.created_file) *options.created_file = created_file;
     return 0;
   } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;
@@ -1402,7 +1414,8 @@ class BufferStorage : public IndexStorage {
     }
   }
 
-  int open_unpublished(const std::string &path, const OpenOptions &options) {
+  int open_unpublished(const std::string &path, const OpenOptions &options,
+                       bool *created_file) {
     const bool writable = !options.read_only;
     if (!ailego::File::IsExist(path) && options.create_if_missing) {
       size_t last_slash = path.rfind('/');
@@ -1415,6 +1428,7 @@ class BufferStorage : public IndexStorage {
                   error_code);
         return error_code;
       }
+      *created_file = true;
     }
 
     try {
@@ -1869,9 +1883,10 @@ class BufferStorage : public IndexStorage {
     for (size_t ci = 0; ci < meta_chains_.size(); ++ci) {
       MetaChain &mchain = meta_chains_[ci];
       const char *seg_buf = mchain.segment_meta.data();
-      mchain.footer.segments_meta_crc =
+      auto footer = mchain.footer;
+      footer.segments_meta_crc =
           ailego::Crc32c::Hash(seg_buf, mchain.footer.segments_meta_size, 0u);
-      IndexFormat::UpdateMetaFooter(&mchain.footer, consumed_chkp);
+      IndexFormat::UpdateMetaFooter(&footer, consumed_chkp);
       if (buffer_pool_handle_->write_meta(mchain.segment_meta_file_offset(),
                                           mchain.footer.segments_meta_size,
                                           seg_buf) != 0) {
@@ -1880,12 +1895,13 @@ class BufferStorage : public IndexStorage {
         return IndexError_WriteData;
       }
       if (buffer_pool_handle_->write_meta(
-              mchain.footer_file_offset(), sizeof(mchain.footer),
-              reinterpret_cast<const char *>(&mchain.footer)) != 0) {
+              mchain.footer_file_offset(), sizeof(footer),
+              reinterpret_cast<const char *>(&footer)) != 0) {
         LOG_ERROR("Failed to write footer: file[%s], chain[%zu]",
                   file_name_.c_str(), ci);
         return IndexError_WriteData;
       }
+      mchain.footer = footer;
     }
     // Consume only the checkpoint observed by this flush.
     uint64_t expected_chkp = consumed_chkp;
@@ -1902,7 +1918,8 @@ class BufferStorage : public IndexStorage {
     // the page table reset under it, dropping the modification).
     AllShardsExclusiveLatch latch(mapping_shards_);
     if (!force && has_prepared_writes()) return IndexError_Runtime;
-    flush_index_locked();
+    const int flush_status = flush_index_locked();
+    if (flush_status != 0 && !force) return flush_status;
     read_scratch_.clear();
     invalidate_directory();
     file_name_.clear();
@@ -1915,7 +1932,7 @@ class BufferStorage : public IndexStorage {
     pending_check_point_.store(0, std::memory_order_relaxed);
     index_dirty_.store(false, std::memory_order_relaxed);
     corrupted_.store(false, std::memory_order_relaxed);
-    return 0;
+    return flush_status;
   }
 
   //! Append a segment into storage.

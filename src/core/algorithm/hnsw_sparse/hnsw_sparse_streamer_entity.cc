@@ -133,7 +133,7 @@ const Neighbors HnswSparseStreamerEntity::get_neighbors(level_t level,
   size_t size = chunk->read(offset, neighbor_block, neighbor_size);
   if (ailego_unlikely(size != neighbor_size)) {
     LOG_ERROR("Read neighbor header failed, ret=%zu", size);
-    throw GraphStorageError{IndexError_ReadData};
+    throw GraphStorageError{chunk->read_error()};
   }
   return Neighbors(std::move(neighbor_block));
 }
@@ -321,21 +321,14 @@ void HnswSparseStreamerEntity::add_neighbor(level_t level, node_id_t id,
       loc.second + sizeof(NeighborsHeader) + size * sizeof(node_id_t);
   ailego_assert_with(size < neighbor_cnt(level), "invalid neighbor size");
   ailego_assert_with(offset < loc.first->data_size(), "invalid chunk offset");
-  size_t ret = loc.first->write(offset, &neighbor_id, sizeof(node_id_t));
-  if (ailego_unlikely(ret != sizeof(node_id_t))) {
-    LOG_ERROR("Write neighbor id failed, ret=%zu", ret);
-    throw GraphStorageError{IndexError_WriteData};
-    throw GraphStorageError{IndexError_ReadData};
+  const uint32_t neighbors = size + 1;
+  const IndexStorage::SegmentData writes[] = {
+      {offset, sizeof(neighbor_id), &neighbor_id},
+      {loc.second, sizeof(neighbors), &neighbors},
+  };
+  if (!loc.first->write_batch(writes, 2)) {
+    throw GraphStorageError{loc.first->write_error()};
   }
-
-  uint32_t neighbors = size + 1;
-  ret = loc.first->write(loc.second, &neighbors, sizeof(uint32_t));
-  if (ailego_unlikely(ret != sizeof(uint32_t))) {
-    LOG_ERROR("Write neighbor cnt failed, ret=%zu", ret);
-    throw GraphStorageError{IndexError_WriteData};
-  }
-
-  return;
 }
 
 int HnswSparseStreamerEntity::init_chunks(
@@ -487,7 +480,10 @@ int HnswSparseStreamerEntity::close() {
   LOG_DEBUG("close index");
 
   std::lock_guard<std::mutex> lock(mutex_);
-  flush_header();
+  const int header_status = flush_header();
+  if (header_status != 0) return header_status;
+  const int close_status = broker_->close();
+  if (close_status != 0) return close_status;
   mutable_header()->reset();
   upper_neighbor_index_->cleanup();
   keys_map_.reset();
@@ -497,20 +493,15 @@ int HnswSparseStreamerEntity::close() {
 
   decltype(sparse_node_chunks_)().swap(sparse_node_chunks_);
 
-  return broker_->close();
+  return 0;
 }
 
 int HnswSparseStreamerEntity::flush(uint64_t checkpoint) {
   LOG_INFO("Flush index, curDocs=%u", doc_cnt());
 
   std::lock_guard<std::mutex> lock(mutex_);
-  flush_header();
-  int ret = broker_->flush(checkpoint);
-  if (ret != 0) {
-    return ret;
-  }
-
-  return 0;
+  const int ret = flush_header();
+  return ret != 0 ? ret : broker_->flush(checkpoint);
 }
 
 int HnswSparseStreamerEntity::dump(const IndexDumper::Pointer &dumper) {

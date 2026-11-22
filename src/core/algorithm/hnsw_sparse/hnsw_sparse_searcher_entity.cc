@@ -194,7 +194,7 @@ const Neighbors HnswSparseSearcherEntity::get_neighbors(level_t level,
                             sizeof(SparseGraphNeighborMeta)) !=
                         sizeof(SparseGraphNeighborMeta))) {
       LOG_ERROR("Read neighbors meta from segment failed");
-      return {0, nullptr};
+      throw GraphStorageError{neighbors_meta_->read_error()};
     }
 
     const auto *m =
@@ -204,7 +204,7 @@ const Neighbors HnswSparseSearcherEntity::get_neighbors(level_t level,
                                          m->neighbor_cnt * sizeof(node_id_t)) !=
                         m->neighbor_cnt * sizeof(node_id_t))) {
       LOG_ERROR("Read neighbors from segment failed");
-      return {0, nullptr};
+      throw GraphStorageError{neighbors_->read_error()};
     }
     Neighbors result(static_cast<uint32_t>(m->neighbor_cnt),
                      static_cast<const node_id_t *>(data.data()));
@@ -219,7 +219,7 @@ const Neighbors HnswSparseSearcherEntity::get_neighbors(level_t level,
                           sizeof(HnswSparseNeighborMeta)) !=
                       sizeof(HnswSparseNeighborMeta))) {
     LOG_ERROR("Read neighbors meta from segment failed");
-    return {0, nullptr};
+    throw GraphStorageError{upper_neighbors_meta_->read_error()};
   }
 
   const auto *m =
@@ -232,7 +232,7 @@ const Neighbors HnswSparseSearcherEntity::get_neighbors(level_t level,
           upper_neighbors_->read(offset, data, upper_neighbors_size()) !=
           upper_neighbors_size())) {
     LOG_ERROR("Read neighbors from segment failed");
-    return {0, nullptr};
+    throw GraphStorageError{upper_neighbors_->read_error()};
   }
 
   return Neighbors(std::move(data));

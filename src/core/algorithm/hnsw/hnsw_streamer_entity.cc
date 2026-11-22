@@ -284,7 +284,7 @@ const Neighbors HnswStreamerEntity::get_neighbors(level_t level,
       size_t size = chunk->read(offset, neighbor_block, neighbor_size);
       if (ailego_unlikely(size != neighbor_size)) {
         LOG_ERROR("Read neighbor header failed, ret=%zu", size);
-        throw GraphStorageError{IndexError_ReadData};
+        throw GraphStorageError{chunk->read_error()};
       }
       return Neighbors(neighbor_block);
     }
@@ -306,7 +306,7 @@ const Neighbors HnswStreamerEntity::get_neighbors(level_t level,
       size_t size = chunk->read(offset, neighbor_block, neighbor_size);
       if (ailego_unlikely(size != neighbor_size)) {
         LOG_ERROR("Read neighbor header failed, ret=%zu", size);
-        throw GraphStorageError{IndexError_ReadData};
+        throw GraphStorageError{chunk->read_error()};
       }
       return Neighbors(neighbor_block);
     }
@@ -685,7 +685,10 @@ int HnswStreamerEntity::close() {
   LOG_DEBUG("close index");
 
   std::lock_guard<std::mutex> lock(mutex_);
-  flush_header();
+  const int header_status = flush_header();
+  if (header_status != 0) return header_status;
+  const int close_status = broker_->close();
+  if (close_status != 0) return close_status;
   mutable_header()->reset();
   upper_neighbor_index_->cleanup();
   keys_map_.reset();
@@ -695,20 +698,15 @@ int HnswStreamerEntity::close() {
   decltype(upper_neighbor_chunks_)().swap(upper_neighbor_chunks_);
   upper_neighbor_chunk_bases_.reset();
 
-  return broker_->close();
+  return 0;
 }
 
 int HnswStreamerEntity::flush(uint64_t checkpoint) {
   LOG_INFO("Flush index, curDocs=%u", doc_cnt());
 
   std::lock_guard<std::mutex> lock(mutex_);
-  flush_header();
-  int ret = broker_->flush(checkpoint);
-  if (ret != 0) {
-    return ret;
-  }
-
-  return 0;
+  const int ret = flush_header();
+  return ret != 0 ? ret : broker_->flush(checkpoint);
 }
 
 int HnswStreamerEntity::dump(const IndexDumper::Pointer &dumper) {

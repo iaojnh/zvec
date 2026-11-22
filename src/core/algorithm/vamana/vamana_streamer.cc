@@ -388,7 +388,8 @@ int VamanaStreamer::flush(uint64_t checkpoint) try {
   LOG_INFO("VamanaStreamer flush checkpoint=%zu", (size_t)checkpoint);
 
   meta_.set_metric(metric_->name(), 0, metric_->params());
-  entity_->set_index_meta(meta_);
+  const int ret = entity_->set_index_meta(meta_);
+  if (ret != 0) return ret;
   return entity_->flush(checkpoint);
 } catch (const GraphStorageError &error) {
   return error.code;
