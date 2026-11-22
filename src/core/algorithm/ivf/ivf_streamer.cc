@@ -15,6 +15,7 @@
 #include <zvec/ailego/utility/time_helper.h>
 #include <zvec/core/framework/index_segment_storage.h>
 #include "ailego/pattern/defer.h"
+#include "ailego/pattern/scope_guard.h"
 #include "ivf_centroid_index.h"
 #include "ivf_index_provider.h"
 #include "ivf_params.h"
@@ -313,6 +314,8 @@ int IVFStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
   for (size_t q = 0; q < count; ++q) {
     ret = entity->bind_query(query, iv_qmeta);
     ivf_check_error_code(ret);
+    auto release_prefetch =
+        ailego::ScopeGuard::Make([&] { entity->release_prefetch(); });
     auto &centroids = centroid_index_ctx->result(q);
     auto &context_stats = ctx->mutable_stats(q);
     auto &heap = ctx->mutable_result_heap();

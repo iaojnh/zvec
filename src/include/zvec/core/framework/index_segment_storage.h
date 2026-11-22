@@ -105,10 +105,14 @@ class IndexSegmentStorage : public IndexStorage {
       return parent_->set_read_chunks(translated);
     }
 
-    size_t read_scatter(size_t offset, ScatterBlock &data, size_t len) override {
-      if (offset > region_size_) { data.reset(); return 0; }
+    size_t read_scatter(size_t offset, ScatterBlock &data,
+                        size_t len) override {
+      if (offset > region_size_) {
+        data.reset();
+        return 0;
+      }
       return parent_->read_scatter(data_offset_ + offset, data,
-                                    std::min(len, region_size_ - offset));
+                                   std::min(len, region_size_ - offset));
     }
 
     //! Read data from segment

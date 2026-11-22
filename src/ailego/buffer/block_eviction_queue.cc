@@ -2557,6 +2557,23 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
   };
   if (impossible()) return false;
 
+  const bool uses_rss = request.rss_bytes || !request.native_bytes;
+  const auto available_for_request = [&] {
+    const size_t rss = uses_rss ? process_rss_.available() : 0;
+    return AdmissionRequest{
+        std::min(request.native_bytes, native_available()),
+        request.rss_bytes ? std::min(request.rss_bytes, rss) : rss};
+  };
+  AdmissionRequest best = wait ? available_for_request() : AdmissionRequest{};
+  bool observed_progress = false;
+  const auto observe_progress = [&](AdmissionRequest room) {
+    if (room.native_bytes > best.native_bytes ||
+        room.rss_bytes > best.rss_bytes)
+      observed_progress = true;
+    best.native_bytes = std::max(best.native_bytes, room.native_bytes);
+    best.rss_bytes = std::max(best.rss_bytes, room.rss_bytes);
+  };
+
   if (wait) {
     size_t waiting = native_waiting_bytes_.load(std::memory_order_relaxed);
     do {
@@ -2603,45 +2620,51 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
       }
     }
     if (!wait || impossible()) break;
-    bool has_reclaimer;
-    {
-      std::lock_guard<std::mutex> lock(process_reclaimer_mutex_);
-      has_reclaimer = static_cast<bool>(process_reclaimer_);
-    }
-    const size_t fixed = fixed_used();
-    const size_t capacity = pool_size_.load(std::memory_order_relaxed);
-    if ((fixed > capacity || request.native_bytes > capacity - fixed) &&
-        !has_reclaimer)
-      break;
 
     // Observe increases relative to this failed attempt, rather than testing
     // an already-true capacity hint. Reuse can be denied with zero new bytes;
     // it still needs a paced retry after maintenance publishes a new proof.
-    const size_t native_room = native_available();
-    const size_t rss_room = process_rss_.available();
+    const auto room = available_for_request();
+    observe_progress(room);
     capacity_waits_.fetch_add(1, std::memory_order_relaxed);
-    bool progress;
     {
       std::unique_lock<std::mutex> lock(capacity_mutex_);
-      progress = capacity_cv_.wait_until(
-          lock, std::min(deadline, Clock::now() + milliseconds(100)),
-          [this, native_room, rss_room, request] {
-            return (request.native_bytes && native_available() > native_room) ||
-                   process_rss_.available() > rss_room;
+      const bool progress = capacity_cv_.wait_until(
+          lock, std::min(deadline, Clock::now() + milliseconds(100)), [&] {
+            const auto current = available_for_request();
+            observe_progress(current);
+            return current.native_bytes > room.native_bytes ||
+                   current.rss_bytes > room.rss_bytes;
           });
       if (!progress)
         capacity_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
     }
     if (admit()) return true;
-    // Live owners can release a large reservation in several steps. Keep
-    // waiting within the deadline while capacity is making progress even
-    // when no eviction or residency work remains.
-    if (!progress && !process_rss_.has_resident_uncertainty() && !has_reclaimer) {
-      const auto queues = BlockEvictionQueue::get_instance().stats();
-      if (std::all_of(queues.approximate_queue_sizes.begin(),
-                      queues.approximate_queue_sizes.end(),
-                      [](size_t depth) { return depth == 0; }))
-        break;
+    // Fixed usage includes live mapped owners. Give them a paced attempt to
+    // release capacity, and preserve the same deadline after partial progress.
+    // Once a release is observed, a later polling interval without a release
+    // cannot establish that the remaining owners have stopped making progress.
+    if (!observed_progress &&
+        !(uses_rss && process_rss_.has_resident_uncertainty())) {
+      bool has_reclaimer;
+      {
+        std::lock_guard<std::mutex> lock(process_reclaimer_mutex_);
+        has_reclaimer = static_cast<bool>(process_reclaimer_);
+      }
+      if (!has_reclaimer) {
+        const auto queues = BlockEvictionQueue::get_instance().stats();
+        const size_t fixed = fixed_used();
+        const size_t capacity = pool_size_.load(std::memory_order_relaxed);
+        if (request.native_bytes > capacity - std::min(fixed, capacity) ||
+            std::all_of(queues.approximate_queue_sizes.begin(),
+                        queues.approximate_queue_sizes.end(),
+                        [](size_t depth) { return depth == 0; })) {
+          // The final queue pop can publish capacity concurrently with our
+          // queue snapshot. Check the ledger after observing exhaustion.
+          observe_progress(available_for_request());
+          if (!observed_progress) break;
+        }
+      }
     }
     previous_shortfall = std::numeric_limits<size_t>::max();
     bg_cv_.notify_one();

@@ -395,21 +395,29 @@ int HnswSparseStreamer::dump(const IndexDumper::Pointer &dumper) try {
 }
 
 IndexStreamer::Context::Pointer HnswSparseStreamer::create_context() const {
+  Context::Pointer context;
+  create_context_with_status(context);
+  return context;
+}
+
+int HnswSparseStreamer::create_context_with_status(
+    Context::Pointer &context) const {
+  context.reset();
   if (ailego_unlikely(state_ != STATE_OPENED)) {
     LOG_ERROR("Create context failed, open storage first!");
-    return Context::Pointer();
+    return IndexError_NoReady;
   }
 
   HnswSparseEntity::Pointer entity = entity_.clone();
   if (ailego_unlikely(!entity)) {
     LOG_ERROR("CreateContext clone init failed");
-    return Context::Pointer();
+    return IndexError_Runtime;
   }
-  HnswSparseContext *ctx =
-      new (std::nothrow) HnswSparseContext(metric_, entity);
+  auto ctx = std::unique_ptr<HnswSparseContext>(
+      new (std::nothrow) HnswSparseContext(metric_, entity));
   if (ailego_unlikely(ctx == nullptr)) {
     LOG_ERROR("Failed to new HnswSparseContext");
-    return Context::Pointer();
+    return IndexError_NoMemory;
   }
   ctx->set_ef(ef_);
   ctx->set_max_scan_limit(max_scan_limit_);
@@ -422,14 +430,14 @@ IndexStreamer::Context::Pointer HnswSparseStreamer::create_context() const {
   ctx->set_force_padding_topk(force_padding_topk_enabled_);
   ctx->set_bruteforce_threshold(bruteforce_threshold_);
 
-  if (ailego_unlikely(ctx->init(HnswSparseContext::kSparseStreamerContext)) !=
-      0) {
+  const int ret = ctx->init(HnswSparseContext::kSparseStreamerContext);
+  if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Init HnswSparseContext failed");
-    delete ctx;
-    return Context::Pointer();
+    return ret;
   }
 
-  return Context::Pointer(ctx);
+  context = std::move(ctx);
+  return 0;
 }
 
 IndexStreamer::SparseProvider::Pointer

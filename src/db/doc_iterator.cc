@@ -261,10 +261,11 @@ Result<Doc::Ptr> DocIterator::next() try {
                            impl_->current_batch->num_rows());
     auto ms = materialize_window(impl_.get(), begin, &end);
     if (!ms.ok()) {
-      // Sticky failure: never hand out a partially filled window.
+      // No window row was published and batch_offset is unchanged. Releasing
+      // other results can make this same window admissible on the next call.
       impl_->batch_docs.clear();
-      impl_->error = ms;
-      return tl::make_unexpected(ms);
+      if (ms.code() != StatusCode::RESOURCE_EXHAUSTED) impl_->error = ms;
+      return tl::make_unexpected(std::move(ms));
     }
     impl_->batch_offset = end;
     if (end >= impl_->current_batch->num_rows()) {

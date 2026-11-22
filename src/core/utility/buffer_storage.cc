@@ -96,6 +96,13 @@ inline void bs_store_relaxed(uint64_t *p, uint64_t v) {
 /*! Buffer Storage
  */
 class BufferStorage : public IndexStorage {
+  struct PreparedWriteState {
+    explicit PreparedWriteState(BufferStorage *storage) : owner(storage) {}
+    std::mutex lifetime_mutex;
+    BufferStorage *owner;
+    std::atomic<size_t> active{0};
+  };
+
  public:
   /*! Index Storage Segment
    */
@@ -522,7 +529,7 @@ class BufferStorage : public IndexStorage {
       while (bypass_batch_pages != 0) {
         try {
           scratch.bypass_page.resize_or_throw(bypass_batch_pages *
-                                     ailego::kVectorPageSize);
+                                              ailego::kVectorPageSize);
           break;
         } catch (const std::bad_alloc &) {
           // Batching is optional: retain the original one-page fallback when
@@ -865,18 +872,7 @@ class BufferStorage : public IndexStorage {
                   abs_offset);
         return 0;
       }
-      const uint64_t write_end = offset + len;
-      if (write_end > bs_load_acquire(&meta->data_size)) {
-        std::lock_guard<std::mutex> meta_latch(meta_mtx_);
-        uint64_t cur = bs_load_relaxed(&meta->data_size);
-        if (write_end > cur) {
-          // Publish padding before data_size to keep the pair consistent.
-          bs_store_relaxed(&meta->padding_size, capacity_ - write_end);
-          bs_store_release(&meta->data_size, write_end);
-        }
-      }
-      // Fixed-size rewrites are dirty even when data_size is unchanged.
-      owner_->set_as_dirty();
+      publish_written_size(offset + len);
       return len;
     }
 
@@ -900,32 +896,13 @@ class BufferStorage : public IndexStorage {
         return true;
       }
 
-      auto meta = segment_info_->segment.meta();
-      const size_t data_base = segment_info_->segment_header_start_offset +
-                               segment_info_->segment_header->content_offset +
-                               meta->data_index;
       std::array<ailego::VecBufferWriteFragment, kMaxCoalescedWrites>
           fragments{};
       uint64_t write_end = 0;
-      bool has_data = false;
-      for (size_t i = 0; i < count; ++i) {
-        const auto &write = writes[i];
-        if (ailego_unlikely(write.offset > capacity_ ||
-                            write.length > capacity_ - write.offset ||
-                            (write.length != 0 && write.data == nullptr))) {
-          return false;
-        }
-        if (write.length == 0) {
-          continue;
-        }
-        const size_t abs_offset = data_base + write.offset;
-        fragments[i] = {abs_offset, write.length,
-                        static_cast<const char *>(write.data)};
-        write_end = std::max<uint64_t>(write_end, write.offset + write.length);
-        has_data = true;
-      }
+      if (!make_write_fragments(writes, count, fragments.data(), write_end))
+        return false;
 
-      if (has_data) {
+      if (write_end != 0) {
         const auto status = owner_->buffer_pool_handle_->write_fragments_status(
             fragments.data(), count);
         if (status != ailego::PageWriteStatus::kOk) {
@@ -934,16 +911,34 @@ class BufferStorage : public IndexStorage {
           return false;
         }
       }
-      if (write_end > bs_load_acquire(&meta->data_size)) {
-        std::lock_guard<std::mutex> meta_latch(meta_mtx_);
-        const uint64_t current = bs_load_relaxed(&meta->data_size);
-        if (write_end > current) {
-          bs_store_relaxed(&meta->padding_size, capacity_ - write_end);
-          bs_store_release(&meta->data_size, write_end);
-        }
-      }
-      owner_->set_as_dirty();
+      publish_written_size(write_end);
       return true;
+    }
+
+    int prepare_write_batch(const SegmentData *writes, size_t count,
+                            std::unique_ptr<PreparedWrite> *out) override try {
+      if (!out || (!writes && count)) return IndexError_InvalidArgument;
+      std::shared_lock<std::shared_mutex> latch(
+          owner_->mapping_shards_[owner_->mapping_shard_id()].mtx);
+      if (!owner_->buffer_pool_ || !owner_->buffer_pool_->writable() ||
+          owner_->corrupted_.load(std::memory_order_acquire))
+        return IndexError_WriteData;
+
+      ailego::MemoryReservation descriptor;
+      std::unique_ptr<PreparedBatch> prepared;
+      descriptor.add_for_allocation(sizeof(PreparedBatch), [&] {
+        prepared = std::make_unique<PreparedBatch>(
+            std::static_pointer_cast<WrappedSegment>(shared_from_this()),
+            owner_->buffer_pool_);
+      });
+      prepared->memory = std::move(descriptor);
+      const int ret = prepared->prepare(writes, count);
+      if (ret != 0) return ret;
+      prepared->hold_storage(owner_->prepared_write_state());
+      *out = std::move(prepared);
+      return ret;
+    } catch (const std::bad_alloc &) {
+      return IndexError_NoMemory;
     }
 
     //! Resize size of data.  See write() for the locking contract.
@@ -1022,6 +1017,106 @@ class BufferStorage : public IndexStorage {
     }
 
    private:
+    class PreparedBatch final : public PreparedWrite {
+     public:
+      PreparedBatch(std::shared_ptr<WrappedSegment> segment,
+                    ailego::VecBufferPool::Pointer pool)
+          : segment_(std::move(segment)), pool_(std::move(pool)) {}
+
+      ~PreparedBatch() override {
+        pins_.reset();
+        if (state_) state_->active.fetch_sub(1, std::memory_order_release);
+      }
+
+      void hold_storage(std::shared_ptr<PreparedWriteState> state) {
+        state->active.fetch_add(1, std::memory_order_relaxed);
+        state_ = std::move(state);
+      }
+
+      int prepare(const SegmentData *writes, size_t count) {
+        fragments_.resize(count);
+        if (!segment_->make_write_fragments(writes, count, fragments_.data(),
+                                            write_end_))
+          return IndexError_InvalidArgument;
+        size_t total = 0;
+        for (const auto &fragment : fragments_) {
+          if (fragment.length > std::numeric_limits<size_t>::max() - total)
+            return IndexError_NoMemory;
+          total += fragment.length;
+        }
+        payload_.resize(total);
+        size_t offset = 0;
+        for (auto &fragment : fragments_) {
+          if (!fragment.length) continue;
+          std::memcpy(payload_.data() + offset, fragment.src, fragment.length);
+          fragment.src = payload_.data() + offset;
+          offset += fragment.length;
+        }
+        const auto status =
+            pool_->prepare_write_fragments(fragments_.data(), count, pins_);
+        if (status == ailego::PageWriteStatus::kOk) return 0;
+        return status == ailego::PageWriteStatus::kNoMemory
+                   ? IndexError_NoMemory
+                   : IndexError_WriteData;
+      }
+
+      void commit() noexcept override {
+        if (write_end_ == 0) return;
+        std::lock_guard<std::mutex> life(state_->lifetime_mutex);
+        auto *owner = state_->owner;
+        if (!owner) return;
+        std::shared_lock<std::shared_mutex> latch(
+            owner->mapping_shards_[owner->mapping_shard_id()].mtx);
+        pool_->commit_write_fragments(fragments_.data(), fragments_.size(),
+                                      pins_);
+        segment_->publish_written_size(write_end_);
+        write_end_ = 0;
+      }
+
+      ailego::MemoryReservation memory;
+
+     private:
+      std::shared_ptr<PreparedWriteState> state_;
+      std::shared_ptr<WrappedSegment> segment_;
+      ailego::VecBufferPool::Pointer pool_;
+      ailego::BudgetedVector<ailego::VecBufferWriteFragment> fragments_;
+      ailego::BudgetedVector<char> payload_;
+      ailego::VecBufferPool::PreparedWritePages pins_;
+      uint64_t write_end_{0};
+    };
+
+    bool make_write_fragments(const SegmentData *writes, size_t count,
+                              ailego::VecBufferWriteFragment *fragments,
+                              uint64_t &write_end) const {
+      const size_t data_base = data_offset();
+      for (size_t i = 0; i < count; ++i) {
+        const auto &write = writes[i];
+        if (write.offset > capacity_ ||
+            write.length > capacity_ - write.offset ||
+            (write.length != 0 && write.data == nullptr))
+          return false;
+        if (!write.length) continue;
+        fragments[i] = {data_base + write.offset, write.length,
+                        static_cast<const char *>(write.data)};
+        write_end = std::max<uint64_t>(write_end, write.offset + write.length);
+      }
+      return true;
+    }
+
+    void publish_written_size(uint64_t write_end) {
+      auto *meta = segment_info_->segment.meta();
+      if (write_end > bs_load_acquire(&meta->data_size)) {
+        std::lock_guard<std::mutex> meta_latch(meta_mtx_);
+        if (write_end > bs_load_relaxed(&meta->data_size)) {
+          // Publish data bytes and padding before the logical length.
+          bs_store_relaxed(&meta->padding_size, capacity_ - write_end);
+          bs_store_release(&meta->data_size, write_end);
+        }
+      }
+      // Fixed-size rewrites are dirty even when data_size is unchanged.
+      owner_->set_as_dirty();
+    }
+
     static constexpr size_t kMaxCoalescedWrites = 8;
     // Stable unordered_map value address; reparses update this object in place.
     IndexMapping::SegmentInfo *segment_info_{nullptr};
@@ -1086,7 +1181,7 @@ class BufferStorage : public IndexStorage {
           !immutable && len <= kSmallSnapshotBytes
               ? 0
               : (len < kBufferAlignment ? AILEGO_CACHE_LINE_SIZE
-                                       : kBufferAlignment);
+                                        : kBufferAlignment);
       if (alignment) {
         if (ailego_unlikely(!AlignBufferSize(len, &alloc_size, alignment))) {
           return 0;
@@ -1148,7 +1243,11 @@ class BufferStorage : public IndexStorage {
 
   //! Destructor
   ~BufferStorage() override {
-    this->cleanup();
+    if (prepared_writes_) {
+      std::lock_guard<std::mutex> life(prepared_writes_->lifetime_mutex);
+      prepared_writes_->owner = nullptr;
+    }
+    close_index(/*force=*/true);
   }
 
   //! Retrieve the memory block type of this storage
@@ -1175,8 +1274,7 @@ class BufferStorage : public IndexStorage {
 
   //! Cleanup storage
   int cleanup() override {
-    this->close_index();
-    return 0;
+    return this->close_index();
   }
 
   //! Open storage
@@ -1188,6 +1286,30 @@ class BufferStorage : public IndexStorage {
 
   int open_with_options(const std::string &path,
                         const OpenOptions &options) override {
+    BufferStorage candidate;
+    candidate.segment_meta_capacity_ = segment_meta_capacity_;
+    AllShardsExclusiveLatch latch(mapping_shards_);
+    if (has_prepared_writes()) return IndexError_Runtime;
+    // A second open may read the same file. Publish pending writes before
+    // parsing it, and keep the current directory until admission succeeds.
+    int ret = flush_index_locked();
+    if (ret != 0) return ret;
+    ret = candidate.open_unpublished(path, options);
+    if (ret != 0) return ret;
+
+    read_scratch_.clear();
+    file_name_.swap(candidate.file_name_);
+    buffer_pool_.swap(candidate.buffer_pool_);
+    buffer_pool_handle_.swap(candidate.buffer_pool_handle_);
+    segments_.swap(candidate.segments_);
+    meta_chains_.swap(candidate.meta_chains_);
+    std::swap(cache_enabled_, candidate.cache_enabled_);
+    pending_check_point_.store(0, std::memory_order_relaxed);
+    return 0;
+  }
+
+ private:
+  int open_unpublished(const std::string &path, const OpenOptions &options) {
     const bool writable = !options.read_only;
     if (!ailego::File::IsExist(path) && options.create_if_missing) {
       size_t last_slash = path.rfind('/');
@@ -1203,13 +1325,10 @@ class BufferStorage : public IndexStorage {
     }
 
     try {
-      // Capture both owners before replacing the published state. In
-      // particular, a failed reopen must not change existing segments' pool.
       auto candidate_pool =
           std::make_shared<ailego::VecBufferPool>(path, writable);
       auto candidate_handle =
           std::make_shared<ailego::VecBufferPoolHandle>(candidate_pool);
-      read_scratch_.clear();
       file_name_ = path;
       buffer_pool_ = std::move(candidate_pool);
       buffer_pool_handle_ = std::move(candidate_handle);
@@ -1461,6 +1580,7 @@ class BufferStorage : public IndexStorage {
     return IndexError_NoMemory;
   }
 
+ public:
   //! Flush storage
   int flush() override {
     return this->flush_index();
@@ -1468,8 +1588,7 @@ class BufferStorage : public IndexStorage {
 
   //! Close storage
   int close() override {
-    this->close_index();
-    return 0;
+    return this->close_index();
   }
 
   //! Append a segment into storage
@@ -1678,11 +1797,12 @@ class BufferStorage : public IndexStorage {
   }
 
   //! Close index storage
-  void close_index() {
+  int close_index(bool force = false) {
     // Hold ONE continuous all-shards latch across flush + teardown so no
     // writer can slip in between (which would dirty meta_buf only to have
     // the page table reset under it, dropping the modification).
     AllShardsExclusiveLatch latch(mapping_shards_);
+    if (!force && has_prepared_writes()) return IndexError_Runtime;
     flush_index_locked();
     read_scratch_.clear();
     file_name_.clear();
@@ -1691,9 +1811,11 @@ class BufferStorage : public IndexStorage {
     buffer_pool_handle_.reset();
     buffer_pool_.reset();
     cache_enabled_ = false;
+    prepared_writes_.reset();
     pending_check_point_.store(0, std::memory_order_relaxed);
     index_dirty_.store(false, std::memory_order_relaxed);
     corrupted_.store(false, std::memory_order_relaxed);
+    return 0;
   }
 
   //! Append a segment into storage.
@@ -1956,6 +2078,26 @@ class BufferStorage : public IndexStorage {
   }
 
  private:
+  std::shared_ptr<PreparedWriteState> prepared_write_state() {
+    auto state =
+        std::atomic_load_explicit(&prepared_writes_, std::memory_order_acquire);
+    if (state) return state;
+    auto candidate = std::allocate_shared<PreparedWriteState>(
+        ailego::BudgetedAllocator<PreparedWriteState>{}, this);
+    if (std::atomic_compare_exchange_strong_explicit(
+            &prepared_writes_, &state, candidate, std::memory_order_acq_rel,
+            std::memory_order_acquire))
+      return candidate;
+    return state;
+  }
+
+  // Called with all mapping shards held. Every prepare operation acquires a
+  // shard before publishing a handle, so no new hold can race replacement.
+  bool has_prepared_writes() const {
+    return prepared_writes_ &&
+           prepared_writes_->active.load(std::memory_order_acquire) != 0;
+  }
+
   bool read_bypass(size_t offset, size_t len, char *out) const {
     bool allocation_failed = false;
     const bool ok = buffer_pool_handle_->read_range_bypass(offset, len, out,
@@ -1975,6 +2117,7 @@ class BufferStorage : public IndexStorage {
 
   std::atomic<bool> index_dirty_{false};
   ReusableReadScratch read_scratch_;
+  std::shared_ptr<PreparedWriteState> prepared_writes_;
   std::atomic<uint64_t> pending_check_point_{0};
   // Raised after an unrecoverable rollback; blocks writes until close.
   std::atomic<bool> corrupted_{false};

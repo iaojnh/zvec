@@ -184,8 +184,7 @@ Result<std::unique_ptr<arrow::RecordBatchReader>> SQLEngineImpl::prepare_search(
   auto reader = search_by_query_info(collection, segments, &query_infos,
                                      max_queued_bytes);
   if (!reader) {
-    if (reader.error().code() == StatusCode::RESOURCE_EXHAUSTED)
-      return reader;
+    if (reader.error().code() == StatusCode::RESOURCE_EXHAUSTED) return reader;
     return tl::make_unexpected(Status::InternalError(
         "Execute plan failed (query): ", reader.error().c_str()));
   }
@@ -704,8 +703,8 @@ Result<DocPtrList> SQLEngineImpl::fill_result(
     }
     size_t cur_size = docs.size();
     detail::ResultMemoryAllowance::PendingCopy pending;
-    if (memory) memory->add_pending(detail::EstimateQueryResult(*record_batch),
-                                     pending);
+    if (memory)
+      memory->add_pending(detail::EstimateQueryResult(*record_batch), pending);
     pending.start();
     docs.resize(docs.size() + record_batch->num_rows());
     for (int i = 0; i < record_batch->num_rows(); i++) {

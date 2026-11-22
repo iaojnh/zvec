@@ -75,9 +75,9 @@ int Index::search_internal_ids(const VectorData &vector_data,
     return 0;
   }
 
-  if (!is_trained_ && train() != 0) {
-    LOG_ERROR("Failed to train index");
-    return core::IndexError_Runtime;
+  if (!is_trained_) {
+    const int ret = train();
+    if (ret != 0) return ret;
   }
   auto &context = acquire_context(true);
   AILEGO_DEFER([&] { release_context(); });

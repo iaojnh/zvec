@@ -13,10 +13,10 @@
 // limitations under the License.
 #pragma once
 
-#include <atomic>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <utility>
 #include <rocksdb/advanced_cache.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
@@ -34,14 +34,13 @@ class RocksdbBlockCache final : public rocksdb::CacheWrapper {
   struct ContextLease {
     explicit ContextLease(std::shared_ptr<RocksdbBlockCache> cache)
         : owner(std::move(cache)) {
-      std::lock_guard<std::mutex> lock(owner->context_mutex_);
-      owner->tracks_contexts_.store(true, std::memory_order_release);
-      owner->contexts_.fetch_add(1, std::memory_order_release);
+      std::unique_lock lock(owner->context_mutex_);
+      owner->tracks_contexts_ = true;
+      ++owner->contexts_;
     }
     ~ContextLease() {
-      std::lock_guard<std::mutex> lock(owner->context_mutex_);
-      if (owner->contexts_.fetch_sub(1, std::memory_order_acq_rel) == 1)
-        owner->EraseUnRefEntries();
+      std::unique_lock lock(owner->context_mutex_);
+      if (--owner->contexts_ == 0) owner->EraseUnRefEntries();
     }
     std::shared_ptr<RocksdbBlockCache> owner;
   };
@@ -71,8 +70,11 @@ class RocksdbBlockCache final : public rocksdb::CacheWrapper {
   bool Release(Handle *handle, bool erase_if_last_ref = false) override {
     // A pinned block can outlive the last DB. Preserve the live handle, then
     // release its backing instead of putting it back in an ownerless LRU.
-    const bool closed = tracks_contexts_.load(std::memory_order_acquire) &&
-                        contexts_.load(std::memory_order_acquire) == 0;
+    // Keep the last-context purge ordered with the actual unpin, not just
+    // with reading the context count. Independent LRU shards can unpin in
+    // parallel while their DB contexts stay open.
+    std::shared_lock lock(context_mutex_);
+    const bool closed = tracks_contexts_ && contexts_ == 0;
     return target_->Release(handle, erase_if_last_ref || closed);
   }
 
@@ -123,9 +125,9 @@ class RocksdbBlockCache final : public rocksdb::CacheWrapper {
   }
 
  private:
-  std::mutex context_mutex_;
-  std::atomic<size_t> contexts_{0};
-  std::atomic<bool> tracks_contexts_{false};
+  std::shared_mutex context_mutex_;
+  size_t contexts_{0};
+  bool tracks_contexts_{false};
 
   static bool is_read_block(const CacheItemHelper *helper) {
     if (!helper) return false;

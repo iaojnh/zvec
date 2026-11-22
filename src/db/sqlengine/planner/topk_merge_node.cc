@@ -89,8 +89,8 @@ arrow::Status TopKMergeNode::prepare() {
       try {
         readers[i] = plans_[end - 1 - i]->execute_to_reader(64 * 1024);
       } catch (const std::bad_alloc &) {
-        readers[i] = tl::make_unexpected(Status(
-            StatusCode::RESOURCE_EXHAUSTED, "TopK reader exceeds budget"));
+        readers[i] = tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                                "TopK reader exceeds budget"));
       } catch (const std::exception &error) {
         readers[i] = tl::make_unexpected(Status::InternalError(error.what()));
       }
@@ -135,9 +135,9 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> TopKMergeNode::fetch(
     size_t segment, const std::vector<int> &rows,
     std::shared_ptr<arrow::Array> scores) const {
   ARROW_ASSIGN_OR_RAISE(
-      auto table, internal::fetch_table(
-                      *segments_[segment],
-                      output_->get_selected_scalar_field_names(), rows));
+      auto table,
+      internal::fetch_table(*segments_[segment],
+                            output_->get_selected_scalar_field_names(), rows));
   ARROW_ASSIGN_OR_RAISE(
       auto batch,
       table->CombineChunksToBatch(segments_[segment]->query_memory_pool()));
@@ -172,8 +172,8 @@ TopKMergeNode::materialize() {
   const size_t count = std::min(kBatchRows, winners.size() - offset_);
   std::array<size_t, kBatchRows> order;
   std::iota(order.begin(), order.begin() + count, 0);
-  bool append_in_order = output_->fts_cond_info() &&
-                         segments_.front()->uses_buffer_storage();
+  bool append_in_order =
+      output_->fts_cond_info() && segments_.front()->uses_buffer_storage();
   if (append_in_order) {
     bool ascending = true, descending = true;
     for (size_t i = 1; i < count; ++i) {
@@ -227,7 +227,8 @@ TopKMergeNode::materialize() {
   ARROW_ASSIGN_OR_RAISE(auto table,
                         arrow::Table::FromRecordBatches(schema_, batches));
   if (append_in_order) {
-    ARROW_ASSIGN_OR_RAISE(auto result, table->CombineChunksToBatch(memory_pool));
+    ARROW_ASSIGN_OR_RAISE(auto result,
+                          table->CombineChunksToBatch(memory_pool));
     offset_ += count;
     return result;
   }

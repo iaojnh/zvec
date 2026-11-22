@@ -23,6 +23,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <ailego/pattern/scope_guard.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/pattern/expected.hpp>
 #include <zvec/ailego/utility/string_helper.h>
@@ -102,6 +103,7 @@ Status Version::Save(const std::string &path, const Version &version) {
   }
 
   ofs.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
+  ofs.close();
   if (!ofs.good()) {
     LOG_ERROR("Failed to serialize manifest to file: %s", path.c_str());
     return Status::InternalError("Failed to serialize manifest to file");
@@ -276,17 +278,38 @@ Status VersionManager::remove_persisted_segment_meta(SegmentID id) {
 
 Status VersionManager::flush() {
   std::lock_guard lock(mtx_);
+  return flush_unlocked(current_version_);
+}
 
-  std::string current_path;
-  if (version_id_ != 0) {
-    current_path =
-        FileHelper::MakeFilePath(path_, FileID::MANIFEST_FILE, version_id_ - 1);
+Status VersionManager::flush_writing_segment(
+    const SegmentMeta::Ptr &meta, uint32_t delete_snapshot_path_suffix) {
+  std::lock_guard lock(mtx_);
+  auto pending = current_version_;
+  pending.reset_writing_segment_meta(meta);
+  if (delete_snapshot_path_suffix != UINT32_MAX) {
+    pending.set_delete_snapshot_path_suffix(delete_snapshot_path_suffix);
   }
+  auto status = flush_unlocked(pending);
+  if (status.ok()) current_version_ = std::move(pending);
+  return status;
+}
 
-  auto s = Version::Save(
-      FileHelper::MakeFilePath(path_, FileID::MANIFEST_FILE, version_id_++),
-      current_version_);
+Status VersionManager::flush_unlocked(const Version &version) {
+  const auto next_path =
+      FileHelper::MakeFilePath(path_, FileID::MANIFEST_FILE, version_id_);
+  const auto current_path =
+      version_id_ == 0 ? std::string{}
+                       : FileHelper::MakeFilePath(path_, FileID::MANIFEST_FILE,
+                                                  version_id_ - 1);
+  const auto temporary_path = next_path + ".tmp";
+  auto cleanup =
+      ailego::ScopeGuard::Make([&] { FileHelper::RemoveFile(temporary_path); });
+  auto s = Version::Save(temporary_path, version);
   CHECK_RETURN_STATUS(s);
+  if (!ailego::File::Rename(temporary_path, next_path)) {
+    return Status::InternalError("Failed to publish manifest: ", next_path);
+  }
+  ++version_id_;
 
   if (!current_path.empty()) {
     FileHelper::RemoveFile(current_path);

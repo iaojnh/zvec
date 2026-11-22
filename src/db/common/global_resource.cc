@@ -74,15 +74,28 @@ int GlobalResource::initialize() {
   if (initialized_.load(std::memory_order_acquire)) {
     return 0;
   }
-  std::lock_guard<std::mutex> lock(initialization_mutex_);
+
+  // An explicit configuration owns startup once it starts. Keep the
+  // configuration lock through lazy startup so that a racing explicit call
+  // cannot publish settings for resources being created from the defaults.
+  auto &config = GlobalConfig::Instance();
+  std::unique_lock config_lock(config.initialization_mutex_);
+  if (config.initializing_thread_ == std::this_thread::get_id()) return -1;
+  config.initialization_cv_.wait(config_lock, [&config] {
+    return config.initialization_state_ !=
+           GlobalConfig::InitializationState::kInitializing;
+  });
+  if (initialized_.load(std::memory_order_acquire)) return 0;
+  if (config.initialization_state_ ==
+      GlobalConfig::InitializationState::kFailed)
+    return -1;
+
+  std::unique_lock lock(initialization_mutex_);
   if (initialization_failed_) return -1;
-  if (query_thread_pool_ && optimize_thread_pool_) {
-    return 0;
-  }
   // Keep the initial budget snapshot and resource creation under one lock.
   // Another lazy caller must not mistake our newly created pool for a
   // preconfigured standalone pool.
-  const auto &config = GlobalConfig::Instance();
+  const auto snapshot = config.config_snapshot();
   auto &memory_pool = zvec::ailego::MemoryLimitPool::get_instance();
   // Standalone/core users may configure the process-wide pool before the DB
   // layer lazily creates its thread pools. In that case the first published
@@ -91,23 +104,28 @@ int GlobalResource::initialize() {
   const bool preserve_existing_pool = memory_pool.initialized();
   const uint64_t effective_memory_limit = preserve_existing_pool
                                               ? memory_pool.capacity()
-                                              : config.memory_limit_bytes();
-  return initialize_locked(
-      effective_memory_limit, config.query_thread_count(),
-      config.query_thread_binding(), config.optimize_thread_count(),
-      config.optimize_thread_binding(), preserve_existing_pool);
+                                              : snapshot->memory_limit_bytes;
+  const int result = initialize_locked(
+      effective_memory_limit, snapshot->query_thread_count,
+      snapshot->query_thread_binding, snapshot->optimize_thread_count,
+      snapshot->optimize_thread_binding, preserve_existing_pool);
+  if (result == 0) initialized_.store(true, std::memory_order_release);
+  lock.unlock();
+  config_lock.unlock();
+  if (result == 0) log_initialized();
+  return result;
 }
 
-int GlobalResource::initialize(uint64_t memory_limit_bytes,
-                               uint32_t query_thread_count,
-                               bool query_thread_binding,
-                               uint32_t optimize_thread_count,
-                               bool optimize_thread_binding,
-                               bool preserve_existing_pool) {
+int GlobalResource::prepare(uint64_t memory_limit_bytes,
+                            uint32_t query_thread_count,
+                            bool query_thread_binding,
+                            uint32_t optimize_thread_count,
+                            bool optimize_thread_binding) {
   std::lock_guard<std::mutex> lock(initialization_mutex_);
   return initialize_locked(memory_limit_bytes, query_thread_count,
                            query_thread_binding, optimize_thread_count,
-                           optimize_thread_binding, preserve_existing_pool);
+                           optimize_thread_binding,
+                           /*preserve_existing_pool=*/false);
 }
 
 int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
@@ -274,21 +292,6 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
     rocksdb_block_cache_ = std::move(rocksdb_block_cache);
     rocksdb_write_buffer_manager_ = std::move(rocksdb_write_buffer_manager);
     initialization_failed_ = false;
-    initialized_.store(true, std::memory_order_release);
-    LOG_INFO(
-        "Managed memory initialized: total=%llu buffer_pool=%llu "
-        "rocksdb=%llu rocksdb_percent=%u rocksdb_write_buffer=%llu "
-        "rocksdb_cache_shard_bits=%d rss_limit=%llu rss_headroom=%llu",
-        static_cast<unsigned long long>(memory_limit_bytes_),
-        static_cast<unsigned long long>(buffer_pool_capacity),
-        static_cast<unsigned long long>(rocksdb_memory_capacity_),
-        detail::kRocksDbMemoryPercent,
-        static_cast<unsigned long long>(
-            rocksdb_write_buffer_manager_->buffer_size()),
-        calculate_rocksdb_cache_shard_bits(rocksdb_memory_capacity_),
-        static_cast<unsigned long long>(memory_pool.process_rss_limit()),
-        static_cast<unsigned long long>(ailego::ProcessRssBudget::headroom(
-            memory_pool.process_rss_limit())));
     return 0;
   } catch (const std::exception &e) {
     LOG_ERROR("GlobalResource::initialize failed: %s", e.what());
@@ -296,6 +299,27 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
     LOG_ERROR("GlobalResource::initialize failed with an unknown exception");
   }
   return -1;
+}
+
+void GlobalResource::log_initialized() const noexcept try {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto rss_limit = pool.process_rss_limit();
+  LOG_INFO(
+      "Managed memory initialized: total=%llu buffer_pool=%llu "
+      "rocksdb=%llu rocksdb_percent=%u rocksdb_write_buffer=%llu "
+      "rocksdb_cache_shard_bits=%d rss_limit=%llu rss_headroom=%llu",
+      static_cast<unsigned long long>(memory_limit_bytes_),
+      static_cast<unsigned long long>(pool.capacity()),
+      static_cast<unsigned long long>(rocksdb_memory_capacity_),
+      detail::kRocksDbMemoryPercent,
+      static_cast<unsigned long long>(
+          rocksdb_write_buffer_manager_->buffer_size()),
+      calculate_rocksdb_cache_shard_bits(rocksdb_memory_capacity_),
+      static_cast<unsigned long long>(rss_limit),
+      static_cast<unsigned long long>(
+          ailego::ProcessRssBudget::headroom(rss_limit)));
+} catch (...) {
+  // Logging after publication cannot change the startup result.
 }
 
 }  // namespace zvec

@@ -484,8 +484,12 @@ class IndexStorage : public IndexModule {
     using ReadChunks = ailego::BudgetedVector<ReadChunk>;
     // Immutable logical read ranges, relative to this segment. Backends that
     // support them can cache the same units that the algorithm consumes.
-    virtual bool supports_read_chunks() const { return false; }
-    virtual int set_read_chunks(const ReadChunks &) { return 0; }
+    virtual bool supports_read_chunks() const {
+      return false;
+    }
+    virtual int set_read_chunks(const ReadChunks &) {
+      return 0;
+    }
 
     //! A bounded-lifetime scatter read. Page-backed implementations may
     //! return independently pinned spans; contiguous backends use fallback.
@@ -779,6 +783,20 @@ class IndexStorage : public IndexModule {
                               CachePriority priority = CachePriority::kLow) {
       prefetch(offset, len, priority);
       return true;
+    }
+
+    class PreparedWrite {
+     public:
+      virtual ~PreparedWrite() = default;
+      virtual void commit() noexcept = 0;
+    };
+
+    // A successful preparation owns the input bytes and all required page
+    // pins. Destroying the result cancels it without marking data dirty.
+    // Keep the storage open until all prepared write results are destroyed.
+    virtual int prepare_write_batch(const SegmentData *, size_t,
+                                    std::unique_ptr<PreparedWrite> *) {
+      return IndexError_Unsupported;
     }
   };
 

@@ -11,10 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include "vamana_streamer_entity.h"
 #include <ailego/pattern/defer.h>
 #include <ailego/utility/memory_helper.h>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/hash/crc32c.h>
 #include <zvec/core/framework/index_stats.h>
 #include "utility/legacy_read_buffer.h"

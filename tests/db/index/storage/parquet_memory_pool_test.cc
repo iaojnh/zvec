@@ -73,10 +73,10 @@ struct MemoryLimitPoolTestPeer {
     ready.set_value();
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!stop.load() && !pool.workspace_waiting_size_.load() &&
+    while (!stop.load() && !pool.mandatory_waiters_.load() &&
            std::chrono::steady_clock::now() < deadline)
       std::this_thread::yield();
-    return pool.workspace_waiting_size_.load() != 0;
+    return pool.mandatory_waiters_.load() != 0;
   }
   static bool configure_rss(MemoryLimitPool &pool) {
     return pool.process_rss_.configure(

@@ -65,8 +65,7 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> FtsRecallNode::gen() {
                                           fts_ret.error().c_str()));
       }
       state.fts_result_ = fts_ret.value();
-      if (!packed_rank)
-        state.iter_ = state.fts_result_->create_iterator();
+      if (!packed_rank) state.iter_ = state.fts_result_->create_iterator();
     }
 
     if (packed_rank && !state.iter_) {
@@ -77,9 +76,9 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> FtsRecallNode::gen() {
       // when the original builders could still reuse their prepaid slots.
       if (ailego::MemoryLimitPool::get_instance().prefetch_available() >=
           1024 * 1024) {
-        auto batch = MakeFtsRankBatch(
-            *state.fts_result_, state.rank_offset_, self->batch_size_,
-            self->schema_, self->segment_->query_memory_pool());
+        auto batch = MakeFtsRankBatch(*state.fts_result_, state.rank_offset_,
+                                      self->batch_size_, self->schema_,
+                                      self->segment_->query_memory_pool());
         if (batch.ok()) {
           state.rank_offset_ += (*batch)->num_rows();
           return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(

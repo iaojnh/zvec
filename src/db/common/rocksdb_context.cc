@@ -70,7 +70,16 @@ rocksdb::Status RocksdbContext::finish_write(rocksdb::Status status) {
   rocksdb::FlushOptions options;
   options.wait = true;
   options.allow_write_stall = true;
-  return db_->Flush(options, cf_handles_);
+  const auto flushed = db_->Flush(options, cf_handles_);
+  if (!flushed.ok()) {
+    LOG_ERROR("Post-write RocksDB flush failed: db[%s], reason[%s]",
+              db_path_.c_str(), flushed.ToString().c_str());
+  }
+  // Put/Merge/Delete/Write have already committed to the DB. A maintenance
+  // error cannot undo that mutation or prevent its caller from publishing
+  // the corresponding document and updating the other indexes. Explicit
+  // flush/close still report a failed attempt to persist the memtables.
+  return status;
 }
 
 
@@ -416,6 +425,8 @@ std::shared_ptr<void> RocksdbContext::prepare_options(
   // are evicted as writes grow and writes stall if flushing cannot keep up.
   create_opts_.write_buffer_manager =
       GlobalResource::Instance().rocksdb_write_buffer_manager();
+  // A manual flush must be able to make progress while writes are stalled.
+  flush_opts_.allow_write_stall = true;
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
   // malloc can retain freed MemTable blocks around unrelated live objects.
   // Keep SkipList semantics and WBM accounting, but tie the large backing to

@@ -522,14 +522,16 @@ arrow::Status detail::ParquetBufferLoader::load_checked(
   const auto leaves = ParquetLeafColumns(*metadata, {column});
   if (leaves.empty())
     return arrow::Status::Invalid("Invalid parquet column: ", column);
-  const auto bounded_rows = ParquetDecodeBatchRows(*metadata, row_group, leaves);
+  const auto bounded_rows =
+      ParquetDecodeBatchRows(*metadata, row_group, leaves);
   // A resident column retains every decoded chunk anyway. With spare budget,
   // reduce chunk and executor overhead; pressure reads keep the bounded
   // decoder granularity and the existing OOM/streaming fallback.
-  const bool headroom = ailego::MemoryLimitPool::get_instance()
-                            .prefetch_available() >= 128UL * 1024 * 1024;
-  const auto batch_rows = headroom ? std::min<int64_t>(8192, bounded_rows * 8)
-                                  : bounded_rows;
+  const bool headroom =
+      ailego::MemoryLimitPool::get_instance().prefetch_available() >=
+      128UL * 1024 * 1024;
+  const auto batch_rows =
+      headroom ? std::min<int64_t>(8192, bounded_rows * 8) : bounded_rows;
   reader->set_batch_size(batch_rows);
   auto batches = reader->GetRecordBatchReader({row_group}, leaves);
   if (!batches.ok()) {

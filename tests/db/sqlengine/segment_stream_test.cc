@@ -102,6 +102,98 @@ TEST(SegmentStreamTest, ErrorIsPropagatedAndSourceIsReleased) {
   EXPECT_TRUE(expires(weak));
 }
 
+TEST(SegmentStreamTest, DeliveryErrorWaitsForOutstandingPrefetch) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const auto capacity = pool.capacity();
+  ASSERT_EQ(0, pool.init(128UL << 20));
+  auto restore_pool = ailego::ScopeGuard::Make([&] { pool.init(capacity); });
+  auto *cpu = GlobalResource::Instance().arrow_query_thread_pool();
+  ASSERT_NE(nullptr, cpu);
+  const auto cpu_count = cpu->GetCapacity();
+  ASSERT_TRUE(cpu->SetCapacity(2).ok());
+  auto restore_cpu = ailego::ScopeGuard::Make(
+      [&] { EXPECT_TRUE(cpu->SetCapacity(cpu_count).ok()); });
+
+  class RejectDelivery : public arrow::acero::ExecNode {
+   public:
+    RejectDelivery(arrow::acero::ExecPlan *plan, ExecNode *input)
+        : ExecNode(plan, {input}, {"input"}, input->output_schema()) {}
+    const char *kind_name() const override {
+      return "RejectDelivery";
+    }
+    const arrow::compute::Ordering &ordering() const override {
+      return inputs_[0]->ordering();
+    }
+    arrow::Status InputReceived(ExecNode *, arrow::compute::ExecBatch) override {
+      return arrow::Status::IOError("injected delivery failure");
+    }
+    arrow::Status InputFinished(ExecNode *, int) override {
+      return arrow::Status::OK();
+    }
+    arrow::Status StartProducing() override {
+      return arrow::Status::OK();
+    }
+    void PauseProducing(ExecNode *, int32_t counter) override {
+      inputs_[0]->PauseProducing(this, counter);
+    }
+    void ResumeProducing(ExecNode *, int32_t counter) override {
+      inputs_[0]->ResumeProducing(this, counter);
+    }
+
+   protected:
+    arrow::Status StopProducingImpl() override {
+      return arrow::Status::OK();
+    }
+  };
+  static const auto registered =
+      arrow::acero::default_exec_factory_registry()->AddFactory(
+          "zvec_test_reject_delivery",
+          [](arrow::acero::ExecPlan *plan,
+             std::vector<arrow::acero::ExecNode *> inputs,
+             const arrow::acero::ExecNodeOptions &)
+              -> arrow::Result<arrow::acero::ExecNode *> {
+            return plan->EmplaceNode<RejectDelivery>(plan, inputs.at(0));
+          });
+  ASSERT_TRUE(registered.ok());
+
+  auto schema = arrow::schema({arrow::field("row", arrow::int32())});
+  arrow::Int32Builder builder;
+  ASSERT_TRUE(builder.AppendValues(std::vector<int32_t>(1024, 42)).ok());
+  auto batch = arrow::RecordBatch::Make(schema, 1024,
+                                        {builder.Finish().ValueOrDie()});
+  auto started = arrow::Future<>::Make();
+  auto gate = arrow::Future<Batch>::Make();
+  auto release = ailego::ScopeGuard::Make([&] {
+    if (!gate.is_finished()) gate.MarkFinished(Batch{});
+  });
+  arrow::AsyncGenerator<Batch> source =
+      [batch, started, gate, count = 0]() mutable -> arrow::Future<Batch> {
+    // Fill the source's 64-delivery window, then gate the next prefetch.
+    if (++count == 65) {
+      started.MarkFinished();
+      return gate;
+    }
+    return Batch{arrow::compute::ExecBatch(*batch)};
+  };
+  PlanInfo plan(
+      arrow::acero::Declaration::Sequence(
+          {{"source", arrow::acero::SourceNodeOptions{
+                           schema, source,
+                           arrow::compute::Ordering::Implicit()}},
+           {"zvec_test_reject_delivery", arrow::acero::ExecNodeOptions{}}}),
+      schema, true);
+  auto stream = plan.execute_to_generator(8192);
+  ASSERT_TRUE(stream);
+  ASSERT_TRUE(started.Wait(3));
+  auto finished = stream->close();
+  EXPECT_FALSE(finished.Wait(0.1));
+  gate.MarkFinished(Batch{});
+  ASSERT_TRUE(finished.Wait(3));
+  EXPECT_TRUE(finished.status().IsIOError()) << finished.status().ToString();
+  EXPECT_NE(std::string::npos,
+            finished.status().ToString().find("injected delivery failure"));
+}
+
 TEST(SegmentStreamTest, ReadySourceHonorsPressureBeforePullingMore) {
   const auto capacity = arrow::GetCpuThreadPoolCapacity();
   ASSERT_TRUE(arrow::SetCpuThreadPoolCapacity(1).ok());

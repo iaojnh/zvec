@@ -13,11 +13,11 @@
 // limitations under the License.
 
 #include "db/sqlengine/planner/doc_filter.h"
-#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <optional>
 #include <arrow/acero/exec_plan.h>
 #include <arrow/table.h>
 #include <arrow/util/thread_pool.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/logger/logger.h>
 #include "db/common/global_resource.h"
 #include "db/index/storage/parquet_memory_pool.h"

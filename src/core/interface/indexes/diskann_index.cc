@@ -19,9 +19,9 @@
 #include <zvec/core/interface/index.h>
 #if DISKANN_SUPPORTED
 #include "algorithm/diskann/diskann_params.h"
+#include "turbo/quantizer/quantizer.h"
 #include "utility/utility_params.h"
 #include "buffered_input.h"
-#include "turbo/quantizer/quantizer.h"
 #include "holder_builder.h"
 #endif
 
@@ -138,10 +138,16 @@ int DiskAnnIndex::create_and_init_streamer(const BaseIndexParam &param) {
 }
 
 int DiskAnnIndex::open(const std::string &file_path,
-                       StorageOptions storage_options) {
+                       StorageOptions storage_options) try {
+  if (is_open_) return core::IndexError_NoReady;
   if (storage_options.read_only && storage_options.create_new) {
     LOG_ERROR("Cannot create storage for a read-only index");
     return core::IndexError_Runtime;
+  }
+  if (streamer_needs_init_) {
+    const int ret = storage_options.create_new ? reset_build_pipeline(param_)
+                                               : reinitialize_streamer();
+    if (ret != 0) return ret;
   }
   ailego::Params storage_params;
   file_path_ = file_path;
@@ -197,25 +203,22 @@ int DiskAnnIndex::open(const std::string &file_path,
   }
 
   if (!storage_options.create_new) {
-    int ret = storage_->open(file_path_, false);
-    if (ret != 0) {
-      LOG_ERROR("Failed to open storage, path: %s, err: %s", file_path_.c_str(),
-                core::IndexError::What(ret));
-      return core::IndexError_Runtime;
-    }
-    if (streamer_ == nullptr || streamer_->open(storage_) != 0) {
-      LOG_ERROR("Failed to open streamer, path: %s", file_path_.c_str());
-      return core::IndexError_Runtime;
-    }
+    const int ret = open_trained_storage(file_path_);
+    if (ret != 0) return ret;
     is_trained_ = true;
+  } else {
+    if (storage_options.type == StorageOptions::StorageType::kBufferPool) {
+      buffered_input_ = std::make_shared<BufferedInput>(input_vector_meta_,
+                                                        file_path_ + ".input");
+    }
+    build_stage_ = BuildStage::kCollecting;
+    is_trained_ = false;
   }
+  streamer_needs_init_ = false;
   is_open_ = true;
-  if (storage_options.create_new && !is_read_only_ &&
-      storage_options.type == StorageOptions::StorageType::kBufferPool) {
-    buffered_input_ = std::make_shared<BufferedInput>(input_vector_meta_,
-                                                      file_path_ + ".input");
-  }
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int DiskAnnIndex::generate_holder() {

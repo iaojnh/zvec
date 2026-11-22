@@ -31,6 +31,7 @@
 #include <arrow/ipc/reader.h>
 #include <arrow/table.h>
 #include <arrow/util/iterator.h>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/ailego/parallel/thread_queue.h>
@@ -333,11 +334,19 @@ class SegmentImpl : public Segment,
   Status load_scalar_index_blocks(bool create = false);
   Status load_vector_index_blocks();
   Status init_memory_components();
-  Status finish_memory_components(bool reopen_for_serving = true);
+  Status finish_memory_components(bool reopen_for_serving,
+                                  uint32_t delete_snapshot_path_suffix);
   Status flush_impl(bool for_close);
 
+  template <typename T>
+  using PersistedBlocks =
+      std::array<std::variant<std::vector<T>,
+                              std::unordered_map<std::string, std::vector<T>>>,
+                 static_cast<size_t>(BlockType::VECTOR_INDEX_QUANTIZE) + 1>;
   void fresh_persist_block_offset();
-  void calculate_block_offsets();
+  static void build_persist_block_offsets(const SegmentMeta &segment_meta,
+                                          PersistedBlocks<int> &offsets,
+                                          PersistedBlocks<BlockMeta> &metas);
   int find_persist_block_id(BlockType type, int segment_doc_id,
                             const std::string &col_name = "",
                             int *out_offset_idx = nullptr) const;
@@ -363,18 +372,22 @@ class SegmentImpl : public Segment,
   template <typename ValueType>
   Status insert_scalar(InvertedColumnIndexer::Ptr &indexer, const Doc &doc,
                        const FieldSchema::Ptr &field);
+  using PreparedVectorWrites =
+      ailego::BudgetedVector<std::unique_ptr<VectorColumnIndexer::PreparedAdd>>;
   template <typename ValueType>
-  Status insert_vector(VectorColumnIndexer::Ptr &indexer, const Doc &doc,
-                       const FieldSchema::Ptr &field);
+  Status write_vector(const VectorColumnIndexer::Ptr &indexer, const Doc &doc,
+                      const FieldSchema::Ptr &field,
+                      PreparedVectorWrites *prepared);
 
   Status insert_scalar_indexer(Doc &doc);
   Status admit_fts_write(const Doc &doc, detail::FtsWriteAdmission *admission);
   Status insert_fts_indexer(Doc &doc,
                             const detail::FtsWriteAdmission &admission);
-  Status insert_vector_indexer(Doc &doc);
+  Status write_vector_indexes(const Doc &doc, PreparedVectorWrites *prepared);
   struct PreparedForward {
     ailego::MemoryReservation scalar_memory;
     std::unique_ptr<MemForwardStore::PreparedInsert> forward;
+    PreparedVectorWrites vectors;
   };
   Result<PreparedForward> prepare_forward_write(const Doc &doc);
   Status internal_insert(Doc &doc, const detail::FtsWriteAdmission &admission,
@@ -389,7 +402,8 @@ class SegmentImpl : public Segment,
   Status recover();
   Status open_wal_file();
   Status append_wal(const Doc &doc);
-  Status update_version(uint32_t delete_snapshot_path_suffix);
+  Status update_version(const SegmentMeta::Ptr &meta,
+                        uint32_t delete_snapshot_path_suffix);
 
   Result<uint64_t> get_global_doc_id(uint32_t segment_doc_id) const;
 
@@ -442,7 +456,8 @@ class SegmentImpl : public Segment,
       const std::shared_ptr<arrow::Schema> &result_schema,
       const ExecBatchPtr &exec_batch, bool include_vector,
       Status *read_status = nullptr,
-      const std::shared_ptr<detail::ResultMemoryAllowance::Lease> &admitted = {});
+      const std::shared_ptr<detail::ResultMemoryAllowance::Lease> &admitted =
+          {});
   TablePtr fetch_unsafe(const std::vector<std::string> &columns,
                         const std::vector<int> &segment_doc_ids,
                         bool strict = false,
@@ -527,15 +542,8 @@ class SegmentImpl : public Segment,
   // Only valid for a read-only collection; queries never modify this flag.
   bool has_identity_doc_ids_{false};
 
-  std::array<std::variant<std::vector<int>,
-                          std::unordered_map<std::string, std::vector<int>>>,
-             static_cast<size_t>(BlockType::VECTOR_INDEX_QUANTIZE) + 1>
-      persist_block_offsets_;
-  std::array<
-      std::variant<std::vector<BlockMeta>,
-                   std::unordered_map<std::string, std::vector<BlockMeta>>>,
-      static_cast<size_t>(BlockType::VECTOR_INDEX_QUANTIZE) + 1>
-      persist_block_metas_;
+  PersistedBlocks<int> persist_block_offsets_;
+  PersistedBlocks<BlockMeta> persist_block_metas_;
 
   std::atomic<uint64_t> doc_id_allocator_{0};
   std::atomic<BlockID> block_id_allocator_{0};
@@ -566,7 +574,8 @@ class SegmentImpl : public Segment,
   class CombinedRecordBatchReader;
 };
 
-class SegmentImpl::CombinedRecordBatchReader : public ResidentRecordBatchReader {
+class SegmentImpl::CombinedRecordBatchReader
+    : public ResidentRecordBatchReader {
  public:
   CombinedRecordBatchReader(
       std::vector<std::shared_ptr<arrow::RecordBatchReader>> readers,
@@ -832,37 +841,41 @@ Status SegmentImpl::insert_scalar(InvertedColumnIndexer::Ptr &indexer,
 }
 
 template <typename ValueType>
-Status SegmentImpl::insert_vector(VectorColumnIndexer::Ptr &indexer,
-                                  const Doc &doc,
-                                  const FieldSchema::Ptr &field) {
-  auto value = doc.get<ValueType>(field->name());
-  if (value.has_value()) {
+Status SegmentImpl::write_vector(const VectorColumnIndexer::Ptr &indexer,
+                                 const Doc &doc, const FieldSchema::Ptr &field,
+                                 PreparedVectorWrites *prepared) {
+  const auto *value = std::get_if<ValueType>(
+      detail::DocumentMemoryAccess::find_field(doc, field->name()));
+  if (value) {
     vector_column_params::VectorData vector_data;
     if constexpr (std::is_same_v<ValueType,
                                  std::pair<std::vector<uint32_t>,
                                            std::vector<float16_t>>>) {
-      const std::vector<uint32_t> &sparse_indices = value.value().first;
-      const std::vector<float16_t> &sparse_value = value.value().second;
+      const std::vector<uint32_t> &sparse_indices = value->first;
+      const std::vector<float16_t> &sparse_value = value->second;
       vector_data.vector = vector_column_params::SparseVector{
           (uint32_t)sparse_indices.size(), (void *)sparse_indices.data(),
           (void *)sparse_value.data()};
     } else if constexpr (std::is_same_v<ValueType,
                                         std::pair<std::vector<uint32_t>,
                                                   std::vector<float>>>) {
-      const std::vector<uint32_t> &sparse_indices = value.value().first;
-      const std::vector<float> &sparse_value = value.value().second;
+      const std::vector<uint32_t> &sparse_indices = value->first;
+      const std::vector<float> &sparse_value = value->second;
       vector_data.vector = vector_column_params::SparseVector{
           (uint32_t)sparse_indices.size(), (void *)sparse_indices.data(),
           (void *)sparse_value.data()};
     } else {
-      vector_data.vector =
-          vector_column_params::DenseVector{value.value().data()};
+      vector_data.vector = vector_column_params::DenseVector{value->data()};
     }
 
     auto &mem_block_meta = segment_meta_->writing_forward_block().value();
     auto &block_doc_id = mem_block_meta.doc_count_;
 
-    return indexer->insert(vector_data, block_doc_id);
+    if (!prepared) return indexer->insert(vector_data, block_doc_id);
+    std::unique_ptr<VectorColumnIndexer::PreparedAdd> pending;
+    auto status = indexer->prepare_insert(vector_data, block_doc_id, &pending);
+    if (status.ok()) prepared->push_back(std::move(pending));
+    return status;
   } else {
     LOG_WARN("Field %s not found or is null for doc: %s", field->name().c_str(),
              doc.to_detail_string().c_str());
@@ -951,7 +964,8 @@ Status SegmentImpl::insert_scalar_indexer(Doc &doc) {
   return Status::OK();
 }
 
-Status SegmentImpl::insert_vector_indexer(Doc &doc) {
+Status SegmentImpl::write_vector_indexes(const Doc &doc,
+                                         PreparedVectorWrites *prepared) {
   for (const auto &field : collection_schema_->vector_fields()) {
     std::vector<VectorColumnIndexer::Ptr> indexers;
     auto m_indexer = get_memory_vector_indexer(field->name());
@@ -987,38 +1001,45 @@ Status SegmentImpl::insert_vector_indexer(Doc &doc) {
       auto data_type = field->data_type();
       switch (data_type) {
         case DataType::VECTOR_BINARY32:
-          status = insert_vector<std::vector<uint32_t>>(indexer, doc, field);
+          status = write_vector<std::vector<uint32_t>>(indexer, doc, field,
+                                                       prepared);
           break;
         case DataType::VECTOR_BINARY64:
-          status = insert_vector<std::vector<uint64_t>>(indexer, doc, field);
+          status = write_vector<std::vector<uint64_t>>(indexer, doc, field,
+                                                       prepared);
           break;
         case DataType::VECTOR_FP16:
-          status = insert_vector<std::vector<float16_t>>(indexer, doc, field);
+          status = write_vector<std::vector<float16_t>>(indexer, doc, field,
+                                                        prepared);
           break;
         case DataType::VECTOR_FP32:
-          status = insert_vector<std::vector<float>>(indexer, doc, field);
+          status =
+              write_vector<std::vector<float>>(indexer, doc, field, prepared);
           break;
         case DataType::VECTOR_FP64:
-          status = insert_vector<std::vector<double>>(indexer, doc, field);
+          status =
+              write_vector<std::vector<double>>(indexer, doc, field, prepared);
           break;
         // case DataType::VECTOR_INT4:
         //   status = InsertVector<std::vector<int8_t>>(indexer, doc, field);
         //   break;
         case DataType::VECTOR_INT8:
-          status = insert_vector<std::vector<int8_t>>(indexer, doc, field);
+          status =
+              write_vector<std::vector<int8_t>>(indexer, doc, field, prepared);
           break;
         case DataType::VECTOR_INT16:
-          status = insert_vector<std::vector<int16_t>>(indexer, doc, field);
+          status =
+              write_vector<std::vector<int16_t>>(indexer, doc, field, prepared);
           break;
         case DataType::SPARSE_VECTOR_FP16:
-          status = insert_vector<
+          status = write_vector<
               std::pair<std::vector<uint32_t>, std::vector<float16_t>>>(
-              indexer, doc, field);
+              indexer, doc, field, prepared);
           break;
         case DataType::SPARSE_VECTOR_FP32:
-          status = insert_vector<
-              std::pair<std::vector<uint32_t>, std::vector<float>>>(indexer,
-                                                                    doc, field);
+          status = write_vector<
+              std::pair<std::vector<uint32_t>, std::vector<float>>>(
+              indexer, doc, field, prepared);
           break;
         default:
           status = Status::InvalidArgument(
@@ -1078,7 +1099,7 @@ Result<SegmentImpl::PreparedForward> SegmentImpl::prepare_forward_write(
     }
   }
   if (ready_for_dump_block()) {
-    auto status = flush();
+    auto status = flush_impl(false);
     if (!status.ok()) return tl::make_unexpected(status);
   }
   if (!memory_store_) {
@@ -1093,6 +1114,10 @@ Result<SegmentImpl::PreparedForward> SegmentImpl::prepare_forward_write(
   auto forward = memory_store_->prepare_insert(doc, next_id);
   if (!forward) return tl::make_unexpected(forward.error());
   prepared.forward = std::move(*forward);
+  if (uses_buffer_storage()) {
+    status = write_vector_indexes(doc, &prepared.vectors);
+    if (!status.ok()) return tl::make_unexpected(status);
+  }
   return prepared;
 } catch (const std::bad_alloc &) {
   return tl::make_unexpected(
@@ -1122,9 +1147,11 @@ Status SegmentImpl::internal_insert(Doc &doc,
   s = insert_fts_indexer(doc, admission);
   CHECK_RETURN_STATUS(s);
   // write vector index
-  s = insert_vector_indexer(doc);
-  if (!s.ok() && s != Status::AlreadyExists()) {
-    return s;
+  if (uses_buffer_storage()) {
+    for (auto &vector : prepared.vectors) vector->commit();
+  } else {
+    s = write_vector_indexes(doc, nullptr);
+    if (!s.ok() && s != Status::AlreadyExists()) return s;
   }
 
   auto &mem_block = segment_meta_->writing_forward_block().value();
@@ -1755,7 +1782,8 @@ std::vector<Doc::Ptr> SegmentImpl::fetch_docs(
       continue;
     }
     detail::ResultMemoryAllowance::Lease batch_memory(
-        options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
+        options_.enable_mmap_ ? nullptr
+                              : &detail::SharedResultMemoryAllowance());
     detail::ResultMemoryAllowance::PendingCopy batch_pending;
     std::optional<detail::RequestScratchArray<size_t, kMaxFetchBatchSize>>
         row_bytes;
@@ -1815,10 +1843,9 @@ std::vector<Doc::Ptr> SegmentImpl::fetch_docs(
             &detail::SharedResultMemoryAllowance());
         batch_memory.transfer_copy_to(*memory, (*row_bytes)[row]);
       }
-      docs[output] =
-          materialize_doc_unsafe(g_doc_ids[output], segment_doc_ids[row],
-                                 columns, result_schema, batch, include_vector,
-                                 nullptr, memory);
+      docs[output] = materialize_doc_unsafe(
+          g_doc_ids[output], segment_doc_ids[row], columns, result_schema,
+          batch, include_vector, nullptr, memory);
     }
     begin = end;
   }
@@ -2045,7 +2072,14 @@ Doc::Ptr SegmentImpl::materialize_doc_unsafe(
         auto vector_indexer = vector_indexers[block_idx];
         auto fetch_result = vector_indexer->fetch(block_doc_id);
         if (!fetch_result) {
-          if (read_status) *read_status = fetch_result.error();
+          if (read_status) {
+            *read_status = fetch_result.error();
+          } else if (fetch_result.error().code() ==
+                     StatusCode::RESOURCE_EXHAUSTED) {
+            // Nullable fetch results represent missing documents. Propagate a
+            // denied vector read through the caller's allocation-error path.
+            throw std::bad_alloc();
+          }
           LOG_ERROR(
               "vector indexer fetch failed, block_doc_id: %d, block_idx: %d, "
               "segment_doc_id: %d",
@@ -2086,6 +2120,8 @@ Doc::Ptr SegmentImpl::materialize_doc_unsafe(
               *read_status = fetch_result.error();
               return nullptr;
             }
+            if (fetch_result.error().code() == StatusCode::RESOURCE_EXHAUSTED)
+              throw std::bad_alloc();
             LOG_ERROR(
                 "vector indexer fetch failed, column: %s, doc_count: %lu, "
                 "mem_block_offset: %d, block_doc_id: %d",
@@ -2917,7 +2953,7 @@ Status SegmentImpl::dump() {
   if (sealed_) {
     return Status::NotSupported("Segment has been dumped.");
   }
-  auto s = flush();
+  auto s = flush_impl(false);
   CHECK_RETURN_STATUS(s);
 
   if (invert_indexers_) {
@@ -2941,6 +2977,7 @@ void SegmentImpl::remove_writing_forward_block() {
 }
 
 Status SegmentImpl::flush() {
+  std::lock_guard lock(seg_mtx_);
   return flush_impl(false);
 }
 
@@ -2948,10 +2985,8 @@ Status SegmentImpl::flush_for_close() {
   return flush_impl(true);
 }
 
-Status SegmentImpl::flush_impl(bool for_close) {
-  // Requires seg_mtx_ (Insert's buffer-full path, dump, close) or the
-  // collection's exclusive schema lock (CollectionImpl::flush): finish_/
-  // init_memory_components() below do not lock.
+Status SegmentImpl::flush_impl(bool for_close) try {
+  // Requires seg_mtx_ or the collection's exclusive schema lock on close.
   CHECK_SEGMENT_READONLY_RETURN_STATUS;
 
   if (wal_file_ == nullptr || !wal_file_->has_record()) {
@@ -3005,8 +3040,6 @@ Status SegmentImpl::flush_impl(bool for_close) {
     CHECK_RETURN_STATUS(s);
   }
 
-  auto block = segment_meta_->writing_forward_block().value();
-
   uint32_t delete_snapshot_path_suffix = UINT32_MAX;
   uint32_t delete_snapshot_path_suffix_current = UINT32_MAX;
   if (delete_store_) {
@@ -3017,26 +3050,19 @@ Status SegmentImpl::flush_impl(bool for_close) {
           version_manager_->delete_snapshot_path_suffix() + 1;
       std::string delete_store_path = FileHelper::MakeFilePath(
           path_, FileID::DELETE_FILE, delete_snapshot_path_suffix);
-      s = delete_store_->flush(delete_store_path);
+      s = delete_store_->snapshot(delete_store_path);
       CHECK_RETURN_STATUS(s);
     }
   }
 
-  if (memory_store_) {
-    // update segment meta with memory components
-    s = finish_memory_components(!for_close);
-    CHECK_RETURN_STATUS(s);
-
-    // set a new mem block
-    auto block_id = allocate_block_id();
-    segment_meta_->set_writing_forward_block({block_id, BlockType::SCALAR,
-                                              block.max_doc_id_ + 1, 0, 0,
-                                              block.columns_});
-  }
-
-  // update version and flush
-  s = update_version(delete_snapshot_path_suffix);
+  // Failed pre-WAL preparation can leave an empty writer. A delete-only
+  // WAL still needs a manifest update, but must not publish an empty block
+  // or derive a new global-ID start from its unset maximum.
+  s = memory_store_ && memory_store_->num_rows() != 0
+          ? finish_memory_components(!for_close, delete_snapshot_path_suffix)
+          : update_version(segment_meta_, delete_snapshot_path_suffix);
   CHECK_RETURN_STATUS(s);
+  if (delete_snapshot_path_suffix != UINT32_MAX) delete_store_->mark_flushed();
 
   // clear WAL file
   if (wal_file_) {
@@ -3057,6 +3083,9 @@ Status SegmentImpl::flush_impl(bool for_close) {
   }
 
   return Status::OK();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Insufficient memory to publish flushed segment");
 }
 
 Status SegmentImpl::destroy() {
@@ -3325,9 +3354,8 @@ arrow::Result<TablePtr> SegmentImpl::fetch_shared_block(
           rows[output] = {index, static_cast<int>(output),
                           static_cast<int>(row - offsets[index])};
         }
-        std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) {
-          return a.block < b.block;
-        });
+        std::sort(rows.begin(), rows.end(),
+                  [](const Row &a, const Row &b) { return a.block < b.block; });
         size_t group_count = 1;
         for (size_t row = 1; row < rows.size(); ++row)
           group_count += rows[row].block != rows[row - 1].block;
@@ -3343,9 +3371,11 @@ arrow::Result<TablePtr> SegmentImpl::fetch_shared_block(
               persist_stores_[index].get());
           if (!buffered_store) return TablePtr{};
           size_t group_end = group_begin + 1;
-          while (group_end < rows.size() && rows[group_end].block == index) ++group_end;
+          while (group_end < rows.size() && rows[group_end].block == index)
+            ++group_end;
           requests.push_back(
-              {buffered_store, {},
+              {buffered_store,
+               {},
                {selected_rows.data() + group_begin, group_end - group_begin}});
           group_begin = group_end;
         }
@@ -4141,8 +4171,8 @@ arrow::Result<bool> SegmentImpl::CombinedRecordBatchReader::read_next(
     std::shared_ptr<arrow::RecordBatch> input;
     if (resident_only) {
       ARROW_ASSIGN_OR_RAISE(
-          auto ready, zvec::ReadNextResident(*readers_[current_reader_index_],
-                                             &input));
+          auto ready,
+          zvec::ReadNextResident(*readers_[current_reader_index_], &input));
       if (!ready) return false;
     } else {
       ARROW_RETURN_NOT_OK(readers_[current_reader_index_]->ReadNext(&input));
@@ -4164,8 +4194,8 @@ arrow::Result<bool> SegmentImpl::CombinedRecordBatchReader::read_next(
         if (num_rows) {
           std::iota(ids, ids + num_rows, next_segment_row_id_to_emit_);
         }
-        segment_row_id_array = std::make_shared<arrow::UInt64Array>(
-            num_rows, std::move(values));
+        segment_row_id_array =
+            std::make_shared<arrow::UInt64Array>(num_rows, std::move(values));
       } else {
         arrow::UInt64Builder builder(pool_);
         ARROW_RETURN_NOT_OK(builder.Reserve(num_rows));
@@ -4196,8 +4226,8 @@ arrow::Result<bool> SegmentImpl::CombinedRecordBatchReader::read_next(
 }
 
 bool SegmentImpl::ready_for_dump_block() {
-  if (memory_store_) return memory_store_->is_full();
-  return false;
+  return memory_store_ &&
+         (memory_store_->finalized_ || memory_store_->is_full());
 }
 
 template <typename ArrayType, typename ValueType>
@@ -4883,84 +4913,66 @@ Status SegmentImpl::drop_column(const std::string &column_name) {
 
 
 void SegmentImpl::fresh_persist_block_offset() {
-  // Clear
-  for (size_t i = 0; i <= static_cast<size_t>(BlockType::VECTOR_INDEX_QUANTIZE);
-       ++i) {
-    if (std::holds_alternative<std::vector<int>>(persist_block_offsets_[i])) {
-      std::get<std::vector<int>>(persist_block_offsets_[i]).clear();
-    } else if (std::holds_alternative<
-                   std::unordered_map<std::string, std::vector<int>>>(
-                   persist_block_offsets_[i])) {
-      std::get<std::unordered_map<std::string, std::vector<int>>>(
-          persist_block_offsets_[i])
-          .clear();
-    }
-    std::visit(
-        [](auto &&arg) {
-          using T = std::decay_t<decltype(arg)>;
-          if constexpr (std::is_same_v<T, std::vector<BlockMeta>> ||
-                        std::is_same_v<
-                            T, std::unordered_map<std::string,
-                                                  std::vector<BlockMeta>>>) {
-            arg.clear();
-          }
-        },
-        persist_block_metas_[i]);
-  }
+  PersistedBlocks<int> offsets;
+  PersistedBlocks<BlockMeta> metas;
+  build_persist_block_offsets(*segment_meta_, offsets, metas);
+  persist_block_offsets_ = std::move(offsets);
+  persist_block_metas_ = std::move(metas);
+}
 
-  for (const auto &block : segment_meta_->persisted_blocks()) {
-    size_t type_index = static_cast<size_t>(block.type());
+void SegmentImpl::build_persist_block_offsets(
+    const SegmentMeta &segment_meta, PersistedBlocks<int> &offsets,
+    PersistedBlocks<BlockMeta> &metas) {
+  using ColumnBlocks = std::unordered_map<std::string, std::vector<BlockMeta>>;
+  using ColumnOffsets = std::unordered_map<std::string, std::vector<int>>;
+  const auto scalar = static_cast<size_t>(BlockType::SCALAR);
+  auto &scalar_blocks = std::get<std::vector<BlockMeta>>(metas[scalar]);
+  for (const auto type :
+       {BlockType::VECTOR_INDEX, BlockType::VECTOR_INDEX_QUANTIZE}) {
+    auto index = static_cast<size_t>(type);
+    metas[index].emplace<ColumnBlocks>();
+    offsets[index].emplace<ColumnOffsets>();
+  }
+  for (const auto &block : segment_meta.persisted_blocks()) {
     if (block.type() == BlockType::SCALAR) {
-      if (std::holds_alternative<std::vector<BlockMeta>>(
-              persist_block_metas_[type_index])) {
-        std::get<std::vector<BlockMeta>>(persist_block_metas_[type_index])
-            .push_back(block);
-      } else {
-        persist_block_metas_[type_index] = std::vector<BlockMeta>{block};
-        persist_block_offsets_[type_index] = std::vector<int>();
-      }
+      scalar_blocks.push_back(block);
     } else if (block.type() == BlockType::VECTOR_INDEX ||
                block.type() == BlockType::VECTOR_INDEX_QUANTIZE) {
-      if (block.columns().size() == 1) {
-        auto column_name = block.columns()[0];
-        if (std::holds_alternative<
-                std::unordered_map<std::string, std::vector<BlockMeta>>>(
-                persist_block_metas_[type_index])) {
-          auto block_map =
-              std::get<std::unordered_map<std::string, std::vector<BlockMeta>>>(
-                  persist_block_metas_[type_index]);
-          auto iter = block_map.find(column_name);
-          if (iter != block_map.end()) {
-            auto &block_metas = iter->second;
-            block_metas.push_back(block);
-          } else {
-            block_map.insert(
-                std::make_pair(column_name, std::vector<BlockMeta>{block}));
-            auto block_offsets_map =
-                std::get<std::unordered_map<std::string, std::vector<int>>>(
-                    persist_block_offsets_[type_index]);
-            block_offsets_map.insert(
-                std::make_pair(column_name, std::vector<int>()));
-          }
-
-          std::get<std::unordered_map<std::string, std::vector<BlockMeta>>>(
-              persist_block_metas_[type_index])[column_name]
-              .push_back(block);
-        } else {
-          std::unordered_map<std::string, std::vector<BlockMeta>> new_map;
-          new_map[column_name].push_back(block);
-          persist_block_metas_[type_index] = std::move(new_map);
-          persist_block_offsets_[type_index] =
-              std::unordered_map<std::string, std::vector<int>>();
-        }
-      } else {
+      if (block.columns().size() != 1) {
         LOG_ERROR("Add block meta: %s failed, block.columns.size != 1",
                   block.to_string().c_str());
+        continue;
+      }
+      auto index = static_cast<size_t>(block.type());
+      std::get<ColumnBlocks>(metas[index])[block.columns().front()].push_back(
+          block);
+    }
+  }
+  if (!scalar_blocks.empty() && !scalar_blocks.front().columns().empty()) {
+    auto &scalar_offsets = std::get<std::vector<int>>(offsets[scalar]);
+    const auto &column = scalar_blocks.front().columns().front();
+    scalar_offsets.reserve(scalar_blocks.size());
+    int offset = 0;
+    for (const auto &block : scalar_blocks) {
+      if (!block.contain_column(column)) continue;
+      scalar_offsets.push_back(offset);
+      offset += static_cast<int>(block.doc_count());
+    }
+  }
+  for (const auto type :
+       {BlockType::VECTOR_INDEX, BlockType::VECTOR_INDEX_QUANTIZE}) {
+    const auto index = static_cast<size_t>(type);
+    auto &column_offsets = std::get<ColumnOffsets>(offsets[index]);
+    for (const auto &[column, blocks] : std::get<ColumnBlocks>(metas[index])) {
+      auto &output = column_offsets[column];
+      output.reserve(blocks.size());
+      int offset = 0;
+      for (const auto &block : blocks) {
+        output.push_back(offset);
+        offset += static_cast<int>(block.doc_count());
       }
     }
   }
-
-  calculate_block_offsets();
 }
 
 void SegmentImpl::fresh_persist_chunked_array() {
@@ -5050,56 +5062,6 @@ void SegmentImpl::fresh_persist_chunked_array() {
         "fresh_persist_chunked_array persist_chunk_arrays[%zu] "
         "chunk_layouts[%zu]",
         persist_chunk_arrays_.size(), chunk_layout_offsets_.size());
-  }
-}
-
-void SegmentImpl::calculate_block_offsets() {
-  for (size_t type_index = 0;
-       type_index <= static_cast<size_t>(BlockType::VECTOR_INDEX_QUANTIZE);
-       ++type_index) {
-    auto &block_offsets = persist_block_offsets_[type_index];
-    int current_offset = 0;
-
-    // Visit the appropriate container based on the variant type
-    std::visit(
-        [&current_offset, &block_offsets](auto &&blocks) {
-          using T = std::decay_t<decltype(blocks)>;
-
-          if constexpr (std::is_same_v<T, std::vector<BlockMeta>>) {
-            // For SCALAR type - simple vector
-            auto &offset_vector = std::get<std::vector<int>>(block_offsets);
-            offset_vector.clear();
-            offset_vector.reserve(blocks.size());
-            if (!blocks.empty()) {
-              auto &filter_col_name = blocks[0].columns()[0];
-              for (const auto &block : blocks) {
-                if (!block.contain_column(filter_col_name)) continue;
-                offset_vector.push_back(current_offset);
-                current_offset += static_cast<int>(block.doc_count_);
-              }
-            }
-          } else if constexpr (std::is_same_v<T, std::unordered_map<
-                                                     std::string,
-                                                     std::vector<BlockMeta>>>) {
-            // For other types - map with column names
-            auto &offset_map =
-                std::get<std::unordered_map<std::string, std::vector<int>>>(
-                    block_offsets);
-            offset_map.clear();
-
-            for (const auto &[column_name, block_list] : blocks) {
-              auto &column_offsets = offset_map[column_name];
-              column_offsets.reserve(block_list.size());
-              int column_offset = 0;
-
-              for (const auto &block : block_list) {
-                column_offsets.push_back(column_offset);
-                column_offset += static_cast<int>(block.doc_count_);
-              }
-            }
-          }
-        },
-        persist_block_metas_[type_index]);
   }
 }
 
@@ -5785,112 +5747,100 @@ Status SegmentImpl::append_wal(const Doc &doc) try {
                 "Insufficient memory for WAL serialization");
 }
 
-Status SegmentImpl::finish_memory_components(bool reopen_for_serving) {
-  // Caller holds seg_mtx_ exclusively, or the collection's exclusive schema
-  // lock (via CollectionImpl::flush()).
+Status SegmentImpl::finish_memory_components(
+    bool reopen_for_serving, uint32_t delete_snapshot_path_suffix) {
+  const auto &block = segment_meta_->writing_forward_block().value();
+  auto next_meta = std::make_shared<SegmentMeta>(*segment_meta_);
+  next_meta->add_persisted_block(block);
+  next_meta->set_writing_forward_block(
+      {block_id_allocator_.load(), BlockType::SCALAR, block.max_doc_id_ + 1, 0,
+       0, block.columns_});
 
-  auto block = segment_meta_->writing_forward_block().value();
-
-  // close for loading persist block
-  auto s = memory_store_->close();
-  CHECK_RETURN_STATUS(s);
-  memory_store_.reset();
-
-  // A closing segment publishes the same metadata without loading readers.
+  // Keep the original readers and writers usable until the complete block
+  // and its manifest are ready. In particular, opening a serving index can
+  // fail after its writable counterpart has already flushed successfully.
+  decltype(vector_indexers_) next_vector_indexers;
+  decltype(quant_vector_indexers_) next_quant_indexers;
+  PersistedBlocks<int> next_offsets;
+  PersistedBlocks<BlockMeta> next_block_metas;
   if (reopen_for_serving) {
-    const auto persist_forward_store_path = FileHelper::MakeForwardBlockPath(
-        path_, segment_meta_->id(), block.id_, !options_.enable_mmap_);
-    BaseForwardStore::Ptr persist_store;
+    next_vector_indexers = vector_indexers_;
+    next_quant_indexers = quant_vector_indexers_;
+  }
+  const auto stage_vectors = [&](const auto &writers, const auto &block_ids,
+                                 BlockType type, auto &readers) -> Status {
+    for (const auto &[column, writer] : writers) {
+      next_meta->add_persisted_block({block_ids.at(column),
+                                      type,
+                                      block.min_doc_id_,
+                                      block.max_doc_id_,
+                                      block.doc_count_,
+                                      {column}});
+      if (!reopen_for_serving) continue;
+      auto reader = writer;
+      if (!options_.enable_mmap_) {
+        reader = std::make_shared<VectorColumnIndexer>(
+            writer->index_file_path(), writer->field_schema());
+        auto status = reader->open({false, false, true});
+        CHECK_RETURN_STATUS(status);
+      }
+      readers[column].push_back(std::move(reader));
+    }
+    return Status::OK();
+  };
+  auto status = stage_vectors(memory_vector_indexers_, memory_vector_block_ids_,
+                              BlockType::VECTOR_INDEX, next_vector_indexers);
+  CHECK_RETURN_STATUS(status);
+  status = stage_vectors(quant_memory_vector_indexers_,
+                         quant_memory_vector_block_ids_,
+                         BlockType::VECTOR_INDEX_QUANTIZE, next_quant_indexers);
+  CHECK_RETURN_STATUS(status);
+  if (reopen_for_serving) {
+    persist_stores_.reserve(persist_stores_.size() + 1);
+    build_persist_block_offsets(*next_meta, next_offsets, next_block_metas);
+  }
+
+  // Finalize the footer for the disk reader, but keep the live batches until
+  // both opening that reader and publishing the manifest have succeeded.
+  status = memory_store_->finalize();
+  CHECK_RETURN_STATUS(status);
+  BaseForwardStore::Ptr persist_store;
+  if (reopen_for_serving) {
+    const auto path = memory_store_->path();
     if (options_.enable_mmap_) {
-      persist_store =
-          std::make_shared<MmapForwardStore>(persist_forward_store_path);
+      persist_store = std::make_shared<MmapForwardStore>(path);
     } else {
-      persist_store =
-          std::make_shared<BufferPoolForwardStore>(persist_forward_store_path);
+      persist_store = std::make_shared<BufferPoolForwardStore>(path);
     }
-    s = persist_store->open();
-    CHECK_RETURN_STATUS(s);
-    persist_stores_.push_back(persist_store);
+    status = persist_store->open();
+    CHECK_RETURN_STATUS(status);
   }
 
-  BlockMeta b{block.id_,         block.type_,      block.min_doc_id_,
-              block.max_doc_id_, block.doc_count_, block.columns_};
-  segment_meta_->add_persisted_block(b);
-
-  // remove indexer from memory to persist
-  for (auto &[column_name, indexer] : memory_vector_indexers_) {
-    if (reopen_for_serving) {
-      s = reopen_vector_indexer_for_serving(indexer);
-      CHECK_RETURN_STATUS(s);
-    } else {
-      s = indexer->close();
-      CHECK_RETURN_STATUS(s);
-    }
-    auto block_id = memory_vector_block_ids_[column_name];
-    BlockMeta vb =
-        BlockMeta{block_id,          BlockType::VECTOR_INDEX, block.min_doc_id_,
-                  block.max_doc_id_, block.doc_count_,        {column_name}};
-    if (reopen_for_serving) {
-      auto it = vector_indexers_.find(column_name);
-      if (it == vector_indexers_.end()) {
-        std::vector<VectorColumnIndexer::Ptr> vector_indexers{indexer};
-        vector_indexers_.emplace(column_name, std::move(vector_indexers));
-      } else {
-        it->second.push_back(indexer);
-      }
-    }
-    segment_meta_->add_persisted_block(vb);
+  status = update_version(next_meta, delete_snapshot_path_suffix);
+  CHECK_RETURN_STATUS(status);
+  segment_meta_ = std::move(next_meta);
+  allocate_block_id();
+  if (reopen_for_serving) {
+    persist_stores_.push_back(std::move(persist_store));
+    vector_indexers_.swap(next_vector_indexers);
+    quant_vector_indexers_.swap(next_quant_indexers);
+    persist_block_offsets_ = std::move(next_offsets);
+    persist_block_metas_ = std::move(next_block_metas);
   }
 
-  // remove quant indexer from memory to persist
-  for (auto &[column_name, indexer] : quant_memory_vector_indexers_) {
-    if (reopen_for_serving) {
-      s = reopen_vector_indexer_for_serving(indexer);
-      CHECK_RETURN_STATUS(s);
-    } else {
-      s = indexer->close();
-      CHECK_RETURN_STATUS(s);
-    }
-    auto block_id = quant_memory_vector_block_ids_[column_name];
-    BlockMeta block_meta(block_id, BlockType::VECTOR_INDEX_QUANTIZE,
-                         block.min_doc_id_, block.max_doc_id_, block.doc_count_,
-                         {column_name});
-
-    if (reopen_for_serving) {
-      auto it = quant_vector_indexers_.find(column_name);
-      if (it == quant_vector_indexers_.end()) {
-        std::vector<VectorColumnIndexer::Ptr> vector_indexers;
-        vector_indexers.push_back(indexer);
-        quant_vector_indexers_.emplace(column_name, std::move(vector_indexers));
-      } else {
-        it->second.push_back(indexer);
-      }
-    }
-    segment_meta_->add_persisted_block(block_meta);
-  }
-
-  // clear memory vector indexers
+  memory_store_.reset();
   memory_vector_indexers_.clear();
   quant_memory_vector_indexers_.clear();
   memory_vector_block_ids_.clear();
   quant_memory_vector_block_ids_.clear();
-
-  if (reopen_for_serving) fresh_persist_block_offset();
   return Status::OK();
 }
 
-Status SegmentImpl::update_version(uint32_t delete_snapshot_path_suffix) {
-  if (version_manager_) {
-    if (delete_snapshot_path_suffix != UINT32_MAX) {
-      version_manager_->set_delete_snapshot_path_suffix(
-          delete_snapshot_path_suffix);
-    }
-    auto s = version_manager_->reset_writing_segment_meta(segment_meta_);
-    CHECK_RETURN_STATUS(s);
-    s = version_manager_->flush();
-    CHECK_RETURN_STATUS(s);
-  }
-  return Status::OK();
+Status SegmentImpl::update_version(const SegmentMeta::Ptr &meta,
+                                   uint32_t delete_snapshot_path_suffix) {
+  return version_manager_ ? version_manager_->flush_writing_segment(
+                                meta, delete_snapshot_path_suffix)
+                          : Status::OK();
 }
 
 BlockID SegmentImpl::allocate_block_id() {
@@ -5951,9 +5901,14 @@ Result<Segment::Ptr> Segment::CreateAndOpen(
     }
   }
 
+  bool created = false;
+  AILEGO_DEFER([&] {
+    if (!created) (void)segment->destroy();
+  });
   auto s = segment->create(options, min_doc_id);
   CHECK_RETURN_STATUS_EXPECTED(s);
 
+  created = true;
   return segment;
 }
 

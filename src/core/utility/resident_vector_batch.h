@@ -25,10 +25,13 @@ namespace core {
 
 // A bounded read-only vector distance batch. By default it only pins resident
 // pages; PQ callers may populate misses together through the pool's batched IO.
-// Scratch growth precedes page acquisition and no pin survives distance scoring.
+// Scratch growth precedes page acquisition and no pin survives distance
+// scoring.
 class ResidentVectorBatch {
  public:
-  ~ResidentVectorBatch() { release(); }
+  ~ResidentVectorBatch() {
+    release();
+  }
   ResidentVectorBatch() = default;
   ResidentVectorBatch(const ResidentVectorBatch &) = delete;
   ResidentVectorBatch &operator=(const ResidentVectorBatch &) = delete;
@@ -46,12 +49,14 @@ class ResidentVectorBatch {
       return false;
     }
     const size_t max_id = (capacity - code_size) / code_size;
-    return read_offsets(pool, ids, count, code_size,
+    return read_offsets(
+        pool, ids, count, code_size,
         [=](uint32_t id, size_t *absolute) {
           if (id > max_id) return false;
           *absolute = base + size_t{id} * code_size;
           return true;
-        }, views, load_misses);
+        },
+        views, load_misses);
   }
 
   // Locate may span several segments in the same read-only storage. Returned
@@ -100,8 +105,7 @@ class ResidentVectorBatch {
           code_size > (std::numeric_limits<size_t>::max)() - absolute)
         return false;
       const size_t page = absolute / page_size;
-      if (page > (std::numeric_limits<ailego::block_id_t>::max)())
-        return false;
+      if (page > (std::numeric_limits<ailego::block_id_t>::max)()) return false;
       auto &code = codes[i];
       code.within = absolute % page_size;
       code.first = code.last = page_index(page);
@@ -122,9 +126,8 @@ class ResidentVectorBatch {
     const bool acquired =
         load_misses ? pool.acquire_pages(page_ids_.data(), pages, pages_.data())
                     : pool.try_acquire_resident_pages(page_ids_.data(), pages,
-                                                     pages_.data());
-    if (!acquired)
-      return false;
+                                                      pages_.data());
+    if (!acquired) return false;
     pool_ = &pool;
     page_count_ = pages;
     size_t copied = 0;

@@ -288,8 +288,8 @@ int MixedStreamerReducer::reduce(const IndexFilter &filter) try {
           read_results[i] = IndexError_Runtime;
           break;
         }
-        read_results[i] = read_sparse_vec(i, provider, filter, id_offset,
-                                          &next_id);
+        read_results[i] =
+            read_sparse_vec(i, provider, filter, id_offset, &next_id);
         if (read_results[i] != 0) break;
         id_offset += provider->count();
       }
@@ -456,10 +456,9 @@ int MixedStreamerReducer::read_vec(size_t source_streamer_index,
     bool needs_convert = false;
     if (quantizer != nullptr && need_encode) {
       ailego::BudgetedStringWorkspace original_vector;
-      original_vector.reserve(
-          std::max<size_t>(original_query_meta_.element_size(),
-                           size_t{source_streamer_query_meta.dimension()} *
-                               sizeof(float)));
+      original_vector.reserve(std::max<size_t>(
+          original_query_meta_.element_size(),
+          size_t{source_streamer_query_meta.dimension()} * sizeof(float)));
       const int ret = quantizer->dequantize(
           vector_data, source_streamer_query_meta, &original_vector.value);
       if (ret != 0) return ret;
@@ -468,8 +467,8 @@ int MixedStreamerReducer::read_vec(size_t source_streamer_index,
     } else if (need_revert) {
       ailego::BudgetedStringWorkspace new_vector;
       new_vector.reserve(original_query_meta_.element_size());
-      const int ret = reformer->revert(
-          vector_data, source_streamer_query_meta, &new_vector.value);
+      const int ret = reformer->revert(vector_data, source_streamer_query_meta,
+                                       &new_vector.value);
       if (ret != 0) return ret;
       bytes.assign(new_vector.value.begin(), new_vector.value.end());
       needs_convert = true;
@@ -538,7 +537,7 @@ void MixedStreamerReducer::add_vec(int *result) try {
         new_vector.reserve(bytes);
         new_vector.value.resize(bytes);
         target_streamer_quantizer_->quantize_data(vector,
-                                                   new_vector.value.data());
+                                                  new_vector.value.data());
         vector = new_vector.value.data();
         add_meta.set_meta(
             target_streamer_query_meta.data_type(),
@@ -604,8 +603,8 @@ void MixedStreamerReducer::add_sparse_vec(int *result) try {
       converted.value.clear();
       converted.reserve(sparse_count * target_streamer_->meta().unit_size());
       const int ret = target_streamer_reformer_->convert(
-          sparse_count, indices, values, original_query_meta_,
-          &converted.value, &new_meta);
+          sparse_count, indices, values, original_query_meta_, &converted.value,
+          &new_meta);
       if (ret != 0) {
         *result = ret;
         return;
@@ -670,8 +669,8 @@ int MixedStreamerReducer::read_sparse_vec(
     } else {
       const size_t bytes = sparse_count * streamer->meta().unit_size();
       sparse_values.reserve(bytes);
-      sparse_values.data.assign(static_cast<const char *>(iterator->sparse_data()),
-                                bytes);
+      sparse_values.data.assign(
+          static_cast<const char *>(iterator->sparse_data()), bytes);
     }
 
     // TODO: eliminate the copy

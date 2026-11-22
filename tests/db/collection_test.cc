@@ -45,6 +45,7 @@
 #endif
 #include <gtest/gtest.h>
 #include <magic_enum/magic_enum.hpp>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/file_helper.h>
@@ -52,6 +53,7 @@
 #include "db/collection_query_internal.h"
 #include "db/common/constants.h"
 #include "db/common/file_helper.h"
+#include "db/common/result_memory_allowance.h"
 #include "db/index/common/type_helper.h"
 #include "db/index/common/version_manager.h"
 #include "db/sqlengine/planner/plan_info.h"
@@ -5802,6 +5804,26 @@ TEST_F(CollectionTest, Feature_MultiQuery_WithOutputFields) {
   ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_GT(result.value().size(), 0u);
   EXPECT_LE(result.value().size(), 5u);
+  for (const auto &doc : *result) {
+    EXPECT_TRUE(doc->has("int32"));
+    EXPECT_TRUE(doc->has("string"));
+    EXPECT_FALSE(doc->has("int64"));
+  }
+
+  mvq.output_fields = {{"*"}};
+  result = collection->query(mvq);
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  ASSERT_FALSE(result->empty());
+  for (const auto &doc : *result) {
+    EXPECT_TRUE(doc->has("int32"));
+    EXPECT_TRUE(doc->has("string"));
+    EXPECT_TRUE(doc->has("int64"));
+  }
+
+  mvq.output_fields = {{"int32", "missing_field"}};
+  result = collection->query(mvq);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(StatusCode::INVALID_ARGUMENT, result.error().code());
 }
 
 TEST_F(CollectionTest, Feature_MultiQuery_CallbackReranker) {
@@ -5885,6 +5907,85 @@ TEST_F(CollectionTest, Feature_MultiQuery_CallbackReranker) {
   for (size_t i = 1; i < result.value().size(); ++i) {
     EXPECT_GE(result.value()[i - 1]->score(), result.value()[i]->score());
   }
+}
+
+TEST_F(CollectionTest, FetchReportsVectorAdmissionFailure) {
+  constexpr uint32_t kDimension = 16384;
+  auto schema = make_schema();
+  auto field = std::make_shared<FieldSchema>(
+      "vector", DataType::VECTOR_FP32, kDimension, false,
+      std::make_shared<FlatIndexParams>(MetricType::L2));
+  ASSERT_TRUE(schema.add_field(field).ok());
+  // mmap keeps index pages outside this pool. Only the owned vector returned
+  // by fetch needs a workspace lease, so the denial is independent of cache.
+  options_.enable_mmap_ = true;
+  ASSERT_NO_FATAL_FAILURE(create(schema));
+  std::vector<Doc> docs{make_doc("doc", 1)};
+  const std::vector<float> vector(kDimension, 1.0f);
+  ASSERT_TRUE(docs[0].set("vector", vector));
+  auto written = collection_->insert(docs);
+  ASSERT_NO_FATAL_FAILURE(expect_write(written, 1));
+
+  auto verify = [&] {
+    auto &pool = ailego::MemoryLimitPool::get_instance();
+    const size_t occupied = std::max(pool.used(), pool.committed());
+    constexpr size_t kSpare = 16384;
+    ASSERT_GT(pool.capacity(), occupied + kSpare);
+    {
+      ailego::MemoryReservation held;
+      held.add(pool.capacity() - occupied - kSpare);
+      auto scalar = collection_->fetch({"doc"}, std::nullopt, false);
+      ASSERT_TRUE(scalar.has_value()) << scalar.error().message();
+      ASSERT_NE(nullptr, scalar->at("doc"));
+      auto denied = collection_->fetch({"doc"});
+      ASSERT_FALSE(denied.has_value());
+      EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
+    }
+    auto fetched = collection_->fetch({"doc"});
+    ASSERT_TRUE(fetched.has_value()) << fetched.error().message();
+    ASSERT_NE(nullptr, fetched->at("doc"));
+    EXPECT_EQ(vector, fetched->at("doc")->get_ref<std::vector<float>>("vector"));
+  };
+  ASSERT_NO_FATAL_FAILURE(verify());
+  ASSERT_TRUE(collection_->flush().ok());
+  ASSERT_NO_FATAL_FAILURE(verify());
+}
+
+TEST_F(CollectionTest, IteratorRetriesRejectedResultWindow) {
+  options_.enable_mmap_ = false;
+  ASSERT_NO_FATAL_FAILURE(create(make_schema()));
+  std::vector<Doc> docs{make_doc("first", 1), make_doc("second", 2)};
+  auto write = collection_->insert(docs);
+  ASSERT_NO_FATAL_FAILURE(expect_write(write, 2));
+  auto iterator = collection_->create_iterator({});
+  ASSERT_TRUE(iterator.has_value()) << iterator.error().message();
+
+  {
+    auto &allowance = detail::SharedResultMemoryAllowance();
+    const size_t result_limit =
+        ailego::MemoryLimitPool::get_instance().capacity() / 8;
+    const size_t occupied = allowance.active_bytes();
+    ASSERT_GT(result_limit, occupied);
+    detail::ResultMemoryAllowance::Lease held(&allowance);
+    held.add(result_limit - occupied);
+    auto rejected = (*iterator)->next();
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, rejected.error().code());
+    EXPECT_NE(std::string::npos,
+              rejected.error().message().find("iterator result window"));
+  }
+
+  auto first = (*iterator)->next();
+  ASSERT_TRUE(first.has_value()) << first.error().message();
+  ASSERT_NE(nullptr, *first);
+  EXPECT_EQ("first", (*first)->pk());
+  auto second = (*iterator)->next();
+  ASSERT_TRUE(second.has_value()) << second.error().message();
+  ASSERT_NE(nullptr, *second);
+  EXPECT_EQ("second", (*second)->pk());
+  auto end = (*iterator)->next();
+  ASSERT_TRUE(end.has_value()) << end.error().message();
+  EXPECT_EQ(nullptr, *end);
 }
 
 TEST_F(CollectionTest, Feature_GroupByQuery) {}

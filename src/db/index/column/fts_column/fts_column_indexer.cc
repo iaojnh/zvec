@@ -40,11 +40,11 @@ namespace zvec::fts {
 namespace {
 // Reserve only after a positive hit. Keep the ordinary heap algorithm and
 // budgeted backing, with bounded initial capacity for common small requests.
-class FtsTopKHeap : public std::priority_queue<
-                       FtsResult,
-                       std::vector<FtsResult,
-                                   ailego::BudgetedAllocator<FtsResult>>,
-                       std::greater<FtsResult>> {
+class FtsTopKHeap
+    : public std::priority_queue<
+          FtsResult,
+          std::vector<FtsResult, ailego::BudgetedAllocator<FtsResult>>,
+          std::greater<FtsResult>> {
  public:
   void reserve_small(uint32_t topk, uint64_t estimated_hits) {
     try {
@@ -736,7 +736,8 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() try {
     }
     const auto scan_status = iter->status();
     if (!scan_status.ok()) {
-      return tl::make_unexpected(FtsReadFailure(scan_status, "Validate FTS postings"));
+      return tl::make_unexpected(
+          FtsReadFailure(scan_status, "Validate FTS postings"));
     }
     return {};
   }
@@ -745,6 +746,12 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() try {
         "FtsColumnIndexer: missing $DOC_LEN before conversion. field=",
         field_name_));
   }
+
+  // The conversion iterates $TF while writing postings in the same DB.
+  // Materialize its source memtable before taking the iterator: otherwise
+  // the iterator can pin WBM bytes that its own subsequent Put waits for.
+  const auto flushed = ctx_->flush();
+  if (!flushed.ok()) return tl::make_unexpected(flushed);
 
   // ---------------------------------------------------------------
   // 1) Build a pageable doc-length lookup. Do not retain a full heap copy.
@@ -774,7 +781,8 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() try {
     }
     const auto scan_status = iter->status();
     if (!scan_status.ok()) {
-      return tl::make_unexpected(FtsReadFailure(scan_status, "Scan FTS document lengths"));
+      return tl::make_unexpected(
+          FtsReadFailure(scan_status, "Scan FTS document lengths"));
     }
   }
 
@@ -849,7 +857,8 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() try {
     }
     const auto scan_status = iter->status();
     if (!scan_status.ok()) {
-      return tl::make_unexpected(FtsReadFailure(scan_status, "Scan FTS term frequencies"));
+      return tl::make_unexpected(
+          FtsReadFailure(scan_status, "Scan FTS term frequencies"));
     }
   }
   // Flush the last term.
@@ -863,6 +872,7 @@ Result<void> FtsColumnIndexer::convert_postings_to_bitpacked() try {
   // before its RocksDB is closed, and recovery expects BitPacked postings.
   rocksdb::FlushOptions flush_options;
   flush_options.wait = true;
+  flush_options.allow_write_stall = true;
   auto flush_status = ctx_->db_->Flush(flush_options, postings_cf_);
   if (!flush_status.ok()) {
     return tl::make_unexpected(Status::InternalError(

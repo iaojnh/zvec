@@ -190,7 +190,8 @@ int DiskAnnSearcherEntity::load_pq_segment() {
       const size_t last_page =
           (pq_offset + code_bytes - 1) / ailego::kVectorPageSize;
       for (size_t page = first_page; page <= last_page; ++page) {
-        if (!pool->set_page_priority(page, ailego::VecBufferPool::kHighPriority)) {
+        if (!pool->set_page_priority(page,
+                                     ailego::VecBufferPool::kHighPriority)) {
           return IndexError_InvalidFormat;
         }
       }
@@ -211,8 +212,9 @@ int DiskAnnSearcherEntity::load_pq_segment() {
 }
 
 void DiskAnnSearcherEntity::prepare_pq() {
-  if (!storage_ || !storage_->automatic_warmup_enabled() ||
-      !pq_data_segment_ || pq_codes_.data()) return;
+  if (!storage_ || !storage_->automatic_warmup_enabled() || !pq_data_segment_ ||
+      pq_codes_.data())
+    return;
   auto pool = storage_->vec_buffer_pool();
   if (!pool || !pool->cache_enabled() || pool->writable()) return;
   const size_t bytes = meta_header_.doc_cnt * pq_meta_.chunk_num;
@@ -222,11 +224,13 @@ void DiskAnnSearcherEntity::prepare_pq() {
   const size_t last = (offset + bytes - 1) / ailego::kVectorPageSize;
   const auto start = ailego::Monotime::MilliSeconds();
   const auto result = pool->prepare_pages_if_fits(first, last - first + 1);
-  LOG_INFO("DiskANN PQ preparation: status=%d pages=%zu/%zu read_bytes=%zu "
-           "elapsed_ms=%llu", static_cast<int>(result.status),
-           result.pages_loaded, last - first + 1, result.bytes_read,
-           static_cast<unsigned long long>(
-               ailego::Monotime::MilliSeconds() - start));
+  LOG_INFO(
+      "DiskANN PQ preparation: status=%d pages=%zu/%zu read_bytes=%zu "
+      "elapsed_ms=%llu",
+      static_cast<int>(result.status), result.pages_loaded, last - first + 1,
+      result.bytes_read,
+      static_cast<unsigned long long>(ailego::Monotime::MilliSeconds() -
+                                      start));
 }
 
 int DiskAnnSearcherEntity::read_pq_quantizer_meta_buffer(

@@ -28,6 +28,7 @@ namespace zvec::core_interface {
 
 int IVFIndex::create_and_init_converter_reformer(
     const QuantizerParam &param, const BaseIndexParam &index_param) {
+  ivf_quantizer_.reset();
   // Clustering and centroid selection use the input vectors. Only the
   // inverted lists are encoded, after their centroid assignments are known.
   if (index_param.is_sparse ||
@@ -175,9 +176,14 @@ int IVFIndex::load_streamer() {
 
 int IVFIndex::open(const std::string &file_path,
                    StorageOptions storage_options) try {
+  if (is_open_) return core::IndexError_NoReady;
   if (storage_options.read_only && storage_options.create_new) {
     LOG_ERROR("Cannot create storage for a read-only index");
     return core::IndexError_Runtime;
+  }
+  if (storage_options.create_new && streamer_needs_init_) {
+    const int ret = reset_build_pipeline(param_);
+    if (ret != 0) return ret;
   }
   ailego::Params storage_params;
   file_path_ = file_path;
@@ -252,16 +258,21 @@ int IVFIndex::open(const std::string &file_path,
     if (ret != 0) return ret;
   }
 
-  if (is_read_only_ || !storage_options.create_new) {
+  if (!storage_options.create_new) {
     const int ret = open_trained_storage(file_path_);
     if (ret != 0) return ret;
     is_trained_ = true;
+  } else {
+    if (storage_options.type == StorageOptions::StorageType::kBufferPool) {
+      buffered_input_ = std::make_shared<BufferedInput>(input_vector_meta_,
+                                                        file_path_ + ".input");
+    } else if (!doc_cache_) {
+      doc_cache_ = std::make_shared<DocCache>();
+    }
+    build_stage_ = BuildStage::kCollecting;
+    is_trained_ = false;
   }
-  if (storage_options.create_new && !is_read_only_ &&
-      storage_options.type == StorageOptions::StorageType::kBufferPool) {
-    buffered_input_ = std::make_shared<BufferedInput>(input_vector_meta_,
-                                                      file_path_ + ".input");
-  }
+  streamer_needs_init_ = false;
   is_open_ = true;
   return 0;
 } catch (const std::bad_alloc &) {

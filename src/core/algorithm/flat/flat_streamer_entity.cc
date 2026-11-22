@@ -1670,8 +1670,48 @@ int FlatStreamerEntity::alloc_block(const BlockLocation &next,
   return 0;
 }
 
-int FlatStreamerEntity::add_to_block(const BlockLocation &block, uint64_t key,
-                                     const void *data, size_t size) {
+class FlatStreamerEntity::PreparedVectorAdd final
+    : public IndexStreamer::PreparedAdd {
+ public:
+  PreparedVectorAdd(FlatStreamerEntity &entity,
+                    std::unique_lock<std::mutex> lock,
+                    IndexStorage::Segment::Pointer segment,
+                    std::unique_ptr<IndexStorage::Segment::PreparedWrite> write,
+                    uint64_t key, VectorLocation location,
+                    KeyMap::node_type pending_key)
+      : entity_(entity),
+        lock_(std::move(lock)),
+        segment_(std::move(segment)),
+        write_(std::move(write)),
+        key_(key),
+        location_(location),
+        pending_key_(std::move(pending_key)) {}
+
+  void commit() noexcept override {
+    if (!write_) return;
+    write_->commit();
+    entity_.publish_key(key_, location_, std::move(pending_key_));
+    ++entity_.meta_.header.total_vector_count;
+    ++*entity_.stats_.mutable_added_count();
+    entity_.stats_.set_revision_id(entity_.meta_.revision_id + 1);
+    write_.reset();
+    lock_.unlock();
+  }
+
+ private:
+  FlatStreamerEntity &entity_;
+  std::unique_lock<std::mutex> lock_;
+  IndexStorage::Segment::Pointer segment_;
+  std::unique_ptr<IndexStorage::Segment::PreparedWrite> write_;
+  uint64_t key_;
+  VectorLocation location_;
+  KeyMap::node_type pending_key_;
+};
+
+int FlatStreamerEntity::add_to_block(
+    const BlockLocation &block, uint64_t key, const void *data, size_t size,
+    std::unique_lock<std::mutex> *lock,
+    std::unique_ptr<IndexStreamer::PreparedAdd> *out) {
   IndexStorage::MemoryBlock block_header_block;
   this->get_block_header(block, block_header_block);
   const BlockHeader *header =
@@ -1702,17 +1742,78 @@ int FlatStreamerEntity::add_to_block(const BlockLocation &block, uint64_t key,
   const IndexStorage::SegmentData writes[] = {{vector_off, size, data},
                                               {key_off, sizeof(key), &key},
                                               {hd_off, sizeof(hd), &hd}};
+  VectorLocation loc(block.segment_id, false, vector_off);
+  if (out) {
+    std::unique_ptr<IndexStorage::Segment::PreparedWrite> prepared;
+    const int ret = segment->prepare_write_batch(writes, 3, &prepared);
+    if (ret != 0) return ret;
+    *out = std::make_unique<PreparedVectorAdd>(
+        *this, std::move(*lock), std::move(segment), std::move(prepared), key,
+        loc, std::move(pending_key));
+    return 0;
+  }
   // External vectors belong to the source. Persist only IDs and the header;
   // internal vectors keep the atomic batched write including their payload.
   if (!segment->write_batch(writes + (use_external_vector_ ? 1 : 0),
                             use_external_vector_ ? 2 : 3))
     return segment->write_error();
 
-  VectorLocation loc(block.segment_id, false, vector_off);
   publish_key(key, loc, std::move(pending_key));
 
   ++meta_.header.total_vector_count;
   return 0;
+}
+
+int FlatStreamerEntity::append_vector_with_id(
+    uint32_t id, const void *query, uint32_t size,
+    std::unique_lock<std::mutex> &lock,
+    std::unique_ptr<IndexStreamer::PreparedAdd> *out) {
+  IndexStorage::MemoryBlock head_block;
+  get_head_block(head_block);
+  if (!head_block.data()) return IndexError_ReadData;
+  BlockLocation block =
+      *reinterpret_cast<const BlockLocation *>(head_block.data());
+  // New segments may evict or replace the pool's page directory.
+  head_block.reset();
+  if (!is_valid_block(block)) {
+    const int ret = alloc_block(block, &block);
+    if (ret != 0) return ret;
+  }
+  ailego::BudgetedVector<char> empty_vector;
+  if (vector_count() < id) empty_vector.resize(size);
+  while (vector_count() < id) {
+    // The omitted vectors belong to earlier, already committed documents.
+    int ret = add_to_block(block, kInvalidKey, empty_vector.data(), size);
+    if (ret == IndexError_IndexFull) {
+      ret = alloc_block(block, &block);
+      if (ret == 0)
+        ret = add_to_block(block, kInvalidKey, empty_vector.data(), size);
+    }
+    if (ret != 0) return ret;
+  }
+
+  int ret = add_to_block(block, id, query, size, &lock, out);
+  if (ret == IndexError_IndexFull) {
+    ret = alloc_block(block, &block);
+    if (ret == 0) ret = add_to_block(block, id, query, size, &lock, out);
+  }
+  return ret;
+}
+
+int FlatStreamerEntity::prepare_add_vector_with_id(
+    uint32_t id, const void *query, uint32_t size,
+    std::unique_ptr<IndexStreamer::PreparedAdd> *out) try {
+  if (!query || !out || *out || use_external_vector_ ||
+      size != index_meta_.element_size())
+    return IndexError_InvalidArgument;
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (id < vector_count()) return IndexError_Duplicate;
+  meta_dirty_ = true;
+  return append_vector_with_id(id, query, size, lock, out);
+} catch (const ReadError &error) {
+  return error.status;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int FlatStreamerEntity::add_vector_with_id(const uint32_t id, const void *query,
@@ -1722,7 +1823,7 @@ int FlatStreamerEntity::add_vector_with_id(const uint32_t id, const void *query,
     int ret = add(id, query, size);
     return ret == IndexError_Duplicate ? 0 : ret;
   }
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
 
   if (size != static_cast<size_t>(index_meta_.element_size())) {
     LOG_ERROR("Failed to add, mismatch size %u vs elemsize %u", size,
@@ -1733,48 +1834,7 @@ int FlatStreamerEntity::add_vector_with_id(const uint32_t id, const void *query,
 
   meta_dirty_ = true;
   if (id >= vector_count()) {
-    IndexStorage::MemoryBlock head_block;
-    this->get_head_block(head_block);
-    if (!head_block.data()) return IndexError_ReadData;
-    BlockLocation block =
-        *reinterpret_cast<const BlockLocation *>(head_block.data());
-    // Release buffer-pool pin before any alloc_block() call that may trigger
-    // append_segment() and rebuild the pool (same reason as in add()).
-    head_block.reset(nullptr);
-    if (!this->is_valid_block(block)) {
-      int ret = this->alloc_block(block, &block);
-      if (ailego_unlikely(ret != 0)) {
-        return ret;
-      }
-    }
-    ailego::BudgetedVector<char> vec;
-    if (vector_count() < id) vec.resize(size);
-    for (size_t start_id = vector_count(); start_id < id; ++start_id) {
-      int ret = this->add_to_block(block, kInvalidKey, vec.data(), size);
-      if (ret == IndexError_IndexFull) {
-        ret = this->alloc_block(block, &block);
-        if (ailego_unlikely(ret != 0)) {
-          return ret;
-        }
-        ret = this->add_to_block(block, kInvalidKey, vec.data(), size);
-      }
-      if (ailego_unlikely(ret != 0)) {
-        return ret;
-      }
-      if (ret != 0) return ret;
-    }
-
-    int ret = this->add_to_block(block, id, query, size);
-    if (ret == IndexError_IndexFull) {
-      ret = this->alloc_block(block, &block);
-      if (ailego_unlikely(ret != 0)) {
-        return ret;
-      }
-      ret = this->add_to_block(block, id, query, size);
-    }
-    if (ailego_unlikely(ret != 0)) {
-      return ret;
-    }
+    const int ret = append_vector_with_id(id, query, size, lock, nullptr);
     if (ret != 0) return ret;
   } else {
     VectorLocation vector_loc{};

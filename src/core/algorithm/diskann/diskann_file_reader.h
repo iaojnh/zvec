@@ -21,8 +21,8 @@
 
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <ailego/io/iouring_loader.h>  // raw-syscall io_uring wrapper (IoUringRing)
-#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <ailego/io/libaio_loader.h>  // dlopen-based libaio wrapper
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #elif defined(_WIN32) || defined(_WIN64)
 #ifndef NOMINMAX
 #define NOMINMAX

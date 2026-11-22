@@ -63,7 +63,8 @@ void *RocksdbCacheAllocator::Allocate(size_t size) {
   auto &pool = ailego::MemoryLimitPool::get_instance();
   if (!pool.account_pending_process_backing(bytes)) throw std::bad_alloc();
   void *mapping = ailego::File::MemoryMap(bytes, 0);
-  const auto projection = pool.finish_process_backing(bytes, mapping != nullptr);
+  const auto projection =
+      pool.finish_process_backing(bytes, mapping != nullptr);
   if (mapping == nullptr) {
     throw std::bad_alloc();
   }

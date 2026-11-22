@@ -354,9 +354,9 @@ class MergedProviderIndexHolder::OrdinalReader final
       try {
         scratch_.reserve(owner_->element_size());
         scratch_.value.resize(owner_->element_size());
-        const int ret = map_->vectors.read(
-            ordinal * owner_->element_size(), scratch_.value.data(),
-            owner_->element_size());
+        const int ret =
+            map_->vectors.read(ordinal * owner_->element_size(),
+                               scratch_.value.data(), owner_->element_size());
         if (ret != 0) return fail(ret);
         *key = ordinal;
         *data = scratch_.value.data();
@@ -547,7 +547,8 @@ int MergedProviderIndexHolder::retain_stable_data(
 MergedProviderIndexHolder::MergedProviderIndexHolder(
     IndexQueryMeta output_meta, std::vector<Source> sources,
     ailego::MemoryReservation source_memory, bool spool_vectors)
-    : output_meta_(output_meta), source_memory_(std::move(source_memory)),
+    : output_meta_(output_meta),
+      source_memory_(std::move(source_memory)),
       spool_vectors_(spool_vectors) {
   // Reducers reserve before constructing the directory; direct callers hand
   // over a caller-owned vector, whose capacity becomes ours at this boundary.
@@ -729,8 +730,8 @@ MergedProviderIndexHolder::create_iterator() try {
   }
   if (spool_vectors_) {
     if (prepare_ordinal_map() != 0) return nullptr;
-    auto result = IndexHolder::Iterator::Pointer(
-        new (std::nothrow) SpoolIterator(this));
+    auto result =
+        IndexHolder::Iterator::Pointer(new (std::nothrow) SpoolIterator(this));
     if (!result) set_status(IndexError_NoMemory);
     return result;
   }

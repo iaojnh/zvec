@@ -194,6 +194,9 @@ class MemForwardStore : public BaseForwardStore {
 
   /// flush() without locking; callers must hold cache_mtx_ exclusively
   Status flush_locked();
+  Status finalize();
+  Status finalize_locked();
+  void reset_writer();
 
  private:
   /// Guards cache_, batches_ and num_rows_, which insert(), flush() and close()
@@ -238,6 +241,7 @@ class MemForwardStore : public BaseForwardStore {
 
   /// Writer for chunked files
   ChunkedFileWriter::Ptr writer_;
+  bool finalized_{false};
 
 
   /// Maximum size of cache, default 1MB

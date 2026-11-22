@@ -82,15 +82,24 @@ class DeleteStore : public std::enable_shared_from_this<DeleteStore> {
     return status;
   }
 
-  Status flush(const std::string &file_path) {
+  Status snapshot(const std::string &file_path) {
     Status status = bitmap_.serialize(file_path, true);
     if (status.ok()) {
       LOG_DEBUG("Flushed delete store to file[%s]", file_path.c_str());
-      modified_since_last_flush_ = false;
     } else {
       LOG_ERROR("Failed to flush delete store to file[%s]", file_path.c_str());
     }
     return status;
+  }
+
+  Status flush(const std::string &file_path) {
+    auto status = snapshot(file_path);
+    if (status.ok()) mark_flushed();
+    return status;
+  }
+
+  void mark_flushed() {
+    modified_since_last_flush_ = false;
   }
 
   Status prepare_mark_deleted(uint64_t doc_id) {

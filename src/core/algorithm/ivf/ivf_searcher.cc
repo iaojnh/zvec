@@ -263,6 +263,8 @@ int IVFSearcher::search_batch(const void *query, const IndexQueryMeta &qmeta,
                                  : entity->search(one, filter, &heap, &stats);
         ivf_check_error_code(ret);
       } else {
+        auto release_prefetch =
+            ailego::ScopeGuard::Make([&] { entity->release_prefetch(); });
         const auto &centroids = centroid_ctx->result(q);
         size_t hinted_scans = 0, next_hint = 0, scans = 0;
         for (size_t i = 0;

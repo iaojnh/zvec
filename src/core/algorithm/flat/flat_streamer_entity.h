@@ -14,7 +14,6 @@
 
 #pragma once
 
-#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -27,6 +26,7 @@
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/retained_block_allocator.h>
 #include <zvec/ailego/utility/string_helper.h>
 #include <zvec/core/framework/index_context.h>
@@ -303,6 +303,9 @@ class FlatStreamerEntity {
 
   virtual int add_vector_with_id(const uint32_t id, const void *query,
                                  const uint32_t element_size);
+  int prepare_add_vector_with_id(
+      uint32_t id, const void *query, uint32_t size,
+      std::unique_ptr<IndexStreamer::PreparedAdd> *out);
 
  protected:
   const IndexMetric::MatrixDistance &distance() const {
@@ -489,9 +492,15 @@ class FlatStreamerEntity {
 
   //! Add a record to a block
   int add_to_block(const BlockLocation &block, uint64_t key, const void *data,
-                   size_t size);
+                   size_t size, std::unique_lock<std::mutex> *lock = nullptr,
+                   std::unique_ptr<IndexStreamer::PreparedAdd> *out = nullptr);
+  int append_vector_with_id(uint32_t id, const void *query, uint32_t size,
+                            std::unique_lock<std::mutex> &lock,
+                            std::unique_ptr<IndexStreamer::PreparedAdd> *out);
 
  private:
+  class PreparedVectorAdd;
+
   size_t stored_vector_size() const {
     return use_external_vector_ ? 0 : index_meta_.element_size();
   }
@@ -522,8 +531,7 @@ class FlatStreamerEntity {
            vector_index * stored_vector_size();
   }
 
-  static void check_read_budget(
-      const IndexStorage::Segment::Pointer &segment) {
+  static void check_read_budget(const IndexStorage::Segment::Pointer &segment) {
     // The legacy block helpers return a short-read marker. Preserve budget
     // refusal before that marker becomes a generic read/format error; public
     // streamer entry points translate bad_alloc to IndexError_NoMemory.

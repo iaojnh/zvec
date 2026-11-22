@@ -19,6 +19,7 @@
 #include <ailego/pattern/scope_guard.h>
 #include <core/quantizer/distance_quantizer.h>
 #include <core/quantizer/quantizer_params.h>
+#include <core/utility/chunk_read_storage.h>
 #include <turbo/quantizer/common/pq_quantizer/packed_code_quantizer.h>
 #include "metric/metric_params.h"
 #include "ivf_utility.h"
@@ -1020,6 +1021,10 @@ size_t IVFEntity::prefetch_list(size_t inverted_list_id, bool *accepted) const {
                         IndexStorage::Segment::CachePriority::kLow);
   }
   return list->vector_count;
+}
+
+void IVFEntity::release_prefetch() const {
+  ChunkReadStorage::release_prefetch(inverted_.get());
 }
 
 int IVFEntity::search(size_t inverted_list_id, const void *query,

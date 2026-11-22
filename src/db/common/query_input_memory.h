@@ -12,12 +12,12 @@ namespace zvec::detail {
 // planning and executing. Vector views may become owning during sanitization.
 inline size_t QueryInputCopyBytes(
     const QueryTarget &target, std::string_view filter,
-    const std::optional<std::vector<std::string>> &fields,
-    size_t bytes = 256, bool materialize_view = false) {
+    const std::optional<std::vector<std::string>> &fields, size_t bytes = 256,
+    bool materialize_view = false) {
   const auto add = [&](std::string_view value) {
     if (!value.empty())
-      bytes = BindingMemoryBytes(1, value.size(),
-                                 BindingMemoryBytes(1, bytes, 32));
+      bytes =
+          BindingMemoryBytes(1, value.size(), BindingMemoryBytes(1, bytes, 32));
   };
   add(target.field_name_);
   add(filter);

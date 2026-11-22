@@ -302,6 +302,33 @@ int FlatSparseStreamer::add_with_id_impl(uint32_t pkey,
   return IndexError_NoMemory;
 }
 
+int FlatSparseStreamer::prepare_add_with_id(
+    uint32_t id, uint32_t sparse_count, const uint32_t *indices,
+    const void *values, const IndexQueryMeta &qmeta, Context::Pointer &context,
+    std::unique_ptr<PreparedAdd> *out) try {
+  if (!out || (sparse_count && (!indices || !values)))
+    return IndexError_InvalidArgument;
+  if (state_ != STATE_OPENED) return IndexError_NoReady;
+  const int ret = check_params(qmeta);
+  if (ret != 0) return ret;
+  if (sparse_count > PARAM_FLAT_SPARSE_MAX_DIM_SIZE)
+    return IndexError_InvalidValue;
+  if (!dynamic_cast<FlatSparseContext *>(context.get())) return IndexError_Cast;
+
+  std::shared_lock<ailego::SharedMutex> writer_guard(shared_mutex_,
+                                                     std::try_to_lock);
+  if (!writer_guard) return IndexError_Unsupported;
+  ailego::BudgetedString encoded;
+  SparseUtility::TransSparseFormat(sparse_count, indices, values,
+                                   meta_.unit_size(), encoded);
+  return entity_.prepare_add_with_id(id, encoded, sparse_count,
+                                     std::move(writer_guard), out);
+} catch (const FlatSparseEntity::ReadError &error) {
+  return error.status;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+}
+
 //! Similarity search with sparse inputs
 int FlatSparseStreamer::search_impl(const uint32_t sparse_count,
                                     const uint32_t *sparse_indices,

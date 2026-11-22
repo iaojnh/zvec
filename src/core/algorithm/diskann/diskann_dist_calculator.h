@@ -267,8 +267,7 @@ class DistCalculator {
 
   inline void bind_quantizer(
       const turbo::Quantizer *quantizer, const uint8_t *codes,
-      uint32_t code_size,
-      IndexStorage::Segment::Pointer paged_codes = nullptr,
+      uint32_t code_size, IndexStorage::Segment::Pointer paged_codes = nullptr,
       ailego::VecBufferPool *pool = nullptr) {
     quantizer_ = quantizer;
     quant_codes_ = codes;
@@ -291,11 +290,10 @@ class DistCalculator {
   }
 
   void quantized_dist(const diskann_id_t *ids, uint32_t n, float *dists) try {
-    auto release =
-        ailego::ScopeGuard::Make([&]() {
-          resident_pq_batch_.release();
-          quant_code_blocks_.clear();
-        });
+    auto release = ailego::ScopeGuard::Make([&]() {
+      resident_pq_batch_.release();
+      quant_code_blocks_.clear();
+    });
     quant_dp_list_.resize(n);
     for (uint32_t i = 0; i < n; ++i) {
       if (ids[i] >= entity_->doc_cnt()) {
@@ -312,12 +310,13 @@ class DistCalculator {
       }
     }
     if (paged_quant_codes_ &&
-        !(paged_pq_pool_ && resident_pq_batch_.read(
-            *paged_pq_pool_, *paged_quant_codes_, ids, n, quant_code_size_,
-            quant_dp_list_, /*load_misses=*/true))) {
-      const int ret = ReadPagedQuantizedCodes(
-          *paged_quant_codes_, ids, n, quant_code_size_, quant_code_blocks_,
-          quant_dp_list_);
+        !(paged_pq_pool_ &&
+          resident_pq_batch_.read(*paged_pq_pool_, *paged_quant_codes_, ids, n,
+                                  quant_code_size_, quant_dp_list_,
+                                  /*load_misses=*/true))) {
+      const int ret =
+          ReadPagedQuantizedCodes(*paged_quant_codes_, ids, n, quant_code_size_,
+                                  quant_code_blocks_, quant_dp_list_);
       if (ret) {
         error_code_ = ret;
         return;

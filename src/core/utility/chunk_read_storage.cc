@@ -40,6 +40,7 @@ constexpr int kUnloaded = std::numeric_limits<int>::min();
 constexpr int kLoading = kUnloaded + 1;
 constexpr int kEvicting = std::numeric_limits<int>::min() / 2;
 using Pool = ailego::MemoryLimitPool;
+thread_local int chunk_read_error = IndexError_ReadData;
 
 size_t AlignPage(size_t size) {
   const size_t page = ailego::MemoryHelper::PageSize();
@@ -205,6 +206,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       iocb control{};
       Entry *item{nullptr};
       size_t bytes{0}, required{0};
+      uint64_t requester{0};
       bool done{false}, submitted{false}, resident{false};
     };
     ReadAhead(State &state, std::unique_ptr<MetadataCharge> reservation,
@@ -379,7 +381,19 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       owner.prefetch_peak_bytes.store(
           std::max<uint64_t>(owner.prefetch_peak_bytes.load(), bytes));
     }
-    bool hint(size_t offset, size_t length, Layout *layout, bool retire_stale) {
+    void release_prefetch(uint64_t requester) {
+      std::lock_guard<std::mutex> lock(mutex);
+      for (auto &slot : slots) {
+        if (!slot.item || slot.requester != requester) continue;
+        if (!slot.done && !slot.submitted) cancel(slot);
+        // Kernel-owned buffers can be released only after their completion.
+        // Reaping another reader's completion leaves its slot available.
+        while (!slot.done) reap(true);
+        release(slot);
+      }
+    }
+    bool hint(size_t offset, size_t length, Layout *layout, bool retire_stale,
+              uint64_t requester) {
       std::lock_guard<std::mutex> lock(mutex);
       reap(false);
       if (!ready) return false;
@@ -431,6 +445,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
         if (owner.pin(*item, reinterpret_cast<size_t>(item), false)) {
           free->item = item;
           free->bytes = capacity;
+          free->requester = requester;
           free->done = true;
           free->resident = true;
           account_slot(capacity);
@@ -460,6 +475,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
         free->item = item;
         free->bytes = capacity;
         free->required = required;
+        free->requester = requester;
         io_prep_pread(&free->control, owner.data_file.native_handle(),
                       buffer->data, requested, physical);
         free->control.data = free;
@@ -976,7 +992,10 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     }
     const size_t page = ailego::MemoryHelper::PageSize();
     auto *view = acquire_view(len + 2 * page);
-    if (!view) return 0;
+    if (!view) {
+      chunk_read_error = IndexError_NoMemory;
+      return 0;
+    }
     auto owner = lease(out, view);
     out.lease = owner;
     out.spans.reserve(single ? 1 : len / chunk_bytes + 2);
@@ -984,7 +1003,10 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     size_t run_first = 0, run_end = 0;
     const auto finish_run = [&]() {
       if (run_first == run_end) return true;
-      if (!ensure_workspace(*view, len + 2 * page)) return false;
+      if (!ensure_workspace(*view, len + 2 * page)) {
+        chunk_read_error = IndexError_NoMemory;
+        return false;
+      }
       const size_t begin = run_first, end = run_end;
       const size_t physical = begin / io_alignment * io_alignment;
       const size_t requested =
@@ -1155,6 +1177,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
   std::atomic<size_t> prefetch_pending_requests{0}, prefetch_pending_bytes{0};
   std::atomic<uint64_t> prefetch_read_bytes{0}, prefetch_submit_batches{0};
 #if defined(__linux__) && !defined(__ANDROID__)
+  std::atomic<uint64_t> next_prefetch_requester{1};
   std::unique_ptr<ReadAhead> read_ahead;
 #endif
 };
@@ -1183,33 +1206,33 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
   size_t capacity() const override {
     return size_ + padding_;
   }
+  int read_error() const override {
+    return chunk_read_error;
+  }
   size_t read_scatter(size_t offset, ScatterBlock &out, size_t len) override {
-    if (offset > capacity()) {
-      out.reset();
-      return 0;
-    }
-    return state_->scatter(offset_ + offset, std::min(len, capacity() - offset),
-                           out, layout_);
+    return read_scatter_block(offset, out, len);
   }
   bool supports_read_chunks() const override {
     return true;
   }
   void prefetch(size_t offset, size_t len, CachePriority priority) override {
-      (void)try_prefetch(offset, len, priority);
-    }
-    bool try_prefetch(size_t offset, size_t len, CachePriority priority) override {
-      if (offset > size_ || len > size_ - offset) return false;
+    (void)try_prefetch(offset, len, priority);
+  }
+  bool try_prefetch(size_t offset, size_t len,
+                    CachePriority priority) override {
+    if (offset > size_ || len > size_ - offset) return false;
 #if defined(__linux__) && !defined(__ANDROID__)
     if (layout_ && state_->read_ahead && state_->prefetch_enabled.load() &&
         offset <= size_ && len <= size_ - offset)
-        return state_->read_ahead->hint(offset_ + offset, len, layout_,
-                                       priority != CachePriority::kLow);
+      return state_->read_ahead->hint(offset_ + offset, len, layout_,
+                                      priority != CachePriority::kLow,
+                                      prefetch_requester_);
 #else
     (void)offset;
     (void)len;
     (void)priority;
 #endif
-      return true;
+    return true;
   }
   int set_read_chunks(const ReadChunks &chunks) override try {
     if (layout_) return IndexError_InvalidArgument;
@@ -1238,8 +1261,7 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
       // first-revisit transient returns its mapping to the generic idle pool,
       // where pressure may unmap it before another same-sized read arrives.
       // Metadata pages retain their ordinary admission policy.
-      if (state_->adaptive)
-        layout->entries[i].filter_readmission = false;
+      if (state_->adaptive) layout->entries[i].filter_readmission = false;
     }
     std::lock_guard<std::mutex> lock(state_->table_mutex);
     const size_t charged = layout->charge.bytes;
@@ -1294,7 +1316,10 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
       return got;
     }
     const size_t page = ailego::MemoryHelper::PageSize();
-    if (!state_->ensure_workspace(*owner->view, got + 2 * page)) return 0;
+    if (!state_->ensure_workspace(*owner->view, got + 2 * page)) {
+      chunk_read_error = IndexError_NoMemory;
+      return 0;
+    }
     auto *destination = owner->view->workspace->data +
                         (offset_ + offset) % state_->io_alignment;
     size_t copied = 0;
@@ -1308,15 +1333,14 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
     return got;
   }
   size_t fetch(size_t offset, void *destination, size_t len) const override {
+    chunk_read_error = IndexError_ReadData;
     if (offset > capacity() || !destination) return 0;
     len = std::min(len, capacity() - offset);
     size_t done = 0;
     while (done < len) {
       ScatterBlock block;
       const size_t count = std::min(len - done, state_->max_read_bytes);
-      if (state_->scatter(offset_ + offset + done, count, block, layout_) !=
-          count)
-        return done;
+      if (read_scatter_block(offset + done, block, count) != count) return done;
       size_t cursor = done;
       for (const auto &span : block.spans) {
         std::memcpy(static_cast<uint8_t *>(destination) + cursor, span.data,
@@ -1336,14 +1360,43 @@ class ChunkReadStorage::ReadSegment : public IndexStorage::Segment {
   }
   void update_data_crc(uint32_t) override {}
   Pointer clone() override {
-    return std::make_shared<ReadSegment>(*this);
+    auto clone = std::make_shared<ReadSegment>(*this);
+#if defined(__linux__) && !defined(__ANDROID__)
+    clone->prefetch_requester_ = next_prefetch_requester();
+#endif
+    return clone;
   }
 
  private:
+  friend class ChunkReadStorage;
+#if defined(__linux__) && !defined(__ANDROID__)
+  uint64_t next_prefetch_requester() const {
+    return state_->next_prefetch_requester.fetch_add(1,
+                                                     std::memory_order_relaxed);
+  }
+#endif
+  size_t read_scatter_block(size_t offset, ScatterBlock &out, size_t len) const
+      try {
+    chunk_read_error = IndexError_ReadData;
+    if (offset > capacity()) {
+      out.reset();
+      return 0;
+    }
+    return state_->scatter(offset_ + offset, std::min(len, capacity() - offset),
+                           out, layout_);
+  } catch (const std::bad_alloc &) {
+    out.reset();
+    chunk_read_error = IndexError_NoMemory;
+    return 0;
+  }
+
   std::shared_ptr<State> state_;
   size_t offset_, size_, padding_;
   uint32_t crc_;
   State::Layout *layout_{nullptr};
+#if defined(__linux__) && !defined(__ANDROID__)
+  uint64_t prefetch_requester_{next_prefetch_requester()};
+#endif
 };
 
 ChunkReadStorage::ChunkReadStorage()
@@ -1388,10 +1441,14 @@ int ChunkReadStorage::open(const std::string &path, bool) {
       return IndexError_InvalidArgument;
     const size_t container_size = end - candidate->index_offset;
     auto &view = *candidate->views.front();
+    bool metadata_no_memory = false;
     auto read = [&](size_t offset, const void **data, size_t length) {
-      if (offset > container_size || length > container_size - offset ||
-          !candidate->ensure_workspace(view, length))
+      if (offset > container_size || length > container_size - offset)
         return size_t{0};
+      if (!candidate->ensure_workspace(view, length)) {
+        metadata_no_memory = true;
+        return size_t{0};
+      }
       *data = view.workspace->data;
       return candidate->meta_file.read(
           static_cast<ssize_t>(candidate->index_offset + offset),
@@ -1399,7 +1456,7 @@ int ChunkReadStorage::open(const std::string &path, bool) {
     };
     IndexUnpacker unpacker;
     if (!unpacker.unpack(read, container_size, checksum_))
-      return IndexError_UnpackIndex;
+      return metadata_no_memory ? IndexError_NoMemory : IndexError_UnpackIndex;
     size_t estimated = 0;
     for (const auto &item : unpacker.segments()) {
       const auto &meta = item.second;
@@ -1470,6 +1527,16 @@ IndexStorage::MemoryBlock::MemoryBlockType ChunkReadStorage::memory_block_type()
 }
 std::string ChunkReadStorage::file_path() const {
   return state_ ? state_->path : std::string{};
+}
+void ChunkReadStorage::release_prefetch(Segment *segment) {
+#if defined(__linux__) && !defined(__ANDROID__)
+  auto *reader = dynamic_cast<ReadSegment *>(segment);
+  if (reader && reader->state_->read_ahead &&
+      reader->state_->prefetch_pending_requests.load(std::memory_order_acquire))
+    reader->state_->read_ahead->release_prefetch(reader->prefetch_requester_);
+#else
+  (void)segment;
+#endif
 }
 void ChunkReadStorage::enable_prefetch(bool enabled) {
   if (state_) state_->prefetch_enabled.store(enabled);

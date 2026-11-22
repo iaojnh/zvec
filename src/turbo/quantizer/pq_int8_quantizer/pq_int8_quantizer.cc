@@ -352,10 +352,9 @@ int PqInt8Quantizer::train(IndexHolder::Pointer holder) try {
   }
 
   std::vector<uint8_t> all_data;
-  if (!CollectPqTrainingSamples(holder, kMaxTrainVectors, vec_bytes,
-                                &all_data)) {
-    return kErrUnsupported;
-  }
+  int input_status =
+      ReadPqTrainingSamples(holder, kMaxTrainVectors, vec_bytes, &all_data);
+  if (input_status != 0) return input_status;
   holder.reset();
 
   size_t data_stride = original_dim_ * elem_size;
@@ -444,20 +443,20 @@ void PqInt8Quantizer::train_all_chunks(const void *data, size_t num,
   auto submit_training = [&](const auto *typed_data) {
     using T = std::remove_const_t<std::remove_pointer_t<decltype(typed_data)>>;
     for (size_t i = 0; i < pool_count; ++i) {
-      task_group->submit(
-          ailego::Closure::New([this, typed_data, num, stride, rows, i,
-                                pool_count, max_iters, &finished, &no_memory]() {
-            try {
-              for (uint32_t m = static_cast<uint32_t>(i); m < num_chunk_;
-                   m += static_cast<uint32_t>(pool_count)) {
-                if (no_memory.load(std::memory_order_relaxed)) break;
-                train_chunk<T>(typed_data, num, stride, m, max_iters, rows);
-                finished++;
-              }
-            } catch (const std::bad_alloc &) {
-              no_memory.store(true, std::memory_order_relaxed);
-            }
-          }));
+      task_group->submit(ailego::Closure::New([this, typed_data, num, stride,
+                                               rows, i, pool_count, max_iters,
+                                               &finished, &no_memory]() {
+        try {
+          for (uint32_t m = static_cast<uint32_t>(i); m < num_chunk_;
+               m += static_cast<uint32_t>(pool_count)) {
+            if (no_memory.load(std::memory_order_relaxed)) break;
+            train_chunk<T>(typed_data, num, stride, m, max_iters, rows);
+            finished++;
+          }
+        } catch (const std::bad_alloc &) {
+          no_memory.store(true, std::memory_order_relaxed);
+        }
+      }));
     }
   };
 

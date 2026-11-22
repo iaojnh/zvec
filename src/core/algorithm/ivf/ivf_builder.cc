@@ -553,7 +553,8 @@ int IVFBuilder::build(IndexThreads::Pointer threads,
       if (ret != 0) return ret;
     }
     if (!scratch.empty() && !holder_->borrowed()) {
-      ret = holder_->enable_buffered_storage(scratch + ".vectors", holder->count());
+      ret = holder_->enable_buffered_storage(scratch + ".vectors",
+                                             holder->count());
       if (ret != 0) return ret;
     }
     if (holder->count() > 0) {

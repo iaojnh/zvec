@@ -40,7 +40,8 @@ class PythonWriteMemory {
 
   void set_pk(Doc &doc, pybind11::handle value) {
     ResultMemoryAllowance::PendingCopy pending;
-    reserve_value(pending, [&] { return PythonFetchInputs::string_bytes(value); });
+    reserve_value(pending,
+                  [&] { return PythonFetchInputs::string_bytes(value); });
     pending.start();
     doc.set_pk(PythonFetchInputs::copy_string(value));
   }
@@ -49,7 +50,8 @@ class PythonWriteMemory {
     // Schema lookup itself crosses a string caster before set_any is reached.
     // Admit that copy too, and avoid a UTF-8 cache on the caller's Unicode key.
     ResultMemoryAllowance::PendingCopy pending;
-    reserve_value(pending, [&] { return PythonFetchInputs::string_bytes(value); });
+    reserve_value(pending,
+                  [&] { return PythonFetchInputs::string_bytes(value); });
     pending.start();
     return pybind11::bytes(PythonFetchInputs::copy_string(value));
   }

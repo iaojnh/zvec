@@ -168,8 +168,9 @@ int IndexCluster::Load(const IndexMeta &meta, IndexStorage::Pointer storage,
   if (!features || !indexes) return IndexError_InvalidFormat;
   auto reader = [](IndexStorage::Segment::Pointer segment) -> CentroidReader {
     return [segment](size_t offset, void *out, size_t bytes) {
-      return segment->fetch(offset, out, bytes) == bytes ? 0
-                                                         : IndexError_ReadData;
+      return segment->fetch(offset, out, bytes) == bytes
+                 ? 0
+                 : segment->read_error();
     };
   };
   return ReadCentroids(meta, features->data_size(), indexes->data_size(),

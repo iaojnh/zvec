@@ -17,6 +17,7 @@
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/core/framework/index_storage.h>
 #include <zvec/core/interface/index.h>
+#include "ailego/pattern/defer.h"
 #include "algorithm/flat/flat_index_format.h"
 #include "algorithm/flat/flat_streamer_context.h"
 #include "algorithm/flat/flat_utility.h"
@@ -154,12 +155,13 @@ int FlatIndex::bind_vector_source(const core::VectorSource &source,
 }
 
 int FlatIndex::add_with_source(const VectorData &vector, uint32_t doc_id,
-                               const core::VectorSource &source) {
+                               const core::VectorSource &source) try {
   if (!is_open_) return core::IndexError_NoReady;
   if (is_read_only_) return core::IndexError_Runtime;
   const auto *dense = std::get_if<DenseVector>(&vector.vector);
   if (!dense || !dense->data) return core::IndexError_InvalidArgument;
-  auto &context = acquire_context();
+  auto &context = acquire_context(true);
+  AILEGO_DEFER([&] { release_context(); });
   if (!context) return core::IndexError_Runtime;
   FlatSourceScope scope{context};
   int ret = bind_vector_source(source, context);
@@ -167,23 +169,29 @@ int FlatIndex::add_with_source(const VectorData &vector, uint32_t doc_id,
   // External Flat stores only IDs. Its raw FP32 layout needs no conversion.
   return streamer_->add_with_id_impl(doc_id, dense->data, input_vector_meta_,
                                      context);
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int FlatIndex::search_with_source(
     const VectorData &query, const BaseIndexQueryParam::Pointer &search_param,
-    const core::VectorSource &source, SearchResult *result) {
+    const core::VectorSource &source, SearchResult *result) try {
   if (!is_open_) return core::IndexError_NoReady;
   if (!search_param || !result) return core::IndexError_InvalidArgument;
   *result = SearchResult{};
-  auto &context = acquire_context();
+  auto &context = acquire_context(true);
+  AILEGO_DEFER([&] { release_context(); });
   if (!context) return core::IndexError_Runtime;
   FlatSourceScope scope{context};
   int ret = bind_vector_source(source, context);
   return ret == 0 ? Index::search(query, search_param, result) : ret;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int FlatIndex::open(const std::string &file_path,
                     StorageOptions storage_options) {
+  if (is_open_) return core::IndexError_NoReady;
   // Restore the persisted encoding while keeping the configured structural
   // meta for the streamer's open-time compatibility checks.
   if (turbo_quantizer_ != nullptr) {

@@ -36,6 +36,7 @@
 #include "zvec/core/framework/index_provider.h"
 #endif
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/core/framework/index_factory.h>
@@ -106,7 +107,12 @@ class CountingHnswStreamer : public zvec::core::HnswStreamer {
                                                 scores);
   }
 
+  int flush(uint64_t checkpoint) override {
+    return flush_error ? flush_error : HnswStreamer::flush(checkpoint);
+  }
+
   mutable size_t candidate_search_count{0};
+  int flush_error{0};
 };
 
 class CountingHNSWIndex : public HNSWIndex {
@@ -118,6 +124,11 @@ class CountingHNSWIndex : public HNSWIndex {
   size_t candidate_search_count() const {
     return std::static_pointer_cast<CountingHnswStreamer>(streamer_)
         ->candidate_search_count;
+  }
+
+  void set_flush_error(int error) {
+    std::static_pointer_cast<CountingHnswStreamer>(streamer_)->flush_error =
+        error;
   }
 
  protected:
@@ -135,6 +146,37 @@ class CountingHNSWIndex : public HNSWIndex {
 };
 
 }  // namespace
+
+TEST(IndexInterface, FailedCloseFlushLeavesIndexOpenForRetry) {
+  constexpr uint32_t kDimension = 16;
+  const std::string path = "index_close_flush_retry.index";
+  zvec::test_util::RemoveTestFiles(path);
+  auto remove = zvec::ailego::ScopeGuard::Make(
+      [&] { zvec::test_util::RemoveTestFiles(path); });
+  const auto param = HNSWIndexParamBuilder()
+                         .with_metric_type(MetricType::kL2sq)
+                         .with_data_type(DataType::DT_FP32)
+                         .with_dimension(kDimension)
+                         .build();
+  CountingHNSWIndex index;
+  ASSERT_EQ(0, index.init_for_test(*param));
+  ASSERT_EQ(0, index.open(path, {StorageOptions::StorageType::kMMAP, true}));
+  std::array<float, kDimension> row{};
+  VectorData data{DenseVector{row.data()}};
+  ASSERT_EQ(0, index.add(data, 0));
+
+  index.set_flush_error(zvec::core::IndexError_WriteData);
+  ASSERT_EQ(zvec::core::IndexError_WriteData, index.close());
+  VectorDataBuffer fetched;
+  ASSERT_EQ(0, index.fetch(0, &fetched));
+
+  index.set_flush_error(0);
+  ASSERT_EQ(0, index.close());
+  ASSERT_EQ(
+      0, index.open(path, {StorageOptions::StorageType::kMMAP, false, true}));
+  EXPECT_EQ(0, index.fetch(0, &fetched));
+  EXPECT_EQ(0, index.close());
+}
 
 TEST(IndexInterface, GraphRefineKeepsLegacyDefaultCandidateCount) {
   constexpr uint32_t kTopk = 10;
@@ -189,6 +231,43 @@ TEST(IndexInterface, IndexTypeKeepsExistingValues) {
   EXPECT_EQ(5, static_cast<int>(IndexType::kDiskAnn));
   EXPECT_EQ(6, static_cast<int>(IndexType::kVamana));
   EXPECT_EQ(7, static_cast<int>(IndexType::kIVFRabitq));
+}
+
+TEST(IndexInterface, IvfCanCreateAfterAbandoningUntrainedIndex) {
+  constexpr uint32_t kDimension = 16;
+  const std::string abandoned = "ivf_abandoned_build.index";
+  const std::string fresh = "ivf_fresh_build.index";
+  auto remove = zvec::ailego::ScopeGuard::Make([&] {
+    zvec::test_util::RemoveTestFiles(abandoned + "*");
+    zvec::test_util::RemoveTestFiles(fresh + "*");
+  });
+  const auto param = IVFIndexParamBuilder()
+                         .with_metric_type(MetricType::kL2sq)
+                         .with_data_type(DataType::DT_FP32)
+                         .with_dimension(kDimension)
+                         .with_n_list(1)
+                         .build();
+  auto index = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_NE(nullptr, index);
+  const StorageOptions create{StorageOptions::StorageType::kMMAP, true};
+  std::array<float, kDimension> row{};
+  VectorData data{DenseVector{row.data()}};
+  ASSERT_EQ(0, index->open(abandoned, create));
+  ASSERT_EQ(0, index->add(data, 7));
+  ASSERT_EQ(0, index->close());
+
+  ASSERT_EQ(0, index->open(fresh, create));
+  ASSERT_FALSE(index->is_trained());
+  EXPECT_EQ(zvec::core::IndexError_NoReady, index->open(abandoned, create));
+  ASSERT_EQ(0, index->add(data, 0));
+  ASSERT_EQ(0, index->train());
+  EXPECT_EQ(1u, index->get_doc_count());
+  ASSERT_EQ(0, index->close());
+
+  ASSERT_EQ(0, index->open(abandoned, create));
+  ASSERT_FALSE(index->is_trained());
+  ASSERT_EQ(0, index->add(data, 0));
+  ASSERT_EQ(0, index->close());
 }
 
 #if DISKANN_SUPPORTED
@@ -294,6 +373,12 @@ TEST(IndexInterface, IvfRabitqSearchIgnoresFetchVector) {
     EXPECT_EQ(nullptr, doc.vector());
   }
 
+  ASSERT_EQ(0, index->close());
+  ASSERT_EQ(0, index->open(index_name,
+                           {StorageOptions::StorageType::kMMAP, false, true}));
+  ASSERT_EQ(0, index->search(vector_data, query_param, &result));
+  ASSERT_EQ(1u, result.doc_list_.size());
+  EXPECT_EQ(0u, result.doc_list_[0].key());
   ASSERT_EQ(0, index->close());
   zvec::test_util::RemoveTestFiles(index_name);
 }
@@ -997,13 +1082,15 @@ TEST(IndexInterface, IvfBufferPoolDefersWarmupUntilReads) {
   auto verify_lazy_reads = [&](const Index::Pointer &index) {
     const auto cached_payload_bytes = [&]() {
       return memory_pool.stats().page_used +
-             zvec::ailego::MemoryLimitPool::get_instance().evictable_cache_used();
+             zvec::ailego::MemoryLimitPool::get_instance()
+                 .evictable_cache_used();
     };
     const size_t open_cache_bytes = cached_payload_bytes();
     ASSERT_GT(memory_pool.metadata_used(), 0u);
     // Count both page and Chunk caches, excluding prepaid execution workspace.
-    // Opening may read headers and centroids, but not all posting-list payloads.
-    // The pool fits the entire index, so eviction cannot hide eager warmup.
+    // Opening may read headers and centroids, but not all posting-list
+    // payloads. The pool fits the entire index, so eviction cannot hide eager
+    // warmup.
     ASSERT_LT(open_cache_bytes, kVectorBytes / 2);
 
     for (uint32_t id : {0U, 127U, 511U, 895U, 1023U}) {
@@ -1259,6 +1346,19 @@ TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
                                           false, true}));
     auto close =
         zvec::ailego::ScopeGuard::Make([&] { EXPECT_EQ(0, index->close()); });
+    {
+      // Leave room to register the thread but less than the three aligned
+      // rows DiskANN needs for its query context.
+      constexpr size_t kContextSlack = 512;
+      ASSERT_GT(memory_pool.capacity() - memory_pool.used(), kContextSlack);
+      zvec::ailego::MemoryReservation pressure;
+      pressure.add(memory_pool.capacity() - memory_pool.used() - kContextSlack);
+      SearchResult result;
+      EXPECT_EQ(zvec::core::IndexError_NoMemory,
+                index->search(VectorData{DenseVector{values.data()}},
+                              query_param, &result));
+      EXPECT_TRUE(result.doc_list_.empty());
+    }
     for (size_t i = 0; i < baseline.size(); ++i) {
       ASSERT_NO_FATAL_FAILURE(query(index, i, &baseline[i]));
     }

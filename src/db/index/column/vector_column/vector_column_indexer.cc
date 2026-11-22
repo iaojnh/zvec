@@ -148,6 +148,22 @@ Status VectorColumnIndexer::insert(
   return Status::OK();
 }
 
+Status VectorColumnIndexer::prepare_insert(
+    const vector_column_params::VectorData &vector_data, uint32_t doc_id,
+    std::unique_ptr<PreparedAdd> *out) {
+  if (!index) return Status::InvalidArgument("Index not opened");
+  auto engine_vector_data =
+      ProximaEngineHelper::convert_to_engine_vector(vector_data, is_sparse_);
+  if (!engine_vector_data) return engine_vector_data.error();
+  const int ret = index->prepare_add(*engine_vector_data, doc_id, out);
+  if (ret == 0) return Status::OK();
+  return Status(ret == core::IndexError_NoMemory
+                    ? StatusCode::RESOURCE_EXHAUSTED
+                    : StatusCode::INTERNAL_ERROR,
+                std::string("Failed to prepare vector insert: ") +
+                    core::IndexError::What(ret));
+}
+
 Result<vector_column_params::VectorDataBuffer> VectorColumnIndexer::fetch(
     uint32_t doc_id) const {
   if (index == nullptr) {

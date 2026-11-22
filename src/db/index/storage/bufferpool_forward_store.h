@@ -17,13 +17,13 @@
 #include <optional>
 #include <string>
 #include <vector>
-#include <arrow/util/span.h>
 #include <arrow/api.h>
 #include <arrow/compute/api.h>
 #include <arrow/filesystem/filesystem.h>
 #include <arrow/io/api.h>
 #include <arrow/ipc/reader.h>
 #include <arrow/util/async_generator.h>
+#include <arrow/util/span.h>
 #include <parquet/arrow/reader.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/db/status.h>
@@ -95,11 +95,10 @@ class BufferPoolForwardStore
   // Supported scalar and array fields are copied into an admitted Doc.
   // Unsupported schemas retain the ordinary Arrow materialization path.
   // Only a caller with a validated row mapping may supply known_doc_id.
-  std::shared_ptr<Doc> fetch_doc(const std::vector<std::string> &columns,
-                                 const std::shared_ptr<arrow::Schema> &schema,
-                                 int index,
-                                 std::optional<uint64_t> known_doc_id =
-                                     std::nullopt);
+  std::shared_ptr<Doc> fetch_doc(
+      const std::vector<std::string> &columns,
+      const std::shared_ptr<arrow::Schema> &schema, int index,
+      std::optional<uint64_t> known_doc_id = std::nullopt);
 
   /// Scan specified columns from the data source
   /// \param columns The list of column names to scan

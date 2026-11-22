@@ -75,12 +75,12 @@ int FhtRotator::init_impl(size_t dim) {
 
 void FhtRotator::rotate(const float *in, float *out) const {
   kernels_.rotate(in, out, dimension_, dimension_,
-                   const_cast<turbo::FhtCtx *>(context()));
+                  const_cast<turbo::FhtCtx *>(context()));
 }
 
 void FhtRotator::unrotate(const float *in, float *out) const {
   kernels_.unrotate(in, out, dimension_, dimension_,
-                     const_cast<turbo::FhtCtx *>(context()));
+                    const_cast<turbo::FhtCtx *>(context()));
 }
 
 RotatorType FhtRotator::rotator_type() const {

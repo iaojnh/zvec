@@ -16,8 +16,9 @@
 #include <array>
 #include <cmath>
 #include <limits>
-#include <thread>
+#include <map>
 #include <new>
+#include <thread>
 #include <magic_enum/magic_enum.hpp>
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/core/framework/index_error.h>
@@ -212,84 +213,87 @@ int CreateReformerFromConverterMeta(
 
 }  // namespace
 
-struct CachedIndexContext {
-  Index *owner;
-  std::thread::id thread;
-  core::IndexContext::Pointer context;
-  size_t users{0};
+struct IndexContextRegistry {
+  struct Slot {
+    core::IndexContext::Pointer context;
+    size_t users{0};
+  };
+  using Entry = std::pair<const std::thread::id, Slot>;
+  std::map<std::thread::id, Slot, std::less<std::thread::id>,
+           ailego::BudgetedAllocator<Entry>>
+      slots;
+  std::mutex mutex;
+
+  void erase_idle(const std::thread::id &thread) {
+    auto entry = slots.find(thread);
+    if (entry != slots.end() && entry->second.users == 0) slots.erase(entry);
+  }
+
+  void clear() {
+    std::lock_guard<std::mutex> lock(mutex);
+    slots.clear();
+  }
 };
 
 namespace {
 struct ThreadContextRef {
-  std::weak_ptr<CachedIndexContext> slot;
+  std::weak_ptr<IndexContextRegistry> registry;
   ~ThreadContextRef() {
-    // A worker exiting must not leave its query workspace on a live index.
-    if (auto current = slot.lock()) current->context.reset();
+    auto current = registry.lock();
+    if (current) erase_idle(*current);
+  }
+
+  static void erase_idle(IndexContextRegistry &current) {
+    std::lock_guard<std::mutex> lock(current.mutex);
+    current.erase_idle(std::this_thread::get_id());
   }
 };
 thread_local std::array<ThreadContextRef,
                         (magic_enum::enum_count<IndexType>() - 1) * 2>
     thread_context_refs;
+
+size_t context_index(IndexType type, bool sparse) {
+  return (magic_enum::enum_integer(type) - 1) * 2 + static_cast<size_t>(sparse);
+}
 }  // namespace
 
-Index::~Index() {
-  if (context_index_ < thread_context_refs.size()) {
-    auto &cached = thread_context_refs[context_index_].slot;
-    if (auto slot = cached.lock(); slot && slot->owner == this) cached.reset();
-  }
-}
+Index::Index() : contexts_(std::make_shared<IndexContextRegistry>()) {}
+
+Index::~Index() = default;
 
 bool Index::init_context() {
   return static_cast<bool>(acquire_context());
 }
 
 core::IndexContext::Pointer &Index::acquire_context(bool active) {
-  context_index_ = (magic_enum::enum_integer(param_.index_type) - 1) * 2 +
-                   static_cast<size_t>(is_sparse_);
-  {
-    auto &cached = thread_context_refs[context_index_].slot;
-    if (auto slot = cached.lock()) {
-      if (slot->owner == this && slot->context) {
-        slot->users += active;
-        return slot->context;
-      }
-      // Preserve the old per-thread/per-type bound: switching indexes drops
-      // the previous reader instead of keeping one workspace per collection.
-      if (slot->users == 0) slot->context.reset();
-    }
-    std::lock_guard<std::mutex> lock(contexts_mutex_);
-    const auto thread = std::this_thread::get_id();
-    for (auto &slot : contexts_) {
-      if (slot->thread == thread) {
-        if (!slot->context) slot->context = streamer_->create_context();
-        cached = slot;
-        slot->users += active;
-        return slot->context;
-      }
-    }
-    auto slot = std::allocate_shared<CachedIndexContext>(
-        ailego::BudgetedAllocator<CachedIndexContext>{});
-    slot->owner = this;
-    slot->thread = thread;
-    slot->context = streamer_->create_context();
-    slot->users += active;
-    contexts_.push_back(slot);
-    cached = slot;
-    return slot->context;
+  auto &cached =
+      thread_context_refs[context_index(param_.index_type, is_sparse_)];
+  if (auto current = cached.registry.lock(); current && current != contexts_) {
+    // Keep only the current index's idle context for this thread and type.
+    ThreadContextRef::erase_idle(*current);
   }
+  std::lock_guard<std::mutex> lock(contexts_->mutex);
+  auto &slot = contexts_->slots[std::this_thread::get_id()];
+  cached.registry = contexts_;
+  if (!slot.context && streamer_->create_context_with_status(slot.context) ==
+                           core::IndexError_NoMemory) {
+    contexts_->slots.erase(std::this_thread::get_id());
+    throw std::bad_alloc();
+  }
+  slot.users += active;
+  return slot.context;
 }
 
 void Index::release_context() {
-  std::lock_guard<std::mutex> lock(contexts_mutex_);
-  const auto thread = std::this_thread::get_id();
-  for (auto &slot : contexts_) {
-    if (slot->thread != thread) continue;
-    if (slot->users) --slot->users;
-    // A nested refiner may switch the thread cache to another index.
-    if (!slot->users && thread_context_refs[context_index_].slot.lock() != slot)
-      slot->context.reset();
-    return;
-  }
+  std::lock_guard<std::mutex> lock(contexts_->mutex);
+  auto entry = contexts_->slots.find(std::this_thread::get_id());
+  if (entry == contexts_->slots.end()) return;
+  if (entry->second.users) --entry->second.users;
+  auto &cached =
+      thread_context_refs[context_index(param_.index_type, is_sparse_)];
+  // A nested refiner may switch the thread cache to another index.
+  if (!entry->second.users && cached.registry.lock() != contexts_)
+    contexts_->slots.erase(entry);
 }
 
 int Index::train() {
@@ -604,10 +608,7 @@ int Index::open(const std::string &file_path,
   bool opened = false;
   AILEGO_DEFER([&] {
     if (!opened) {
-      {
-        std::lock_guard<std::mutex> lock(contexts_mutex_);
-        contexts_.clear();
-      }
+      contexts_->clear();
       if (reformer_) reformer_->unload();
       if (streamer_) streamer_->cleanup();
       if (storage_) storage_->close();
@@ -760,6 +761,21 @@ int Index::load_streamer() {
   return reformer_ ? reformer_->load(storage_) : 0;
 }
 
+int Index::reset_build_pipeline(const BaseIndexParam &param) {
+  // The previous file may have supplied trained quantizer parameters or an
+  // encoding different from the configured input. A new build starts from
+  // the original parameters, without holding parts of that previous pipeline.
+  builder_.reset();
+  streamer_.reset();
+  converter_.reset();
+  reformer_.reset();
+  metric_.reset();
+  turbo_quantizer_.reset();
+  pending_quantizer_training_ = false;
+  proxima_index_meta_ = core::IndexMeta{};
+  return init(param);
+}
+
 int Index::open_trained_storage(const std::string &path) try {
   bool loaded = false;
   AILEGO_DEFER([&] {
@@ -786,21 +802,22 @@ int Index::close() {
     return core::IndexError_Runtime;
   }
 
-  {
-    std::lock_guard<std::mutex> lock(contexts_mutex_);
-    decltype(contexts_)().swap(contexts_);
+  const bool abandon_build =
+      !is_trained_ && (pending_quantizer_training_ || buffered_input_ ||
+                       param_.index_type == IndexType::kIVF ||
+                       param_.index_type == IndexType::kIVFRabitq ||
+                       param_.index_type == IndexType::kDiskAnn);
+  // Release idle pages and workspaces before flush needs budget. If flush
+  // fails, the open index can recreate its query contexts on demand.
+  contexts_->clear();
+  if (!is_read_only_ && !abandon_build) {
+    const int ret = flush();
+    if (ret != 0) return ret;
   }
-  if (context_index_ < thread_context_refs.size()) {
-    auto &cached = thread_context_refs[context_index_].slot;
-    if (cached.expired()) cached.reset();
-  }
-  context_index_ = std::numeric_limits<size_t>::max();
+
   streamer_needs_init_ = true;
 
-  if (!is_trained_ &&
-      (pending_quantizer_training_ || buffered_input_ ||
-       param_.index_type == IndexType::kIVF ||
-       param_.index_type == IndexType::kIVFRabitq)) {
+  if (abandon_build) {
     // No final search index has been opened yet. Closing abandons the build;
     // drop builder readers first, then release input even if a holder still
     // references it. Failed train/dump alone deliberately retains this input.
@@ -816,12 +833,10 @@ int Index::close() {
     return cleanup_ret != 0 ? cleanup_ret : close_ret;
   }
 
-  const int flush_ret = is_read_only_ ? 0 : flush();
   const int cleanup_ret = streamer_->cleanup();
   if (reformer_) reformer_->unload();
   const int close_ret = storage_->close();
   is_open_ = false;
-  if (flush_ret != 0) return flush_ret;
   return cleanup_ret != 0 ? cleanup_ret : close_ret;
 }
 
@@ -838,13 +853,13 @@ int Index::flush() {
   }
 
   if (buffered_input_ && !is_trained_) return buffered_input_->flush();
-  if (ailego_unlikely(streamer_->flush(0) != 0)) {
+  if (const int ret = streamer_->flush(0); ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to flush streamer");
-    return core::IndexError_Runtime;
+    return ret;
   }
-  if (ailego_unlikely(storage_->flush() != 0)) {
+  if (const int ret = storage_->flush(); ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to flush storage");
-    return core::IndexError_Runtime;
+    return ret;
   }
   return 0;
 }
@@ -868,7 +883,21 @@ int Index::fetch(const uint32_t doc_id, VectorDataBuffer *vector_data_buffer) {
   return _dense_fetch(doc_id, vector_data_buffer);
 }
 
-int Index::add(const VectorData &vector_data, const uint32_t doc_id) try {
+int Index::add(const VectorData &vector_data, uint32_t doc_id) {
+  return add_impl(vector_data, doc_id, nullptr);
+}
+
+int Index::prepare_add(
+    const VectorData &vector_data, uint32_t doc_id,
+    std::unique_ptr<core::IndexStreamer::PreparedAdd> *prepared) {
+  if (!prepared) return core::IndexError_InvalidArgument;
+  prepared->reset();
+  return add_impl(vector_data, doc_id, prepared);
+}
+
+int Index::add_impl(
+    const VectorData &vector_data, uint32_t doc_id,
+    std::unique_ptr<core::IndexStreamer::PreparedAdd> *prepared) try {
   if (pending_quantizer_training_) return core::IndexError_NoReady;
   if (!is_open_) {
     LOG_ERROR("Index is not open");
@@ -890,9 +919,9 @@ int Index::add(const VectorData &vector_data, const uint32_t doc_id) try {
   AILEGO_DEFER([&] { context->reset(); });
   int ret = 0;
   if (is_sparse_) {
-    ret = _sparse_add(vector_data, doc_id, context);
+    ret = _sparse_add(vector_data, doc_id, context, prepared);
   } else {
-    ret = _dense_add(vector_data, doc_id, context);
+    ret = _dense_add(vector_data, doc_id, context, prepared);
   }
   return ret;
 } catch (const std::bad_alloc &) {
@@ -1015,10 +1044,11 @@ int Index::search(const VectorData &vector_data,
                                  sizeof(uint64_t));
       std::vector<std::vector<uint64_t>> keys(1);
       keys[0].reserve(coarse_topk);
-      if (_execute_dense_search(query, query_meta, search_param, context,
-                                &keys[0]) != 0) {
+      ret = _execute_dense_search(query, query_meta, search_param, context,
+                                  &keys[0]);
+      if (ret != 0) {
         LOG_ERROR("Failed to search");
-        return core::IndexError_Runtime;
+        return ret;
       }
       ret = reference_index->_refine_dense_candidates(vector_data, search_param,
                                                       keys, result);
@@ -1126,22 +1156,27 @@ int Index::_sparse_fetch(const uint32_t doc_id,
   return core::IndexError_NoMemory;
 }
 
-int Index::_dense_add(const VectorData &vector_data, const uint32_t doc_id,
-                      core::IndexContext::Pointer &context) {
+int Index::_dense_add(
+    const VectorData &vector_data, uint32_t doc_id,
+    core::IndexContext::Pointer &context,
+    std::unique_ptr<core::IndexStreamer::PreparedAdd> *prepared) {
   if (!std::holds_alternative<DenseVector>(vector_data.vector)) {
     LOG_ERROR("Invalid vector data");
     return core::IndexError_Runtime;
   }
   const DenseVector &dense_vector = std::get<DenseVector>(vector_data.vector);
+  const auto write = [&](const void *data, const core::IndexQueryMeta &meta) {
+    return prepared ? streamer_->prepare_add_with_id(doc_id, data, meta,
+                                                     context, prepared)
+                    : streamer_->add_with_id_impl(doc_id, data, meta, context);
+  };
   if (turbo_quantizer_ != nullptr) {
     const size_t encoded_bytes =
         turbo_quantizer_->quantized_datapoint_vector_length();
-    auto *new_vector = context->mutable_features(
-        encoded_bytes);
+    auto *new_vector = context->mutable_features(encoded_bytes);
     new_vector->resize(encoded_bytes);
     turbo_quantizer_->quantize_data(dense_vector.data, new_vector->data());
-    const int ret = streamer_->add_with_id_impl(
-        doc_id, new_vector->data(), streamer_vector_meta_, context);
+    const int ret = write(new_vector->data(), streamer_vector_meta_);
     if (ret != 0) {
       LOG_ERROR("Failed to add vector");
       return ret;
@@ -1158,34 +1193,44 @@ int Index::_dense_add(const VectorData &vector_data, const uint32_t doc_id,
                              &new_meta);
     if (ret != 0) {
       LOG_ERROR("Failed to convert vector");
-      return core::IndexError_Runtime;
+      return prepared ? ret : core::IndexError_Runtime;
     }
-    ret = streamer_->add_with_id_impl(doc_id, new_vector->data(), new_meta,
-                                      context);
+    ret = write(new_vector->data(), new_meta);
     if (ret != 0) {
       LOG_ERROR("Failed to add vector");
-      return core::IndexError_Runtime;
+      return prepared ? ret : core::IndexError_Runtime;
     }
   } else {
-    int ret = streamer_->add_with_id_impl(doc_id, dense_vector.data,
-                                          input_vector_meta_, context);
+    int ret = write(dense_vector.data, input_vector_meta_);
     if (ret != 0) {
       LOG_ERROR("Failed to add vector");
-      return core::IndexError_Runtime;
+      return prepared ? ret : core::IndexError_Runtime;
     }
   }
   return 0;
 }
 
 
-int Index::_sparse_add(const VectorData &vector_data, const uint32_t doc_id,
-                       core::IndexContext::Pointer &context) {
+int Index::_sparse_add(
+    const VectorData &vector_data, uint32_t doc_id,
+    core::IndexContext::Pointer &context,
+    std::unique_ptr<core::IndexStreamer::PreparedAdd> *prepared) {
   if (!std::holds_alternative<SparseVector>(vector_data.vector)) {
     LOG_ERROR("Invalid vector data");
     return core::IndexError_Runtime;
   }
   const SparseVector &sparse_vector =
       std::get<SparseVector>(vector_data.vector);
+
+  const auto write = [&](const void *values, const core::IndexQueryMeta &meta) {
+    return prepared
+               ? streamer_->prepare_add_with_id(doc_id, sparse_vector.count,
+                                                sparse_vector.get_indices(),
+                                                values, meta, context, prepared)
+               : streamer_->add_with_id_impl(doc_id, sparse_vector.count,
+                                             sparse_vector.get_indices(),
+                                             values, meta, context);
+  };
 
   if (reformer_ != nullptr) {
     ailego::BudgetedStringWorkspace sparse_workspace;
@@ -1200,22 +1245,18 @@ int Index::_sparse_add(const VectorData &vector_data, const uint32_t doc_id,
                              &converted_sparse_values_buffer, &new_meta);
     if (ret != 0) {
       LOG_ERROR("Failed to convert vector");
-      return core::IndexError_Runtime;
+      return prepared ? ret : core::IndexError_Runtime;
     }
-    ret = streamer_->add_with_id_impl(
-        doc_id, sparse_vector.count, sparse_vector.get_indices(),
-        converted_sparse_values_buffer.data(), new_meta, context);
+    ret = write(converted_sparse_values_buffer.data(), new_meta);
     if (ret != 0) {
       LOG_ERROR("Failed to add vector");
-      return core::IndexError_Runtime;
+      return prepared ? ret : core::IndexError_Runtime;
     }
   } else {
-    int ret = streamer_->add_with_id_impl(
-        doc_id, sparse_vector.count, sparse_vector.get_indices(),
-        sparse_vector.get_values(), input_vector_meta_, context);
+    int ret = write(sparse_vector.get_values(), input_vector_meta_);
     if (ret != 0) {
       LOG_ERROR("Failed to add vector");
-      return core::IndexError_Runtime;
+      return prepared ? ret : core::IndexError_Runtime;
     }
   }
   return 0;
@@ -1733,11 +1774,10 @@ int Index::merge(const std::vector<Index::Pointer> &indexes,
                      effective_write_concurrency);
   // Only buffered storage needs a pageable rebuild copy. Keep mmap's
   // existing borrowing and graph construction paths.
-  reducer_params.set(
-      core::PARAM_MIXED_STREAMER_REDUCER_SPOOL_VECTORS,
-      storage_ && (storage_->name() == "BufferStorage" ||
-                   storage_->name() == "ChunkReadStorage" ||
-                   storage_->name() == "BufferReadStorage"));
+  reducer_params.set(core::PARAM_MIXED_STREAMER_REDUCER_SPOOL_VECTORS,
+                     storage_ && (storage_->name() == "BufferStorage" ||
+                                  storage_->name() == "ChunkReadStorage" ||
+                                  storage_->name() == "BufferReadStorage"));
   if (reducer->init(reducer_params) != 0) {
     LOG_ERROR("Failed to init reducer");
     return core::IndexError_Runtime;

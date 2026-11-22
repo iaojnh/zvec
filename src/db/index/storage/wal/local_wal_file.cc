@@ -110,11 +110,12 @@ int LocalWalFile::open(const WalOptions &wal_option) {
     }
 
     // Appends start at the end; prepare_for_read() rewinds readers.
-    file_.seek(0, ailego::File::Origin::End);
+    if (!file_.seek(0, ailego::File::Origin::End)) return -1;
   }
 
   max_docs_wal_flush_ = wal_option.max_docs_wal_flush;
   read_only_ = wal_option.read_only;
+  append_failed_ = false;
   opened_ = true;
 
   WLOG_INFO("Wal open success. create_new[%d]", wal_option.create_new);
@@ -177,6 +178,9 @@ int LocalWalFile::write_record(std::string_view data, uint32_t crc) {
   int ret = -1;
 
   std::lock_guard<std::mutex> lock(file_mutex_);
+  if (append_failed_) return -1;
+  const auto record_offset = file_.offset();
+  if (record_offset < 0) return -1;
   do {
     write_size = file_.write(&length, LENGTH_SIZE);
     if (write_size != LENGTH_SIZE) {
@@ -202,6 +206,11 @@ int LocalWalFile::write_record(std::string_view data, uint32_t crc) {
     docs_count_++;
   } while (false);
 
+  if (ret < 0 && (!file_.truncate(record_offset) ||
+                  !file_.seek(record_offset, ailego::File::Origin::Begin))) {
+    // Further successful records must not follow an unrepaired partial write.
+    append_failed_ = true;
+  }
   return ret;
 }
 
@@ -212,16 +221,21 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
   const auto record_offset = file_.offset();
   if (record_offset < 0) return -1;
   int read_size = 0;
-  std::string err_msg;
   int ret = -1;
 
   // A crash can leave any prefix of the last record. Only a short read at
   // the physical EOF is a recoverable tail; invalid lengths and bad CRCs
   // in complete records must still be reported as corruption.
-  const auto truncated_tail = [&] {
+  const auto repair_truncated_tail = [&] {
     const auto offset = file_.offset();
-    return read_size >= 0 && offset >= 0 &&
-           static_cast<size_t>(offset) == file_.size();
+    if (read_size < 0 || offset < 0 ||
+        static_cast<size_t>(offset) != file_.size())
+      return false;
+    // Recovery reopens this same WAL for append. Remove the incomplete tail
+    // before acknowledging EOF so future appends remain recoverable.
+    return read_only_ ||
+           (file_.truncate(record_offset) &&
+            file_.seek(record_offset, ailego::File::Origin::Begin));
   };
 
   do {
@@ -234,7 +248,7 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
     }
 
     if (read_size != LENGTH_SIZE) {
-      if (truncated_tail()) {
+      if (repair_truncated_tail()) {
         ret = 0;
         break;
       }
@@ -245,7 +259,7 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
 
     read_size = file_.read(reinterpret_cast<void *>(&record.crc_), CRC_SIZE);
     if (read_size != CRC_SIZE) {
-      if (truncated_tail()) {
+      if (repair_truncated_tail()) {
         ret = 0;
         break;
       }
@@ -271,7 +285,7 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
     read_size = file_.read((void *)const_cast<char *>(record.content_.data()),
                            record.length_);
     if (read_size != (int)record.length_) {
-      if (truncated_tail()) {
+      if (repair_truncated_tail()) {
         ret = 0;
         break;
       }

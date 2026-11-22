@@ -32,6 +32,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/buffer/retained_block_allocator.h>
 #include <zvec/ailego/io/io_backend.h>
 #include <zvec/export.h>
@@ -78,10 +79,10 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
   static_assert(sizeof(Entry) + sizeof(MetadataEntry) == 40,
                 "VectorPageTable metadata must remain 40 bytes per page");
   // Immutable files need neither arbitrary write offsets nor dirty/writeback
-  // state. The table's 128M-entry maximum leaves room for both 32-bit sentinels.
+  // state. The table's 128M-entry maximum leaves room for both 32-bit
+  // sentinels.
   struct ReadOnlyMetadataEntry {
-    std::atomic<uint32_t> next_loaded{
-        std::numeric_limits<uint32_t>::max() - 1};
+    std::atomic<uint32_t> next_loaded{std::numeric_limits<uint32_t>::max() - 1};
     std::atomic<uint32_t> admission_state{0};
   };
   static_assert(sizeof(Entry) + sizeof(ReadOnlyMetadataEntry) == 24,
@@ -120,7 +121,8 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
     for (size_t i = 0; i < cnt; ++i) {
       RetainedMetadataDeleter<Entry>{}(segments_[i]);
       if (read_only_)
-        RetainedMetadataDeleter<ReadOnlyMetadataEntry>{}(read_only_segments_[i]);
+        RetainedMetadataDeleter<ReadOnlyMetadataEntry>{}(
+            read_only_segments_[i]);
       else
         RetainedMetadataDeleter<MetadataEntry>{}(metadata_segments_[i]);
     }
@@ -252,7 +254,7 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
   bool is_block_dirty(block_id_t block_id) const {
     assert(block_id < entry_num_.load(std::memory_order_acquire));
     return !read_only_ &&
-        metadata_entry_at(block_id).is_dirty.load(std::memory_order_relaxed);
+           metadata_entry_at(block_id).is_dirty.load(std::memory_order_relaxed);
   }
 
   bool try_mark_writeback_pending(block_id_t block_id) {
@@ -480,8 +482,8 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
   }
   size_t next_loaded_block(size_t idx) const {
     if (!read_only_) return metadata_entry_at(idx).next_loaded;
-    const auto next = read_only_entry_at(idx).next_loaded.load(
-        std::memory_order_relaxed);
+    const auto next =
+        read_only_entry_at(idx).next_loaded.load(std::memory_order_relaxed);
     return next == kReadOnlyInvalidLoaded ? kInvalidLoadedBlock : next;
   }
   void register_loaded_block(block_id_t block_id);
@@ -772,6 +774,40 @@ class ZVEC_AILEGO_API VecBufferPool {
   //! Admission failure leaves all destination bytes unchanged.
   int write_fragments(const VecBufferWriteFragment *fragments, size_t count);
 
+  class PreparedWritePages {
+   public:
+    PreparedWritePages() = default;
+    PreparedWritePages(const PreparedWritePages &) = delete;
+    PreparedWritePages &operator=(const PreparedWritePages &) = delete;
+    ~PreparedWritePages() {
+      reset();
+    }
+    void reset() noexcept {
+      if (pool_) {
+        for (size_t i = 0; i < pages_.size(); ++i) {
+          if (pages_[i]) pool_->page_table_.release_block(ids_[i]);
+        }
+      }
+      pool_ = nullptr;
+      ids_.clear();
+      pages_.clear();
+    }
+
+   private:
+    friend class VecBufferPool;
+    VecBufferPool *pool_{nullptr};
+    std::vector<block_id_t, BudgetedAllocator<block_id_t>> ids_;
+    std::vector<char *, BudgetedAllocator<char *>> pages_;
+  };
+
+  // The live pool must outlast the pin set. Apply the same validated
+  // fragments at commit, with no further allocation or file reads.
+  PageWriteStatus prepare_write_fragments(const VecBufferWriteFragment *writes,
+                                          size_t count,
+                                          PreparedWritePages &pins);
+  void commit_write_fragments(const VecBufferWriteFragment *writes,
+                              size_t count, PreparedWritePages &pins) noexcept;
+
   //! Write metadata without cache admission.
   int write_meta(size_t offset, size_t length, const char *buffer);
 
@@ -813,7 +849,13 @@ class ZVEC_AILEGO_API VecBufferPool {
   //! Sequentially preload pages into the pool until pool is full.
   void warmup();
 
-  enum class PrepareStatus { kSkipped, kComplete, kPressure, kBusy, kReadError };
+  enum class PrepareStatus {
+    kSkipped,
+    kComplete,
+    kPressure,
+    kBusy,
+    kReadError
+  };
   struct PrepareResult {
     PrepareStatus status{PrepareStatus::kSkipped};
     size_t pages_loaded{0};
@@ -823,7 +865,7 @@ class ZVEC_AILEGO_API VecBufferPool {
   //! Never reclaim other pages or wait for space. Concurrent preparations
   //! serialize opportunistically; foreground reads keep their normal policy.
   PrepareResult prepare_pages_if_fits(block_id_t first_page, size_t page_count,
-                                     uint8_t priority = kHighPriority);
+                                      uint8_t priority = kHighPriority);
 
   void prefetch_pages(block_id_t first_page, size_t page_count,
                       uint8_t priority = kLowPriority);
@@ -871,8 +913,21 @@ class ZVEC_AILEGO_API VecBufferPool {
                        bool *allocation_failed);
   PageWriteStatus write_range_status(size_t file_offset, size_t length,
                                      const char *src);
-  PageWriteStatus write_fragments_status(const VecBufferWriteFragment *fragments,
-                                         size_t count);
+  PageWriteStatus write_fragments_status(
+      const VecBufferWriteFragment *fragments, size_t count);
+  struct WriteFragmentLayout {
+    block_id_t page_id{0};
+    bool has_data{false};
+    bool single_page{true};
+  };
+  bool validate_write_fragments(const VecBufferWriteFragment *writes,
+                                size_t count,
+                                WriteFragmentLayout &layout) const;
+  PageWriteStatus pin_write_fragments(const VecBufferWriteFragment *writes,
+                                      size_t count, PreparedWritePages &pins);
+  void write_pinned_fragments(const VecBufferWriteFragment *writes,
+                              size_t count, const block_id_t *ids,
+                              char *const *pages, size_t page_count) noexcept;
   bool acquire_pages_impl(const block_id_t *page_ids, size_t count,
                           char **pages, int retry,
                           bool *allocation_failed = nullptr);
@@ -1018,8 +1073,8 @@ class ZVEC_AILEGO_API VecBufferPoolHandle {
                                      const char *src);
 
   int write_fragments(const VecBufferWriteFragment *fragments, size_t count);
-  PageWriteStatus write_fragments_status(const VecBufferWriteFragment *fragments,
-                                         size_t count);
+  PageWriteStatus write_fragments_status(
+      const VecBufferWriteFragment *fragments, size_t count);
 
   int write_meta(size_t offset, size_t length, const char *buffer);
 

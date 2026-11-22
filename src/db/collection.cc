@@ -580,9 +580,8 @@ Status CollectionImpl::destroy() {
 Status CollectionImpl::flush() {
   CHECK_COLLECTION_READONLY_RETURN_STATUS;
 
-  // The exclusive schema lock also excludes all readers, which the writing
-  // segment's flush() relies on (it runs finish_memory_components() without
-  // the segment lock).
+  // Exclude collection operations while flushing the writing segment and
+  // ending its active write-buffer lease.
   std::lock_guard lock(schema_handle_mtx_);
   CHECK_DESTROY_RETURN_STATUS(destroyed_, false);
   CHECK_CLOSED_RETURN_STATUS(closed_, false);
@@ -1788,19 +1787,11 @@ Status CollectionImpl::switch_to_new_segment_for_writing(
     return flush_unsafe();
   }
 
-  auto s = writing_segment_->dump();
+  // Release the previous block's writer memory without sealing the segment.
+  // Creating the new segment can refuse admission and must be retryable.
+  auto s = flush_unsafe();
   CHECK_RETURN_STATUS(s);
 
-  // The new writer is empty. End the active lease, but preserve the shared
-  // backing allowance: malloc may retain the old writer's freed pages while
-  // index building admits new cache pages.
-  write_buffer_reservation_.release();
-
-  s = segment_manager_->add_segment(writing_segment_);
-  CHECK_RETURN_STATUS(s);
-
-  // when create new segment, segment meta should create a first new block
-  // meta
   auto new_segment = Segment::CreateAndOpen(
       path_, schema == nullptr ? *schema_ : *schema, allocate_segment_id(),
       writing_segment_->meta()->max_doc_id() + 1, id_map_, delete_store_,
@@ -1809,6 +1800,15 @@ Status CollectionImpl::switch_to_new_segment_for_writing(
   if (!new_segment) {
     return new_segment.error();
   }
+  bool keep_replacement = false;
+  AILEGO_DEFER([&] {
+    if (!keep_replacement) (void)new_segment.value()->destroy();
+  });
+
+  s = writing_segment_->dump();
+  CHECK_RETURN_STATUS(s);
+  s = segment_manager_->add_segment(writing_segment_);
+  CHECK_RETURN_STATUS(s);
 
   Version version = version_manager_->get_current_version();
   auto writing_segment_meta = writing_segment_->meta();
@@ -1817,6 +1817,7 @@ Status CollectionImpl::switch_to_new_segment_for_writing(
   CHECK_RETURN_STATUS(s);
 
   writing_segment_ = new_segment.value();
+  keep_replacement = true;
   version.reset_writing_segment_meta(writing_segment_->meta());
   version.set_next_segment_id(segment_id_allocator_.load());
 
@@ -2264,10 +2265,31 @@ Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const
     return tl::make_unexpected(s);
   }
 
-  // Convert each SubQuery to a SearchQuery and validate.
-  // Built-in fusion only needs PKs and scores. Custom callbacks retain the
-  // documented full-document contract.
+  // Late fetch can reproduce a simple forward projection. Defer wildcard
+  // expansion, duplicate/invalid field handling, and explicit vector fields
+  // to the SQL planner, which owns those projection semantics.
+  bool simple_projection = true;
+  if (query.output_fields) {
+    const auto &fields = *query.output_fields;
+    for (auto it = fields.begin(); it != fields.end(); ++it) {
+      if (!schema_->get_forward_field(*it) ||
+          std::find(fields.begin(), it, *it) != it) {
+        simple_projection = false;
+        break;
+      }
+    }
+  }
+  // FTS recall has scalar output. Keep its SQL projection when the caller
+  // asks to include vectors, even if another route in the query is vector.
+  const bool fts_with_vectors =
+      query.include_vector &&
+      std::any_of(query.queries.begin(), query.queries.end(),
+                  [](const SubQuery &sub) {
+                    return sub.target_.get_fts_clause() != nullptr;
+                  });
+  // Built-in fusion only needs PKs and scores. Custom callbacks receive Docs.
   const bool late_fetch =
+      simple_projection && !fts_with_vectors &&
       !std::holds_alternative<reranker::CallbackParams>(query.rerank);
   const std::optional<std::vector<std::string>> no_fields{std::in_place};
   const auto &selected = late_fetch ? no_fields : query.output_fields;

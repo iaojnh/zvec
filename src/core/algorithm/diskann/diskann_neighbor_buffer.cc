@@ -129,7 +129,8 @@ struct DiskAnnNeighborPool::Chunk {
   static void destroy(Chunk *chunk) {
     const size_t charge = chunk->charged_bytes;
     delete chunk;
-    if (charge) ailego::MemoryLimitPool::get_instance().release_external(charge);
+    if (charge)
+      ailego::MemoryLimitPool::get_instance().release_external(charge);
   }
 
   DiskAnnNeighborBuffer buffer;

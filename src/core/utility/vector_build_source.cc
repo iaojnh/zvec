@@ -63,7 +63,7 @@ class VectorBuildSource::SpoolReader : public OrdinalAccessHolder::Reader {
         const size_t bytes = sizeof(uint64_t) + source_->element_bytes_;
         if (source_->segments_[chunk]->fetch(word_offset * sizeof(uint64_t),
                                              scratch_.data(), bytes) != bytes) {
-          return IndexError_ReadData;
+          return source_->segments_[chunk]->read_error();
         }
         record = scratch_.data();
       } else {
@@ -189,7 +189,7 @@ int VectorBuildSource::append(uint64_t key, const void *data) {
     if (segment->write(offset, &key, sizeof(key)) != sizeof(key) ||
         segment->write(offset + sizeof(key), data, element_bytes_) !=
             element_bytes_) {
-      return IndexError_WriteData;
+      return segment->write_error();
     }
   } else {
     if (chunk == memory_chunks_.size())

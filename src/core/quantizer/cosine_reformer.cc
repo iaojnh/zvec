@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <memory>
-#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <turbo/norm/norm2_matrix.h>
 #include <turbo/norm/normalizer.h>
 #include <turbo/quantizer/entropy_integer_quantizer/integer_quantizer.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/turbo/turbo.h>

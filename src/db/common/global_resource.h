@@ -108,15 +108,16 @@ class GlobalResource : public ailego::Singleton<GlobalResource> {
  private:
   friend class GlobalConfig;
 
-  int initialize(uint64_t memory_limit_bytes, uint32_t query_thread_count,
-                 bool query_thread_binding, uint32_t optimize_thread_count,
-                 bool optimize_thread_binding,
-                 bool preserve_existing_pool = false);
+  // Explicit init publishes the prepared resources with its config snapshot.
+  int prepare(uint64_t memory_limit_bytes, uint32_t query_thread_count,
+              bool query_thread_binding, uint32_t optimize_thread_count,
+              bool optimize_thread_binding);
   int initialize_locked(uint64_t memory_limit_bytes,
                         uint32_t query_thread_count, bool query_thread_binding,
                         uint32_t optimize_thread_count,
                         bool optimize_thread_binding,
                         bool preserve_existing_pool);
+  void log_initialized() const noexcept;
 
   std::atomic<bool> initialized_{false};
   std::mutex initialization_mutex_;

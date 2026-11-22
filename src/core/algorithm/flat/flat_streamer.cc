@@ -13,8 +13,8 @@
 // limitations under the License.
 
 #include "flat_streamer.h"
-#include <ailego/pattern/scope_guard.h>
 #include <limits>
+#include <ailego/pattern/scope_guard.h>
 #include <zvec/core/framework/index_factory.h>
 #include "utility/group_candidate_collector.h"
 #include "flat_streamer_context.h"
@@ -392,6 +392,24 @@ int FlatStreamer<BATCH_SIZE>::add_with_id_impl(uint32_t id, const void *query,
 }
 
 template <size_t BATCH_SIZE>
+int FlatStreamer<BATCH_SIZE>::prepare_add_with_id(
+    uint32_t id, const void *query, const IndexQueryMeta &qmeta,
+    Context::Pointer &context, std::unique_ptr<PreparedAdd> *out) {
+  if (state_ != STATE_OPENED || use_external_vector_)
+    return IndexError_Unsupported;
+  if (!query || qmeta.dimension() != meta_.dimension() ||
+      qmeta.data_type() != meta_.data_type() ||
+      qmeta.element_size() != meta_.element_size())
+    return IndexError_InvalidArgument;
+  if (!dynamic_cast<FlatStreamerContext<BATCH_SIZE> *>(context.get()))
+    return IndexError_Cast;
+  READ_LOCK_GUARD_DEFER(dump_mutex_, dump_lock);
+  if (!dump_lock.try_lock()) return IndexError_Unsupported;
+  return entity_->prepare_add_vector_with_id(id, query, qmeta.element_size(),
+                                             out);
+}
+
+template <size_t BATCH_SIZE>
 int FlatStreamer<BATCH_SIZE>::search_bf_impl(const void *query,
                                              const IndexQueryMeta &qmeta,
                                              uint32_t count,
@@ -525,13 +543,14 @@ int FlatStreamer<BATCH_SIZE>::search_bf_by_key_rows(
 }
 
 template <size_t BATCH_SIZE>
-int FlatStreamer<BATCH_SIZE>::search_external(
-    const void *query, const IndexQueryMeta &qmeta, uint32_t count,
-    const std::vector<uint64_t> *keys,
-    Context::Pointer &context) const try {
+int FlatStreamer<BATCH_SIZE>::search_external(const void *query,
+                                              const IndexQueryMeta &qmeta,
+                                              uint32_t count,
+                                              const std::vector<uint64_t> *keys,
+                                              Context::Pointer &context) const
+    try {
   auto *ctx = dynamic_cast<FlatStreamerContext<BATCH_SIZE> *>(context.get());
-  if (!ctx || !query || !count ||
-      qmeta.meta_type() != meta_.meta_type() ||
+  if (!ctx || !query || !count || qmeta.meta_type() != meta_.meta_type() ||
       qmeta.data_type() != meta_.data_type() ||
       qmeta.dimension() != meta_.dimension() ||
       qmeta.element_size() != meta_.element_size()) {
@@ -658,7 +677,8 @@ int FlatStreamer<BATCH_SIZE>::search_external(
       ailego::BudgetedVector<uint32_t> ids;
       ids.reserve(batch_limit);
       auto &pointer_batch = std::get<PointerBatch>(batch);
-      ailego::ReserveVectorCapacity(pointer_batch.ids, batch_memory, batch_limit);
+      ailego::ReserveVectorCapacity(pointer_batch.ids, batch_memory,
+                                    batch_limit);
       ailego::ReserveVectorCapacity(pointer_batch.vectors, batch_memory,
                                     batch_limit);
       auto read_batch = [&]() -> int {

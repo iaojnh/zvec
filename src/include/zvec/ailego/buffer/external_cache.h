@@ -621,8 +621,7 @@ class ExternalCache : public EvictableBlockOwner {
     }
   }
 
-  Value wait_for_loading(const Key &key,
-                         std::unique_lock<Mutex> &lock) {
+  Value wait_for_loading(const Key &key, std::unique_lock<Mutex> &lock) {
     auto iter = table_.find(key);
     assert(iter != table_.end() && iter->second.loading);
     std::shared_ptr<LoadState> load_state = iter->second.load_state;

@@ -33,6 +33,18 @@
 namespace zvec {
 namespace core {
 
+namespace {
+std::array<char, 3 * sizeof(uint64_t)> EncodeSparseOffset(uint64_t offset,
+                                                          uint32_t length,
+                                                          uint64_t key) {
+  std::array<char, 3 * sizeof(uint64_t)> record{};
+  std::memcpy(record.data(), &offset, sizeof(offset));
+  std::memcpy(record.data() + sizeof(uint64_t), &length, sizeof(length));
+  std::memcpy(record.data() + 2 * sizeof(uint64_t), &key, sizeof(key));
+  return record;
+}
+}  // namespace
+
 FlatSparseStreamerEntity::FlatSparseStreamerEntity(IndexStreamer::Stats &stats)
     : stats_(stats) {}
 
@@ -684,9 +696,120 @@ int FlatSparseStreamerEntity::add_vector_with_id(
   return IndexError_NoMemory;
 }
 
-int FlatSparseStreamerEntity::write_sparse_vector_to_chunk(
-    std::string_view sparse_vector, const uint32_t sparse_vector_len,
-    uint32_t &sparse_data_chunk_index, uint32_t &sparse_data_chunk_offset) {
+class FlatSparseStreamerEntity::PreparedInsert final
+    : public IndexStreamer::PreparedAdd {
+ public:
+  PreparedInsert(FlatSparseStreamerEntity *owner, uint32_t id,
+                 uint32_t sparse_count,
+                 std::shared_lock<ailego::SharedMutex> writer_guard,
+                 std::unique_lock<std::mutex> insert_guard,
+                 KeyMap::node_type key,
+                 std::unique_ptr<Chunk::PreparedWrite> data,
+                 std::unique_ptr<Chunk::PreparedWrite> offset)
+      : owner_(owner),
+        id_(id),
+        sparse_count_(sparse_count),
+        writer_guard_(std::move(writer_guard)),
+        insert_guard_(std::move(insert_guard)),
+        key_(std::move(key)),
+        data_(std::move(data)),
+        offset_(std::move(offset)) {}
+
+  void commit() noexcept override {
+    if (!owner_) return;
+    if (data_) data_->commit();
+    offset_->commit();
+    owner_->publish_key(id_, id_, std::move(key_));
+    owner_->inc_doc_count();
+    owner_->inc_total_sparse_count(sparse_count_);
+    ++*owner_->stats_.mutable_added_count();
+    owner_ = nullptr;
+    offset_.reset();
+    data_.reset();
+    insert_guard_.unlock();
+    writer_guard_.unlock();
+  }
+
+ private:
+  FlatSparseStreamerEntity *owner_;
+  uint32_t id_, sparse_count_;
+  std::shared_lock<ailego::SharedMutex> writer_guard_;
+  std::unique_lock<std::mutex> insert_guard_;
+  KeyMap::node_type key_;
+  std::unique_ptr<Chunk::PreparedWrite> data_;
+  std::unique_ptr<Chunk::PreparedWrite> offset_;
+};
+
+int FlatSparseStreamerEntity::prepare_add_with_id(
+    uint32_t id, std::string_view sparse_vector, uint32_t sparse_count,
+    std::shared_lock<ailego::SharedMutex> writer_guard,
+    std::unique_ptr<IndexStreamer::PreparedAdd> *out) {
+  if (!out || *out) return IndexError_InvalidArgument;
+  if (id >= max_doc_cnt_) return IndexError_IndexFull;
+  if (sparse_vector.size() > streamer_meta_.data_chunk_size)
+    return IndexError_InvalidArgument;
+  const size_t stored_length = AlignSize(sparse_vector.size());
+  if (stored_length > streamer_meta_.data_chunk_size)
+    return IndexError_InvalidArgument;
+
+  std::unique_lock<std::mutex> insert_guard(mutex_);
+  if (id < doc_cnt() || get_id(id) != kInvalidNodeId)
+    return IndexError_Duplicate;
+  if (sparse_count > UINT32_MAX - total_sparse_count())
+    return IndexError_Overflow;
+  auto key = prepare_key(id, id);
+
+  // Ordinals below id are already committed DB rows with no vector. Only
+  // those holes may change before the new vector's transaction commits.
+  uint32_t offset_index, offset_position;
+  while (doc_cnt() < id) {
+    int ret = get_new_sparse_offset_chunk(offset_index, offset_position);
+    if (ret != 0) return ret;
+    ret = write_sparse_offset_to_chunk(offset_index, offset_position, 0, 0,
+                                       kInvalidKey);
+    if (ret != 0) return ret;
+    inc_doc_count();
+  }
+  int ret = get_new_sparse_offset_chunk(offset_index, offset_position);
+  if (ret != 0) return ret;
+
+  uint32_t data_index = 0, data_position = 0;
+  std::unique_ptr<Chunk::PreparedWrite> data_write;
+  if (stored_length) {
+    ret = get_sparse_data_slot(static_cast<uint32_t>(stored_length), data_index,
+                               data_position);
+    if (ret != 0) return ret;
+    constexpr char padding[31]{};
+    const size_t pad = stored_length - sparse_vector.size();
+    const IndexStorage::SegmentData writes[]{
+        {data_position, sparse_vector.size(), sparse_vector.data()},
+        {data_position + sparse_vector.size(), pad, padding}};
+    ret = sparse_data_chunks_[data_index]->prepare_write_batch(
+        writes, pad ? 2 : 1, &data_write);
+    if (ret != 0) return ret;
+    if (!data_write) return IndexError_Runtime;
+  }
+
+  const uint64_t location = (uint64_t{data_index} << 32U) + data_position;
+  const auto record =
+      EncodeSparseOffset(location, static_cast<uint32_t>(stored_length), id);
+  const IndexStorage::SegmentData write{offset_position, record.size(),
+                                        record.data()};
+  std::unique_ptr<Chunk::PreparedWrite> offset_write;
+  ret = sparse_offset_chunks_[offset_index]->prepare_write_batch(&write, 1,
+                                                                 &offset_write);
+  if (ret != 0) return ret;
+  if (!offset_write) return IndexError_Runtime;
+
+  *out = std::make_unique<PreparedInsert>(
+      this, id, sparse_count, std::move(writer_guard), std::move(insert_guard),
+      std::move(key), std::move(data_write), std::move(offset_write));
+  return 0;
+}
+
+int FlatSparseStreamerEntity::get_sparse_data_slot(
+    uint32_t sparse_vector_len, uint32_t &sparse_data_chunk_index,
+    uint32_t &sparse_data_chunk_offset) {
   // get sparse data chunk and offset for write sparse vector
   Chunk::Pointer sparse_data_chunk;
   sparse_data_chunk_offset = -1U;
@@ -709,10 +832,11 @@ int FlatSparseStreamerEntity::write_sparse_vector_to_chunk(
       return IndexError_IndexFull;
     }
 
-    sparse_data_chunk = alloc_new_data_chunk(sparse_data_chunks_.size());
-    if (ailego_unlikely(!sparse_data_chunk)) {
+    const int ret =
+        alloc_new_data_chunk(sparse_data_chunks_.size(), &sparse_data_chunk);
+    if (ailego_unlikely(ret != 0)) {
       LOG_ERROR("allocate data chunk failed");
-      return IndexError_NoMemory;
+      return ret;
     }
     sparse_data_chunks_.emplace_back(sparse_data_chunk);
     sparse_data_chunk_index = sparse_data_chunks_.size() - 1U;
@@ -721,6 +845,16 @@ int FlatSparseStreamerEntity::write_sparse_vector_to_chunk(
     sparse_data_chunk = sparse_data_chunks_[sparse_data_chunk_index];
     sparse_data_chunk_offset = sparse_data_chunk->data_size();
   }
+  return 0;
+}
+
+int FlatSparseStreamerEntity::write_sparse_vector_to_chunk(
+    std::string_view sparse_vector, const uint32_t sparse_vector_len,
+    uint32_t &sparse_data_chunk_index, uint32_t &sparse_data_chunk_offset) {
+  int ret = get_sparse_data_slot(sparse_vector_len, sparse_data_chunk_index,
+                                 sparse_data_chunk_offset);
+  if (ret != 0) return ret;
+  const auto &sparse_data_chunk = sparse_data_chunks_[sparse_data_chunk_index];
 
   bool committed = false;
   AILEGO_DEFER([&] {
@@ -728,11 +862,12 @@ int FlatSparseStreamerEntity::write_sparse_vector_to_chunk(
   });
   // write sparse vector
   if (sparse_vector.size() > 0) {
-    if (ailego_unlikely(write_sparse_vector_data(
-                            sparse_data_chunk_index, sparse_data_chunk_offset,
-                            sparse_vector.data(), sparse_vector.size()) != 0)) {
+    ret = write_sparse_vector_data(sparse_data_chunk_index,
+                                   sparse_data_chunk_offset,
+                                   sparse_vector.data(), sparse_vector.size());
+    if (ailego_unlikely(ret != 0)) {
       LOG_ERROR("write sparse vector failed");
-      return IndexError_NoMemory;
+      return ret;
     }
   }
 
@@ -767,10 +902,11 @@ int FlatSparseStreamerEntity::get_new_sparse_offset_chunk(
       return IndexError_IndexFull;
     }
 
-    sparse_offset_chunk = alloc_new_offset_chunk(sparse_offset_chunks_.size());
-    if (ailego_unlikely(!sparse_offset_chunk)) {
+    const int ret = alloc_new_offset_chunk(sparse_offset_chunks_.size(),
+                                           &sparse_offset_chunk);
+    if (ailego_unlikely(ret != 0)) {
       LOG_ERROR("allocate offset chunk failed");
-      return IndexError_NoMemory;
+      return ret;
     }
     sparse_offset_chunks_.emplace_back(sparse_offset_chunk);
     sparse_offset_chunk_index = sparse_offset_chunks_.size() - 1U;
@@ -788,13 +924,10 @@ int FlatSparseStreamerEntity::write_sparse_offset_to_chunk(
     const uint32_t sparse_vector_len, const uint64_t node_id) {
   // One complete record: cross-page admission finishes before any field is
   // changed, so updates cannot mix a new offset with an old length.
-  char record[3 * sizeof(uint64_t)]{};
-  std::memcpy(record, &sparse_offset, sizeof(sparse_offset));
-  std::memcpy(record + sizeof(uint64_t), &sparse_vector_len,
-              sizeof(sparse_vector_len));
-  std::memcpy(record + 2 * sizeof(uint64_t), &node_id, sizeof(node_id));
+  const auto record =
+      EncodeSparseOffset(sparse_offset, sparse_vector_len, node_id);
   const IndexStorage::SegmentData write{sparse_offset_chunk_offset,
-                                        sizeof(record), record};
+                                        record.size(), record.data()};
   const auto &segment = sparse_offset_chunks_[sparse_offset_chunk_index];
   return segment->write_batch(&write, 1) ? 0 : segment->write_error();
 }
@@ -939,7 +1072,7 @@ int FlatSparseStreamerEntity::write_sparse_vector_data(uint32_t chunk_index,
         "length=%u, size=%zu, chunk_data_size=%zu",
         chunk_index, (size_t)offset, length, size,
         sparse_data_chunks_[chunk_index]->data_size());
-    return IndexError_WriteData;
+    return sparse_data_chunks_[chunk_index]->write_error();
   }
   // LOG_DEBUG(
   //     "write_sparse_vector_data: chunk_index=%u, offset=%lu, length=%u, "

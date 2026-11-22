@@ -45,7 +45,7 @@ class Quantizer;
 namespace zvec::core_interface {
 
 class BufferedInput;
-struct CachedIndexContext;
+struct IndexContextRegistry;
 
 class ZVEC_CORE_API IndexFactory;
 
@@ -199,6 +199,11 @@ class ZVEC_CORE_API Index {
 
   virtual int add(const VectorData &vector, uint32_t doc_id);
 
+  // Prepare a row without publishing its key. The prepared operation owns
+  // the encoded payload and any write pins until commit or destruction.
+  int prepare_add(const VectorData &vector, uint32_t doc_id,
+                  std::unique_ptr<core::IndexStreamer::PreparedAdd> *prepared);
+
   virtual int fetch(const uint32_t doc_id,
                     VectorDataBuffer *vector_data_buffer);
   virtual int search(const VectorData &query,
@@ -246,10 +251,14 @@ class ZVEC_CORE_API Index {
   virtual int _dense_fetch(const uint32_t doc_id,
                            VectorDataBuffer *vector_data_buffer);
 
-  int _sparse_add(const VectorData &vector, const uint32_t doc_id,
-                  core::IndexContext::Pointer &context);
-  int _dense_add(const VectorData &vector, const uint32_t doc_id,
-                 core::IndexContext::Pointer &context);
+  int add_impl(const VectorData &vector, uint32_t doc_id,
+               std::unique_ptr<core::IndexStreamer::PreparedAdd> *prepared);
+  int _sparse_add(const VectorData &vector, uint32_t doc_id,
+                  core::IndexContext::Pointer &context,
+                  std::unique_ptr<core::IndexStreamer::PreparedAdd> *prepared);
+  int _dense_add(const VectorData &vector, uint32_t doc_id,
+                 core::IndexContext::Pointer &context,
+                 std::unique_ptr<core::IndexStreamer::PreparedAdd> *prepared);
   int _sparse_search(const VectorData &query,
                      const BaseIndexQueryParam::Pointer &search_param,
                      SearchResult *result,
@@ -296,7 +305,7 @@ class ZVEC_CORE_API Index {
 
  protected:
   friend class IndexFactory;
-  Index() = default;
+  Index();
   int init(const BaseIndexParam &param);
 
 
@@ -322,6 +331,7 @@ class ZVEC_CORE_API Index {
   bool init_context();
   core::IndexContext::Pointer &acquire_context(bool active = false);
   void release_context();
+  int reset_build_pipeline(const BaseIndexParam &param);
   int open_trained_storage(const std::string &path);
   virtual int load_streamer();
   virtual void release_build_input() {}
@@ -346,11 +356,9 @@ class ZVEC_CORE_API Index {
   // kernels. When set, converter_/reformer_/metric_ stay null.
   std::shared_ptr<turbo::Quantizer> turbo_quantizer_{};
 
-  size_t context_index_{std::numeric_limits<size_t>::max()};
   // IVF contexts own storage readers. The index owns their lifetime; thread
   // caches only borrow them, so closing on another thread releases readers.
-  std::mutex contexts_mutex_;
-  ailego::BudgetedVector<std::shared_ptr<CachedIndexContext>> contexts_;
+  std::shared_ptr<IndexContextRegistry> contexts_;
   core::IndexStorage::Pointer storage_{};
 
   // Direct builder input only; Collection merge borrows its providers.
@@ -630,6 +638,10 @@ class ZVEC_CORE_API DiskAnnIndex : public Index {
   DiskAnnIndex() = default;
 
  protected:
+  void release_build_input() override {
+    holder_.reset();
+    decltype(doc_cache_)().swap(doc_cache_);
+  }
   int create_and_init_streamer(const BaseIndexParam &param) override;
   int reinitialize_streamer() override {
     return create_and_init_streamer(param_);

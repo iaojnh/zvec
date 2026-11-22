@@ -14,7 +14,9 @@
 
 #include "db/common/global_resource.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <future>
 #include <thread>
 #include <ailego/utility/memory_helper.h>
 #include <arrow/io/interfaces.h>
@@ -31,6 +33,61 @@ using namespace zvec;
 
 #if (defined(__linux__) || defined(__APPLE__) || defined(_WIN32)) && \
     GTEST_HAS_DEATH_TEST
+namespace {
+
+class DeferredConfigValidation : public GlobalConfig::ConsoleLogConfig {
+ public:
+  DeferredConfigValidation(std::promise<void> &entered,
+                           std::future<void> resume)
+      : entered_(entered), resume_(std::move(resume)) {}
+
+  std::string get_logger_type() const override {
+    entered_.set_value();
+    resume_.wait();
+    return GlobalConfig::ConsoleLogConfig::get_logger_type();
+  }
+
+ private:
+  std::promise<void> &entered_;
+  std::future<void> resume_;
+};
+
+}  // namespace
+
+TEST(GlobalResourceStartupDeathTest, ExplicitStartupOwnsLazyPublication) {
+  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        GlobalConfig::ConfigData config;
+        config.query_thread_binding = true;
+        config.query_thread_count = config.optimize_thread_count = 1;
+        std::promise<void> entered;
+        std::promise<void> resume;
+        auto validating = entered.get_future();
+        config.log_config = std::make_shared<DeferredConfigValidation>(
+            entered, resume.get_future());
+        auto explicit_startup = std::async(std::launch::async, [&config] {
+          return GlobalConfig::Instance().initialize(config);
+        });
+        validating.wait();
+        auto lazy_startup = std::async(std::launch::async, [] {
+          auto &resources = GlobalResource::Instance();
+          return resources.initialize() == 0 &&
+                 GlobalConfig::Instance().query_thread_binding() &&
+                 resources.query_thread_pool()->count() == 1;
+        });
+        const bool waited = lazy_startup.wait_for(std::chrono::milliseconds(250))
+                            == std::future_status::timeout;
+        resume.set_value();
+        if (!explicit_startup.get().ok()) std::_Exit(1);
+        if (!lazy_startup.get() || !waited) std::_Exit(2);
+        std::_Exit(0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ::testing::FLAGS_gtest_death_test_style = previous_style;
+}
+
 TEST(GlobalResourceStartupDeathTest,
      PartialBudgetFailureCannotBecomeStandalone) {
   const auto previous_style = ::testing::FLAGS_gtest_death_test_style;

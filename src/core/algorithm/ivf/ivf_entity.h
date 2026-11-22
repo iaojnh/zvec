@@ -56,6 +56,7 @@ class IVFEntity {
   // caller can apply the same max_scan_count boundary as the scoring loop.
   // accepted=false keeps this list in the caller's rolling lookahead plan.
   size_t prefetch_list(size_t inverted_list_id, bool *accepted = nullptr) const;
+  void release_prefetch() const;
 
   const turbo::Quantizer::Pointer &quantizer() const {
     return quantizer_;

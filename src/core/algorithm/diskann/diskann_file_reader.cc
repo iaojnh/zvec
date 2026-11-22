@@ -301,8 +301,8 @@ int destroy_io_ctx(IOContext &ctx) {
   if (ctx->type == ailego::IOBackendType::kIoUring) {
     ctx->ring.teardown();
   } else if (ctx->type == ailego::IOBackendType::kLibAio && ctx->aio_ctx) {
-    const int ret = LibAioLoader::Instance().destroy_budgeted(
-        ctx->aio_ctx, ctx->aio_memory);
+    const int ret = LibAioLoader::Instance().destroy_budgeted(ctx->aio_ctx,
+                                                              ctx->aio_memory);
     if (ret != 0) {
       // The kernel may still own these destinations. Preserve their mapping
       // and its charge even if the context's final owner must go away.
@@ -392,14 +392,15 @@ static bool reset_aio_context(IoBackend &ctx) {
 }
 
 static bool prepare_libaio_staging(IoBackend &ctx, const AlignedRead *reads,
-                                    size_t count) try {
+                                   size_t count) try {
   using Buffer = ailego::BudgetedMappedBuffer;
   if (ailego::MemoryLimitPool::get_instance().under_process_rss_pressure())
     return false;
   size_t bytes = 0;
   for (size_t i = 0; i < count; ++i) {
     if (!reads[i].buf || !reads[i].len ||
-        reads[i].len > (std::numeric_limits<size_t>::max)()) return false;
+        reads[i].len > (std::numeric_limits<size_t>::max)())
+      return false;
     const size_t slot = Buffer::mapping_size(static_cast<size_t>(reads[i].len));
     if (!slot || slot > (std::numeric_limits<size_t>::max)() - bytes)
       return false;
@@ -414,7 +415,8 @@ static bool prepare_libaio_staging(IoBackend &ctx, const AlignedRead *reads,
 
 static void prepare_libaio_request(IoBackend &ctx, struct iocb *cb, int fd,
                                    const AlignedRead &read, size_t &offset) {
-  io_prep_pread(cb, fd, ctx.aio_staging->data() + offset, read.len, read.offset);
+  io_prep_pread(cb, fd, ctx.aio_staging->data() + offset, read.len,
+                read.offset);
   offset += ailego::BudgetedMappedBuffer::mapping_size(read.len);
 }
 
@@ -423,7 +425,8 @@ int execute_io_libaio(IoBackend &ctx, int fd,
   if (ctx.aio_active) return IndexError_InvalidArgument;
   if (!ctx.aio_ctx || ctx.aio_quarantined)
     return execute_io_pread(fd, read_reqs);
-  const auto finish = ailego::ScopeGuard::Make([&] { finish_libaio_reads(ctx); });
+  const auto finish =
+      ailego::ScopeGuard::Make([&] { finish_libaio_reads(ctx); });
   const size_t batch_size = std::min<size_t>(read_reqs.size(), MAX_EVENTS);
   ailego::BudgetedVector<iocb_t *> cbs;
   ailego::BudgetedVector<io_event_t> evts;
@@ -438,7 +441,8 @@ int execute_io_libaio(IoBackend &ctx, int fd,
     return execute_io_pread(fd, read_reqs);
   }
 
-  const uint64_t iters = DiskAnnUtil::div_round_up(read_reqs.size(), MAX_EVENTS);
+  const uint64_t iters =
+      DiskAnnUtil::div_round_up(read_reqs.size(), MAX_EVENTS);
   for (uint64_t iter = 0; iter < iters; iter++) {
     const size_t n_ops =
         std::min<size_t>(read_reqs.size() - iter * MAX_EVENTS, MAX_EVENTS);
@@ -463,8 +467,8 @@ int execute_io_libaio(IoBackend &ctx, int fd,
     // again.
     while (submitted < n_ops) {
       size_t remaining = n_ops - submitted;
-      int ret = LibAioLoader::Instance().io_submit(ctx.aio_ctx, (int64_t)remaining,
-                                                   cbs.data() + submitted);
+      int ret = LibAioLoader::Instance().io_submit(
+          ctx.aio_ctx, (int64_t)remaining, cbs.data() + submitted);
       if (ret > 0 && static_cast<size_t>(ret) <= remaining) {
         submitted += static_cast<size_t>(ret);
         n_tries = 0;
@@ -489,8 +493,8 @@ int execute_io_libaio(IoBackend &ctx, int fd,
     while (completed < submitted) {
       size_t remaining = submitted - completed;
       int ret = LibAioLoader::Instance().io_getevents(
-          ctx.aio_ctx, (int64_t)remaining, (int64_t)remaining, evts.data() + completed,
-          nullptr);
+          ctx.aio_ctx, (int64_t)remaining, (int64_t)remaining,
+          evts.data() + completed, nullptr);
       if (ret > 0 && static_cast<size_t>(ret) <= remaining) {
         completed += static_cast<size_t>(ret);
         continue;
@@ -996,7 +1000,8 @@ int BufferPoolAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
             const size_t bytes =
                 std::min(left, ailego::kVectorPageSize - within);
             const auto found = std::find(ids.begin(), ids.begin() + count, id);
-            std::memcpy(destination, pages[found - ids.begin()] + within, bytes);
+            std::memcpy(destination, pages[found - ids.begin()] + within,
+                        bytes);
             offset += bytes;
             destination += bytes;
             left -= bytes;
@@ -1676,7 +1681,8 @@ int LinuxAlignedFileReader::submit(PendingBatch &batch,
   }
   size_t offset = 0;
   for (uint32_t j = 0; j < n_ops; ++j) {
-    prepare_libaio_request(*ctx, &batch.cbs[j], file_desc, read_reqs[j], offset);
+    prepare_libaio_request(*ctx, &batch.cbs[j], file_desc, read_reqs[j],
+                           offset);
     batch.cbs[j].data = (void *)(uintptr_t)j;
     batch.cb_ptrs[j] = &batch.cbs[j];
     batch.destinations[j] = read_reqs[j].buf;
@@ -2236,11 +2242,9 @@ int WindowsAlignedFileReader::get_completed(
   if (batch.n_reaped >= batch.n_submitted) {
     return 0;
   }
-  if (!ctx || ctx->iocp_batch != &batch)
-    return IndexError_InvalidArgument;
-  if (ctx->completion_port == nullptr ||
-      batch.generation == 0 || batch.generation != ctx->generation ||
-      batch.n_submitted > MAX_IO_DEPTH ||
+  if (!ctx || ctx->iocp_batch != &batch) return IndexError_InvalidArgument;
+  if (ctx->completion_port == nullptr || batch.generation == 0 ||
+      batch.generation != ctx->generation || batch.n_submitted > MAX_IO_DEPTH ||
       ctx->outstanding_count != batch.n_submitted - batch.n_reaped) {
     LOG_ERROR("Invalid or stale Windows IOCP batch");
     reset_io_ctx(ctx);

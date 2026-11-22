@@ -31,8 +31,11 @@ namespace {
 class MappedMemtableAllocator final : public rocksdb::Allocator {
  public:
   explicit MappedMemtableAllocator(
-      std::shared_ptr<rocksdb::WriteBufferManager> manager)
-      : manager_(std::move(manager)), tracker_(manager_.get()) {
+      std::shared_ptr<rocksdb::WriteBufferManager> manager,
+      rocksdb::Allocator *initial_allocator)
+      : manager_(std::move(manager)),
+        tracker_(manager_.get()),
+        initial_allocator_(initial_allocator) {
     if (!manager_) throw std::bad_alloc();
   }
 
@@ -46,8 +49,8 @@ class MappedMemtableAllocator final : public rocksdb::Allocator {
       const auto projection = block->projection;
       block->~Block();
       if (ailego::File::TryMemoryUnmap(block, bytes))
-        ailego::MemoryLimitPool::get_instance().release_unmapped_process_backing(
-            bytes, projection);
+        ailego::MemoryLimitPool::get_instance()
+            .release_unmapped_process_backing(bytes, projection);
       block = next;
     }
     tracker_.FreeMem();
@@ -59,6 +62,7 @@ class MappedMemtableAllocator final : public rocksdb::Allocator {
 
   char *AllocateAligned(size_t bytes, size_t /*huge_page_size*/ = 0,
                         rocksdb::Logger * /*logger*/ = nullptr) override {
+    if (initial_allocator_) return initial_allocator_->AllocateAligned(bytes);
     constexpr size_t kAlign = alignof(std::max_align_t);
     constexpr size_t kMax = std::numeric_limits<size_t>::max();
     if (bytes == 0 || bytes > kMax - (kAlign - 1)) throw std::bad_alloc();
@@ -91,9 +95,8 @@ class MappedMemtableAllocator final : public rocksdb::Allocator {
       throw;
     }
     const auto projection = pool.finish_process_backing(mapped, true);
-    auto *block = new (memory)
-        Block{current_.load(std::memory_order_relaxed), mapped, projection,
-              sizeof(Block)};
+    auto *block = new (memory) Block{current_.load(std::memory_order_relaxed),
+                                     mapped, projection, sizeof(Block)};
     allocated_.fetch_add(mapped, std::memory_order_relaxed);
     // Claim our slice before publishing the block to concurrent writers.
     char *result = take(block, aligned);
@@ -111,6 +114,10 @@ class MappedMemtableAllocator final : public rocksdb::Allocator {
 
   void seal() {
     tracker_.DoneAllocating();
+  }
+
+  void finish_initialization() {
+    initial_allocator_ = nullptr;
   }
 
  private:
@@ -135,6 +142,9 @@ class MappedMemtableAllocator final : public rocksdb::Allocator {
 
   std::shared_ptr<rocksdb::WriteBufferManager> manager_;
   rocksdb::AllocTracker tracker_;
+  // Use the owning MemTable's already charged Arena for the SkipList head
+  // and splice. Empty CFs must not pin a nonflushable mapping apiece.
+  rocksdb::Allocator *initial_allocator_;
   std::mutex mutex_;
   std::atomic<Block *> current_{nullptr};
   std::atomic<size_t> allocated_{0};
@@ -143,13 +153,15 @@ class MappedMemtableAllocator final : public rocksdb::Allocator {
 class MappedMemtableRep final : public rocksdb::MemTableRep {
  public:
   MappedMemtableRep(const KeyComparator &compare,
+                    rocksdb::Allocator *initial_allocator,
                     const rocksdb::SliceTransform *transform,
                     rocksdb::Logger *logger,
                     std::shared_ptr<rocksdb::WriteBufferManager> manager)
       : MemTableRep(nullptr),
-        backing_(std::move(manager)),
+        backing_(std::move(manager), initial_allocator),
         table_(rocksdb::SkipListFactory().CreateMemTableRep(
             compare, &backing_, transform, logger)) {
+    backing_.finish_initialization();
     allocator_ = &backing_;
   }
 
@@ -237,9 +249,9 @@ RocksdbMemtableFactory::RocksdbMemtableFactory(
 
 rocksdb::MemTableRep *RocksdbMemtableFactory::CreateMemTableRep(
     const rocksdb::MemTableRep::KeyComparator &compare,
-    rocksdb::Allocator * /*allocator*/,
-    const rocksdb::SliceTransform *transform, rocksdb::Logger *logger) {
-  return new MappedMemtableRep(compare, transform, logger, manager_);
+    rocksdb::Allocator *allocator, const rocksdb::SliceTransform *transform,
+    rocksdb::Logger *logger) {
+  return new MappedMemtableRep(compare, allocator, transform, logger, manager_);
 }
 
 }  // namespace zvec

@@ -44,6 +44,9 @@ class ChunkReadStorage : public IndexStorage {
   MemoryBlock::MemoryBlockType memory_block_type() const override;
   std::string file_path() const override;
   Stats stats() const;
+  // Releases optional lookahead initiated by this segment (or clone) when
+  // its query completes, including early returns after preparing hints.
+  static void release_prefetch(Segment *segment);
   // Disabling hints does not discard an already submitted read. Demand reads
   // still join it, and teardown drains it before releasing any backing.
   void enable_prefetch(bool enabled);

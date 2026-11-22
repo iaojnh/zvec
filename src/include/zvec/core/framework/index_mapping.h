@@ -202,6 +202,7 @@ class IndexMapping {
       std::map<std::string_view, SegmentInfo, std::less<>,
                ailego::BudgetedAllocator<
                    std::pair<const std::string_view, SegmentInfo>>>;
+  HeaderMap::node_type stage_header_mapping(size_t len, size_t charge);
   int init_index_mapping_admitted(
       size_t len, HeaderMap::node_type node,
       ailego::MemoryLimitPool::PendingAllocation &memory);

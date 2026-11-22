@@ -41,7 +41,8 @@ struct ReadAheadSourceOptions : arrow::acero::SourceNodeOptions {
       std::shared_ptr<std::atomic<bool>> resident)
       : SourceNodeOptions(std::move(schema), std::move(generator),
                           arrow::compute::Ordering::Implicit()),
-        stopped(std::move(stopped)), resident(std::move(resident)) {}
+        stopped(std::move(stopped)),
+        resident(std::move(resident)) {}
   std::shared_ptr<std::atomic<bool>> stopped;
   std::shared_ptr<std::atomic<bool>> resident;
 };
@@ -120,20 +121,26 @@ class BoundedSource : public arrow::acero::ExecNode {
                          },
                          options);
     }).AddCallback([this, done](const arrow::Result<int> &result) mutable {
-      auto status = result.status();
-      auto finished = finish_ ? finish_() : arrow::Future<>::MakeFinished();
-      finished.AddCallback(
-          [this, done, status, count = result.ok() ? *result : 0](
-              const arrow::Status &cleanup) mutable {
-            // Child cancellation is part of this source's external task.
-            // Releasing a child generator without awaiting it lets
-            // Segment::close() race with global Arrow/RocksDB destruction after
-            // the caller has returned.
-            generator_ = {};
-            finish_ = {};
-            if (status.ok()) status = cleanup;
-            if (status.ok()) status = output_->InputFinished(this, count);
-            done.MarkFinished(status);
+      // A failed delivery can end the loop while the next read is in flight.
+      // Await both local work and nested plans before reporting completion.
+      if (reader_stopped_)
+        reader_stopped_->store(true, std::memory_order_release);
+      finish_work().AddCallback(
+          [this, done, status = result.status(),
+           count = result.ok() ? *result : 0](
+              const arrow::Status &local_cleanup) mutable {
+            if (status.ok()) status = local_cleanup;
+            auto finished =
+                finish_ ? finish_() : arrow::Future<>::MakeFinished();
+            finished.AddCallback(
+                [this, done, status,
+                 count](const arrow::Status &nested_cleanup) mutable {
+                  generator_ = {};
+                  finish_ = {};
+                  if (status.ok()) status = nested_cleanup;
+                  if (status.ok()) status = output_->InputFinished(this, count);
+                  done.MarkFinished(status);
+                });
           });
     });
     return arrow::Status::OK();
@@ -195,7 +202,8 @@ class BoundedSource : public arrow::acero::ExecNode {
       if (!deliveries_.empty() &&
           (delivery_bytes_ >= delivery_window_bytes_ ||
            next_delivery_bytes_ > delivery_window_bytes_ - delivery_bytes_)) {
-        return drain_deliveries().Then([this, next]() { return consume(next); });
+        return drain_deliveries().Then(
+            [this, next]() { return consume(next); });
       }
       return queue_delivery(*next);
     }
@@ -258,8 +266,7 @@ class BoundedSource : public arrow::acero::ExecNode {
   bool parallel_batch(const arrow::compute::ExecBatch &batch) {
     // Publish a cold batch through the consumer before starting another cold
     // read. Only ready batches use the parallel delivery window.
-    if (reader_resident_ &&
-        !reader_resident_->load(std::memory_order_acquire))
+    if (reader_resident_ && !reader_resident_->load(std::memory_order_acquire))
       return false;
     // Ready managed batches can use a bounded delivery window. Under pressure
     // retain inline delivery; the shared allocator still governs every buffer.
@@ -445,8 +452,7 @@ arrow::Result<arrow::acero::Declaration> bound_sources(
         managed_io &&
         GlobalResource::Instance().arrow_query_thread_pool()->GetCapacity() > 1;
     arrow::AsyncGenerator<BoundedSource::Batch> generator =
-        [input, executor, managed,
-         reader_stopped,
+        [input, executor, managed, reader_stopped,
          reader_resident]() -> arrow::Future<BoundedSource::Batch> {
       // The generator is pulled serially. Publishing the I/O Future also
       // publishes this bounded queue before its next CPU-side pull.
@@ -462,8 +468,7 @@ arrow::Result<arrow::acero::Declaration> bound_sources(
       if (!input->error.ok()) return input->error;
       if (input->finished) return BoundedSource::Batch{};
       auto future = executor->Submit(
-          [input, managed,
-           reader_stopped,
+          [input, managed, reader_stopped,
            reader_resident]() -> arrow::Result<BoundedSource::Batch> {
             try {
               if (reader_stopped->load(std::memory_order_acquire))
@@ -496,8 +501,8 @@ arrow::Result<arrow::acero::Declaration> bound_sources(
                 }
                 return bytes >= 64 * 1024 &&
                        bytes <= ailego::MemoryLimitPool::get_instance()
-                                                .prefetch_available() /
-                                            64;
+                                        .prefetch_available() /
+                                    64;
               };
               if (managed && resident && can_prepare(*batch) &&
                   !reader_stopped->load(std::memory_order_acquire)) {

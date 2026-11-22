@@ -875,21 +875,28 @@ int HnswStreamer::dump(const IndexDumper::Pointer &dumper) try {
 }
 
 IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
+  Context::Pointer context;
+  create_context_with_status(context);
+  return context;
+}
+
+int HnswStreamer::create_context_with_status(Context::Pointer &context) const {
+  context.reset();
   if (ailego_unlikely(state_ != STATE_OPENED)) {
     LOG_ERROR("Create context failed, open storage first!");
-    return Context::Pointer();
+    return IndexError_NoReady;
   }
 
   HnswEntity::Pointer entity = entity_->clone();
   if (ailego_unlikely(!entity)) {
     LOG_ERROR("CreateContext clone init failed");
-    return Context::Pointer();
+    return IndexError_Runtime;
   }
-  HnswContext *ctx =
-      new (std::nothrow) HnswContext(meta_.dimension(), metric_, entity);
+  auto ctx = std::unique_ptr<HnswContext>(
+      new (std::nothrow) HnswContext(meta_.dimension(), metric_, entity));
   if (ailego_unlikely(ctx == nullptr)) {
     LOG_ERROR("Failed to new HnswContext");
-    return Context::Pointer();
+    return IndexError_NoMemory;
   }
   ctx->set_ef(ef_);
   ctx->set_po(po_);
@@ -904,10 +911,10 @@ IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
   ctx->set_force_padding_topk(force_padding_topk_enabled_);
   ctx->set_bruteforce_threshold(bruteforce_threshold_);
 
-  if (ailego_unlikely(ctx->init(HnswContext::kStreamerContext)) != 0) {
+  const int ret = ctx->init(HnswContext::kStreamerContext);
+  if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Init HnswContext failed");
-    delete ctx;
-    return Context::Pointer();
+    return ret;
   }
   uint32_t estimate_doc_count = 0;
   if (meta_.streamer_params().get(PARAM_HNSW_STREAMER_ESTIMATE_DOC_COUNT,
@@ -917,13 +924,13 @@ IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
   }
   if (!ctx->check_need_adjuct_ctx(
           std::max(entity_->doc_cnt(), estimate_doc_count))) {
-    delete ctx;
-    return Context::Pointer();
+    return IndexError_NoMemory;
   }
 
   if (build_vector_source_) ctx->set_vector_source(build_vector_source_);
 
-  return Context::Pointer(ctx);
+  context = std::move(ctx);
+  return 0;
 }
 
 IndexProvider::Pointer HnswStreamer::create_provider() const {

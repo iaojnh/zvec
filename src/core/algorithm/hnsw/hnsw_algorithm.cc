@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include "hnsw_algorithm.h"
-#include <ailego/pattern/scope_guard.h>
 #include <mutex>
 #include <ailego/pattern/defer.h>
+#include <ailego/pattern/scope_guard.h>
 
 namespace zvec {
 namespace core {

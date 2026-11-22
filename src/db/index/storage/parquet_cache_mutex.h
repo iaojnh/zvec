@@ -5,8 +5,8 @@
 #include <shared_mutex>
 
 #if defined(__APPLE__)
-#include <cassert>
 #include <pthread.h>
+#include <cassert>
 #include <system_error>
 #endif
 
@@ -29,12 +29,24 @@ class ParquetCacheMutex {
   ParquetCacheMutex(const ParquetCacheMutex &) = delete;
   ParquetCacheMutex &operator=(const ParquetCacheMutex &) = delete;
 
-  void lock() { check(pthread_rwlock_wrlock(&lock_)); }
-  bool try_lock() { return pthread_rwlock_trywrlock(&lock_) == 0; }
-  void unlock() { check(pthread_rwlock_unlock(&lock_)); }
-  void lock_shared() { check(pthread_rwlock_rdlock(&lock_)); }
-  bool try_lock_shared() { return pthread_rwlock_tryrdlock(&lock_) == 0; }
-  void unlock_shared() { check(pthread_rwlock_unlock(&lock_)); }
+  void lock() {
+    check(pthread_rwlock_wrlock(&lock_));
+  }
+  bool try_lock() {
+    return pthread_rwlock_trywrlock(&lock_) == 0;
+  }
+  void unlock() {
+    check(pthread_rwlock_unlock(&lock_));
+  }
+  void lock_shared() {
+    check(pthread_rwlock_rdlock(&lock_));
+  }
+  bool try_lock_shared() {
+    return pthread_rwlock_tryrdlock(&lock_) == 0;
+  }
+  void unlock_shared() {
+    check(pthread_rwlock_unlock(&lock_));
+  }
 
  private:
   static void check(int error) {

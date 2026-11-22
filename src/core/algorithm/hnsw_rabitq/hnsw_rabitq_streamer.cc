@@ -488,21 +488,29 @@ int HnswRabitqStreamer::dump(const IndexDumper::Pointer &dumper) try {
 }
 
 IndexStreamer::Context::Pointer HnswRabitqStreamer::create_context() const {
+  Context::Pointer context;
+  create_context_with_status(context);
+  return context;
+}
+
+int HnswRabitqStreamer::create_context_with_status(
+    Context::Pointer &context) const {
+  context.reset();
   if (ailego_unlikely(state_ != STATE_OPENED)) {
     LOG_ERROR("Create context failed, open storage first!");
-    return Context::Pointer();
+    return IndexError_NoReady;
   }
 
   HnswRabitqEntity::Pointer entity = entity_.clone();
   if (ailego_unlikely(!entity)) {
     LOG_ERROR("CreateContext clone init failed");
-    return Context::Pointer();
+    return IndexError_Runtime;
   }
-  HnswRabitqContext *ctx =
-      new (std::nothrow) HnswRabitqContext(meta_.dimension(), metric_, entity);
+  auto ctx = std::unique_ptr<HnswRabitqContext>(
+      new (std::nothrow) HnswRabitqContext(meta_.dimension(), metric_, entity));
   if (ailego_unlikely(ctx == nullptr)) {
     LOG_ERROR("Failed to new HnswRabitqContext");
-    return Context::Pointer();
+    return IndexError_NoMemory;
   }
   ctx->set_ef(ef_);
   ctx->set_max_scan_limit(max_scan_limit_);
@@ -515,10 +523,10 @@ IndexStreamer::Context::Pointer HnswRabitqStreamer::create_context() const {
   ctx->set_force_padding_topk(force_padding_topk_enabled_);
   ctx->set_bruteforce_threshold(bruteforce_threshold_);
 
-  if (ailego_unlikely(ctx->init(HnswRabitqContext::kStreamerContext)) != 0) {
+  const int ret = ctx->init(HnswRabitqContext::kStreamerContext);
+  if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Init HnswRabitqContext failed");
-    delete ctx;
-    return Context::Pointer();
+    return ret;
   }
   uint32_t estimate_doc_count = 0;
   if (meta_.streamer_params().get(PARAM_HNSW_RABITQ_STREAMER_ESTIMATE_DOC_COUNT,
@@ -528,11 +536,11 @@ IndexStreamer::Context::Pointer HnswRabitqStreamer::create_context() const {
   }
   if (!ctx->check_need_adjuct_ctx(
           std::max(entity_.doc_cnt(), estimate_doc_count))) {
-    delete ctx;
-    return Context::Pointer();
+    return IndexError_NoMemory;
   }
 
-  return Context::Pointer(ctx);
+  context = std::move(ctx);
+  return 0;
 }
 
 IndexProvider::Pointer HnswRabitqStreamer::create_provider() const {

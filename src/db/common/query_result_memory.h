@@ -90,8 +90,8 @@ inline size_t EstimateQueryResult(const arrow::RecordBatch &batch) {
         const auto &binary = static_cast<const arrow::BinaryArray &>(array);
         // Contiguous valid values telescope, including sliced arrays. Charge
         // exactly the copied value bytes, without visiting every string.
-        estimate.add(static_cast<size_t>(
-            binary.value_offset(array.length()) - binary.value_offset(0)));
+        estimate.add(static_cast<size_t>(binary.value_offset(array.length()) -
+                                         binary.value_offset(0)));
         continue;
       }
     } else if (type == arrow::Type::LIST) {

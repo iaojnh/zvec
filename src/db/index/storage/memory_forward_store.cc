@@ -29,12 +29,22 @@
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/logger/logger.h>
 #include "db/common/constants.h"
+#include "db/common/typedef.h"
 #include "db/index/storage/base_forward_store.h"
 #include "fetch_memory.h"
 #include "parquet_memory_pool.h"
 
 
 namespace zvec {
+namespace {
+
+Status ForwardWriteFailure(const arrow::Status &status) {
+  return Status(status.IsOutOfMemory() ? StatusCode::RESOURCE_EXHAUSTED
+                                       : StatusCode::INTERNAL_ERROR,
+                status.ToString());
+}
+
+}  // namespace
 
 MemForwardStore::MemForwardStore(
     const std::shared_ptr<CollectionSchema> &collection_schema,
@@ -153,6 +163,9 @@ Status MemForwardStore::insert(const Doc &doc) {
 Result<std::unique_ptr<MemForwardStore::PreparedInsert>>
 MemForwardStore::prepare_insert(const Doc &doc, uint64_t doc_id) try {
   auto prepared = std::make_unique<PreparedInsert>(cache_mtx_);
+  if (finalized_)
+    return tl::make_unexpected(
+        Status::FailedPrecondition("Forward file has been finalized"));
   const size_t bytes = doc.memory_usage();
   if (bytes > std::numeric_limits<size_t>::max() - total_cache_bytes_)
     throw std::bad_alloc();
@@ -169,10 +182,9 @@ MemForwardStore::prepare_insert(const Doc &doc, uint64_t doc_id) try {
     const size_t target = prepared->cache_bytes + capacity * sizeof(Doc);
     const size_t new_capacity_bytes =
         capacity == cache_.capacity() ? 0 : capacity * sizeof(Doc);
-    cache_memory_.add(target > cache_memory_bytes_
-                          ? target - cache_memory_bytes_
-                          : 0,
-                      bytes + new_capacity_bytes);
+    cache_memory_.add(
+        target > cache_memory_bytes_ ? target - cache_memory_bytes_ : 0,
+        bytes + new_capacity_bytes);
     cache_memory_bytes_ = std::max(cache_memory_bytes_, target);
     // The forward schema excludes vectors: copying the complete Doc clones
     // vector payloads that are written separately by the vector indexer.
@@ -274,9 +286,8 @@ arrow::Result<bool> MemForwardStore::locate_single_source(
   // Only a request spanning different sources may take the full-store
   // path. Propagate allocation refusal from this smaller, point-fetch path.
   ailego::ReserveVectorCapacity(*local_rows, row_memory, indices.size());
-  ARROW_ASSIGN_OR_RAISE(
-      auto builder,
-      arrow::RecordBatchBuilder::Make(physic_schema_, query_memory_pool()));
+  ARROW_ASSIGN_OR_RAISE(auto builder, arrow::RecordBatchBuilder::Make(
+                                          physic_schema_, query_memory_pool()));
   RecordBatchBuilderPtr rb_builder = std::move(builder);
   for (int idx : indices) {
     ARROW_RETURN_NOT_OK(append_doc_to_builder(
@@ -370,26 +381,31 @@ Status MemForwardStore::flush() {
   return flush_locked();
 }
 
-Status MemForwardStore::flush_locked() {
-  if (cache_.empty() && batches_.empty()) {
+Status MemForwardStore::flush_locked() try {
+  if (finalized_ || (cache_.empty() && batches_.empty())) {
     return Status::OK();
   }
 
   if (!writer_) {
-    return Status::InternalError(
-        "forward store writer not open, cannot flush [", path_, "]");
+    writer_ = ChunkedFileWriter::Open(path_, physic_schema_, format_);
+    if (!writer_) {
+      return Status::InternalError("Failed to reopen forward writer: ", path_);
+    }
   }
 
-  auto result = convert_to_record_batch();
-  if (!result.ok()) {
-    return Status::InternalError("failed to convert cache to RecordBatch: ",
-                                 result.status().ToString());
-  }
-
-  auto cache_batch = result.ValueOrDie();
-  if (cache_batch->num_rows() > 0) {
-    batches_.push_back(cache_batch);
+  if (!cache_.empty()) {
+    auto result = convert_to_record_batch();
+    if (!result.ok()) return ForwardWriteFailure(result.status());
+    auto cache_batch = std::move(result).ValueOrDie();
+    const size_t bytes = static_cast<size_t>(MemorySize(*cache_batch));
+    if (bytes > std::numeric_limits<size_t>::max() - total_rb_bytes_) {
+      return Status(StatusCode::RESOURCE_EXHAUSTED,
+                    "Forward batch size exceeds address space");
+    }
+    batches_.push_back(std::move(cache_batch));
+    total_rb_bytes_ += bytes;
     cache_.clear();
+    total_cache_bytes_ = 0;
   }
 
   bool has_incr = false;
@@ -427,10 +443,12 @@ Status MemForwardStore::flush_locked() {
         // The Parquet writer consumes chunked columns directly; concatenating
         // them first needlessly overlaps a full extra payload with the input.
         auto table = arrow::Table::FromRecordBatches(batches_to_merge);
-        if (!table.ok())
-          return Status::InternalError(table.status().ToString());
+        if (!table.ok()) return ForwardWriteFailure(table.status());
         auto written = writer_->write(**table);
-        if (!written.ok()) return Status::InternalError(written.ToString());
+        if (!written.ok()) {
+          reset_writer();
+          return ForwardWriteFailure(written);
+        }
         flushed_batches_ = end_index;
         has_incr = true;
         start_index = end_index;
@@ -449,7 +467,7 @@ Status MemForwardStore::flush_locked() {
                                        status.ToString());
         }
 
-        result = table->CombineChunksToBatch();
+        auto result = table->CombineChunksToBatch();
         if (!result.ok()) {
           return Status::InternalError("failed to combine chunks: ",
                                        result.status().ToString());
@@ -459,8 +477,8 @@ Status MemForwardStore::flush_locked() {
 
       auto status = writer_->write(*batch_to_write);
       if (!status.ok()) {
-        return Status::InternalError("failed to write RecordBatch to file: ",
-                                     status.ToString());
+        reset_writer();
+        return ForwardWriteFailure(status);
       }
 
       flushed_batches_ = end_index;
@@ -477,21 +495,48 @@ Status MemForwardStore::flush_locked() {
              path_.c_str());
   }
   return Status::OK();
+} catch (const std::bad_alloc &) {
+  reset_writer();
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Insufficient memory to flush forward store");
 }
 
-Status MemForwardStore::close() {
-  // Exclusive: flush_locked() and the clears below rewrite cache_/batches_.
+void MemForwardStore::reset_writer() {
+  // A failed encoding or write may have consumed part of an input batch.
+  // The file is still unpublished. Replay all retained batches on retry.
+  writer_.reset();
+  flushed_batches_ = 0;
+}
+
+Status MemForwardStore::finalize() {
   std::lock_guard lock(cache_mtx_);
-  if (!cache_.empty() || !batches_.empty()) {
-    flush_locked();
-  }
+  return finalize_locked();
+}
+
+Status MemForwardStore::finalize_locked() try {
+  if (finalized_) return Status::OK();
+  auto flushed = flush_locked();
+  CHECK_RETURN_STATUS(flushed);
   if (writer_) {
     auto status = writer_->close();
     if (!status.ok()) {
-      LOG_WARN("failed to close writer: %s", status.ToString().c_str());
+      reset_writer();
+      return ForwardWriteFailure(status);
     }
     writer_.reset();
   }
+  finalized_ = true;
+  return Status::OK();
+} catch (const std::bad_alloc &) {
+  reset_writer();
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Insufficient memory to finalize forward store");
+}
+
+Status MemForwardStore::close() {
+  std::lock_guard lock(cache_mtx_);
+  auto status = finalize_locked();
+  CHECK_RETURN_STATUS(status);
   batches_.clear();
   cache_.clear();
   return Status::OK();
@@ -581,7 +626,8 @@ TablePtr MemForwardStore::fetch(const std::vector<std::string> &columns,
 
     if (!status.ok()) {
       if (status.IsOutOfMemory()) throw std::bad_alloc();
-      LOG_ERROR("failed to reserve rowid values: %s", status.ToString().c_str());
+      LOG_ERROR("failed to reserve rowid values: %s",
+                status.ToString().c_str());
       return nullptr;
     }
     for (int row : indices) builder.UnsafeAppend(static_cast<uint64_t>(row));

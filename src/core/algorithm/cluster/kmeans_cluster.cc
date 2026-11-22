@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -193,6 +194,9 @@ class KmeansCentroidFeatures : public IndexFeatures {
   KmeansCentroidFeatures(const IndexMeta &meta,
                          const IndexCluster::CentroidList &cents)
       : centroids_(cents),
+        stored_(std::any_of(
+            cents.begin(), cents.end(),
+            [](const auto &centroid) { return centroid.feature_stored(); })),
         feature_size_(meta.element_size()),
         feature_dimension_(meta.dimension()),
         data_type_(meta.data_type()) {}
@@ -209,6 +213,10 @@ class KmeansCentroidFeatures : public IndexFeatures {
     return centroids_[i].feature();
   }
 
+  const IndexCluster::CentroidList *stored_centroids() const {
+    return stored_ ? &centroids_ : nullptr;
+  }
+
   IndexMeta::DataType data_type() const override {
     return data_type_;
   }
@@ -219,6 +227,7 @@ class KmeansCentroidFeatures : public IndexFeatures {
 
  private:
   const IndexCluster::CentroidList &centroids_;
+  bool stored_;
   size_t feature_size_;
   size_t feature_dimension_;
   IndexMeta::DataType data_type_;
@@ -805,8 +814,12 @@ int KmeansCluster::label(IndexThreads::Pointer threads,
   if (!out) return IndexError_InvalidArgument;
   ailego::MemoryReservation output_memory;
   output_memory.add_array(features_->count(), 2 * sizeof(uint32_t));
-  this->update_labels(threads.get(), out);
-  return 0;
+  std::vector<uint32_t> candidate;
+  workspace_error_.store(0, std::memory_order_relaxed);
+  this->update_labels(threads.get(), &candidate);
+  const int status = workspace_error_.load(std::memory_order_relaxed);
+  if (status == 0) out->swap(candidate);
+  return status;
 } catch (const std::bad_alloc &) {
   return IndexError_NoMemory;
 }
@@ -948,6 +961,7 @@ int KmeansCluster::split_clusters(IndexThreads *threads,
     this->init_containers(count);
   }
   auto task_group = threads->make_group();
+  auto join = ailego::ScopeGuard::Make([&] { task_group->wait_finish(); });
 
   // Initilize base information
   size_t features_count = feature_count();
@@ -977,6 +991,7 @@ int KmeansCluster::split_clusters(IndexThreads *threads,
 void KmeansCluster::update_centroids(IndexThreads *threads,
                                      IndexCluster::CentroidList &cents) {
   auto task_group = threads->make_group();
+  auto join = ailego::ScopeGuard::Make([&] { task_group->wait_finish(); });
   for (size_t i = 0; i < cents.size(); ++i) {
     task_group->submit(ailego::Closure::New(
         this, &KmeansCluster::update_centroid_thread, i, &cents));
@@ -989,6 +1004,7 @@ void KmeansCluster::update_clusters(IndexThreads *threads,
   // Initilize containers
   this->init_features_containers(threads->count() * cents.size());
   auto task_group = threads->make_group();
+  auto join = ailego::ScopeGuard::Make([&] { task_group->wait_finish(); });
 
   size_t features_count = features_->count();
   size_t shard_count = std::max<size_t>(
@@ -1015,6 +1031,7 @@ void KmeansCluster::update_clusters(IndexThreads *threads,
 void KmeansCluster::update_features(IndexThreads *threads,
                                     IndexCluster::CentroidList &cents) {
   auto task_group = threads->make_group();
+  auto join = ailego::ScopeGuard::Make([&] { task_group->wait_finish(); });
   for (size_t i = 0; i < cents.size(); ++i) {
     // Process in work thread
     task_group->submit(ailego::Closure::New(
@@ -1030,6 +1047,7 @@ void KmeansCluster::update_labels(IndexThreads *threads,
       static_cast<size_t>(std::ceil(threads->count() * shard_factor_)), 1u);
   size_t fregment_count = (features_count + shard_count - 1) / shard_count;
   auto task_group = threads->make_group();
+  auto join = ailego::ScopeGuard::Make([&] { task_group->wait_finish(); });
 
   // Prepare buffer
   labels->resize(features_count);
@@ -1055,7 +1073,10 @@ void KmeansCluster::split_clusters_thread(size_t index_begin, size_t index_end,
                                           const IndexThreads *threads) try {
   size_t feature_size = meta_.element_size();
   ailego::BudgetedAlignedBuffer feature_scratch;
-  size_t thread_offset = threads->indexof_this() * seeker_->original()->count();
+  ailego::BudgetedAlignedBuffer centroid_scratch;
+  const auto centers =
+      std::static_pointer_cast<KmeansCentroidFeatures>(seeker_->original());
+  size_t thread_offset = threads->indexof_this() * centers->count();
   auto mean = paged_means_ ? NewVectorMean(meta_) : nullptr;
   std::vector<uint8_t> scratch;
   size_t current = std::numeric_limits<size_t>::max();
@@ -1074,8 +1095,13 @@ void KmeansCluster::split_clusters_thread(size_t index_begin, size_t index_end,
     }
     LinearSeeker::Document result(0, std::numeric_limits<float>::max());
 
-    // ignore error
-    seeker_->seek(feat, meta_.element_size(), &result);
+    const int seek_status =
+        seeker_->seek(feat, feature_size, &result, centers->stored_centroids(),
+                      &centroid_scratch);
+    if (seek_status != 0) {
+      workspace_error_.store(seek_status, std::memory_order_relaxed);
+      return;
+    }
 
     size_t sel_column = thread_offset + result.index;
     shard_cluster_scores_[sel_column] += result.score;
@@ -1167,20 +1193,31 @@ void KmeansCluster::update_centroid_thread(
 
 void KmeansCluster::update_cluster_thread(size_t index_begin, size_t index_end,
                                           const IndexThreads *threads) try {
-  size_t thread_offset = threads->indexof_this() * seeker_->original()->count();
+  ailego::BudgetedAlignedBuffer centroid_scratch;
+  const auto centers =
+      std::static_pointer_cast<KmeansCentroidFeatures>(seeker_->original());
+  size_t thread_offset = threads->indexof_this() * centers->count();
 
   for (size_t i = index_begin; i != index_end; ++i) {
+    if (workspace_error_.load(std::memory_order_relaxed) != 0) return;
     const void *feat = features_->element(i);
     LinearSeeker::Document result(0, std::numeric_limits<float>::max());
 
-    // ignore error
-    seeker_->seek(feat, meta_.element_size(), &result);
+    const int ret =
+        seeker_->seek(feat, meta_.element_size(), &result,
+                      centers->stored_centroids(), &centroid_scratch);
+    if (ret != 0) {
+      workspace_error_.store(ret, std::memory_order_relaxed);
+      return;
+    }
 
     size_t sel_column = thread_offset + result.index;
     shard_cluster_features_[sel_column].emplace_back(feat);
   }
 } catch (const std::bad_alloc &) {
   workspace_error_.store(IndexError_NoMemory);
+} catch (const std::exception &) {
+  workspace_error_.store(IndexError_Runtime);
 }
 
 void KmeansCluster::update_features_thread(
@@ -1212,15 +1249,28 @@ void KmeansCluster::update_features_thread(
 }
 
 void KmeansCluster::update_labels_thread(size_t index_begin, size_t index_end,
-                                         std::vector<uint32_t> *labels) {
+                                         std::vector<uint32_t> *labels) try {
+  ailego::BudgetedAlignedBuffer centroid_scratch;
+  const auto centers =
+      std::static_pointer_cast<KmeansCentroidFeatures>(seeker_->original());
   for (size_t i = index_begin; i != index_end; ++i) {
+    if (workspace_error_.load(std::memory_order_relaxed) != 0) return;
     const void *feat = features_->element(i);
     LinearSeeker::Document result(0, std::numeric_limits<float>::max());
 
-    // ignore error
-    seeker_->seek(feat, meta_.element_size(), &result);
+    const int ret =
+        seeker_->seek(feat, meta_.element_size(), &result,
+                      centers->stored_centroids(), &centroid_scratch);
+    if (ret != 0) {
+      workspace_error_.store(ret, std::memory_order_relaxed);
+      return;
+    }
     (*labels)[i] = static_cast<uint32_t>(result.index);
   }
+} catch (const std::bad_alloc &) {
+  workspace_error_.store(IndexError_NoMemory);
+} catch (const std::exception &) {
+  workspace_error_.store(IndexError_Runtime);
 }
 
 INDEX_FACTORY_REGISTER_CLUSTER_ALIAS(KmeansCluster, KmeansCluster, false);

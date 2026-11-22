@@ -13,6 +13,8 @@
 #include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <rocksdb/advanced_cache.h>
+#include <rocksdb/env.h>
+#include <rocksdb/write_buffer_manager.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/db/collection.h>
@@ -20,6 +22,7 @@
 #include "db/collection_fetch_internal.h"
 #include "db/common/file_helper.h"
 #include "db/common/global_resource.h"
+#include "db/common/rocksdb_context.h"
 #include "db/common/write_buffer_reservation.h"
 #include "db/index/common/version_manager.h"
 #include "db/index/storage/parquet_memory_pool.h"
@@ -280,6 +283,409 @@ TEST_F(CollectionWriteBudgetTest, UpdateReadFailureKeepsWalAndAllowsRetry) {
     EXPECT_EQ(vector, fetched->at("original")->get<std::vector<float>>("emb"));
     fetched->clear();
     ASSERT_TRUE(reopened.value()->close().ok());
+  }
+}
+
+TEST_F(CollectionWriteBudgetTest, FlushCanRetryAfterVectorReaderOpenFails) {
+  const auto collection_path = path("vector_reopen_failure");
+  auto collection_schema = schema();
+  ASSERT_TRUE(collection_schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "emb", DataType::VECTOR_FP32, 4, false,
+                      std::make_shared<FlatIndexParams>(MetricType::L2)))
+                  .ok());
+  auto writer = Collection::CreateAndOpen(collection_path, collection_schema,
+                                          {false, false, kMiB});
+  ASSERT_TRUE(writer.has_value()) << writer.error().message();
+  const std::vector<float> vector{1, 2, 3, 4};
+  auto first = docs("first", "before failed flush");
+  ASSERT_TRUE(first.front().set("emb", vector));
+  auto result = writer.value()->insert(first);
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->front().ok()) << result->front().message();
+
+  std::filesystem::path index_file;
+  for (const auto &entry :
+       std::filesystem::recursive_directory_iterator(collection_path)) {
+    if (entry.path().extension() == ".proxima") index_file = entry.path();
+  }
+  ASSERT_FALSE(index_file.empty());
+  auto hidden_index = index_file;
+  hidden_index += ".hidden";
+  std::error_code error;
+  std::filesystem::rename(index_file, hidden_index, error);
+  if (error) GTEST_SKIP() << "Cannot rename open vector index: " << error;
+  const auto failed = writer.value()->flush();
+  std::filesystem::rename(hidden_index, index_file);
+  ASSERT_FALSE(failed.ok());
+
+  {
+    auto fetched = writer.value()->fetch({"first"});
+    ASSERT_TRUE(fetched.has_value()) << fetched.error().message();
+    ASSERT_NE(nullptr, fetched->at("first"));
+    EXPECT_EQ("before failed flush",
+              fetched->at("first")->get<std::string>("payload"));
+    EXPECT_EQ(vector, fetched->at("first")->get<std::vector<float>>("emb"));
+  }
+  const auto retried = writer.value()->flush();
+  ASSERT_TRUE(retried.ok()) << retried.message();
+  auto second = docs("second");
+  ASSERT_TRUE(second.front().set("emb", vector));
+  result = writer.value()->insert(second);
+  ASSERT_TRUE(result.has_value());
+  ASSERT_TRUE(result->front().ok()) << result->front().message();
+  ASSERT_TRUE(writer.value()->close().ok());
+  auto reopened = Collection::Open(collection_path, {true, false, kMiB});
+  ASSERT_TRUE(reopened.has_value()) << reopened.error().message();
+  auto fetched = reopened.value()->fetch({"first", "second"});
+  ASSERT_TRUE(fetched.has_value()) << fetched.error().message();
+  ASSERT_NE(nullptr, fetched->at("first"));
+  ASSERT_NE(nullptr, fetched->at("second"));
+  EXPECT_EQ(vector, fetched->at("first")->get<std::vector<float>>("emb"));
+  EXPECT_EQ(vector, fetched->at("second")->get<std::vector<float>>("emb"));
+}
+
+class RejectSstCreation : public rocksdb::EnvWrapper {
+ public:
+  RejectSstCreation() : rocksdb::EnvWrapper(rocksdb::Env::Default()) {}
+
+  rocksdb::Status NewWritableFile(
+      const std::string &filename,
+      std::unique_ptr<rocksdb::WritableFile> *result,
+      const rocksdb::EnvOptions &options) override {
+    if (std::filesystem::path(filename).extension() == ".sst") {
+      ++rejections;
+      return rocksdb::Status::IOError("Injected SST creation failure");
+    }
+    return target()->NewWritableFile(filename, result, options);
+  }
+
+  std::atomic<int> rejections{0};
+};
+
+TEST_F(CollectionWriteBudgetTest, RocksWriteStatusReflectsCommittedMutation) {
+  RejectSstCreation env;
+  RocksdbContext ctx;
+  ctx.create_opts_.env = &env;
+  ASSERT_TRUE(ctx.create(path("rocks_flush_failure")).ok());
+  auto manager = ctx.create_opts_.write_buffer_manager;
+  const size_t original_limit = manager->buffer_size();
+  AILEGO_DEFER([&] { manager->SetBufferSize(original_limit); });
+  constexpr size_t limit = 256 * 1024;
+  ASSERT_LT(manager->memory_usage(), limit);
+  manager->SetBufferSize(limit);
+
+  const std::string value(2 * limit, 'v');
+  const auto write = ctx.put("committed", value);
+  EXPECT_GT(env.rejections.load(), 0);
+  std::string actual;
+  ASSERT_TRUE(ctx.db_->Get(ctx.read_opts_, "committed", &actual).ok());
+  EXPECT_EQ(value, actual);
+  EXPECT_TRUE(write.ok()) << write.ToString();
+  EXPECT_FALSE(ctx.flush().ok());
+}
+
+TEST_F(CollectionWriteBudgetTest, EmptyRocksColumnFamiliesDoNotStallWriters) {
+  RocksdbContext ctx;
+  ASSERT_TRUE(ctx.create(path("empty_rocks_cfs"), {"a", "b", "c", "d"}).ok());
+  auto manager = ctx.create_opts_.write_buffer_manager;
+  const size_t original_limit = manager->buffer_size();
+  AILEGO_DEFER([&] { manager->SetBufferSize(original_limit); });
+  manager->SetBufferSize(256 * 1024);
+  ASSERT_FALSE(manager->ShouldStall());
+  EXPECT_TRUE(ctx.put("key", "value").ok());
+  EXPECT_TRUE(ctx.close().ok());
+}
+
+TEST_F(CollectionWriteBudgetTest, FlushCanRetryAfterManifestPublicationFails) {
+  const auto collection_path = path("manifest_failure");
+  auto writer = Collection::CreateAndOpen(collection_path, schema(),
+                                          {false, false, kMiB});
+  ASSERT_TRUE(writer.has_value()) << writer.error().message();
+  auto first = docs("first");
+  auto inserted = writer.value()->insert(first);
+  ASSERT_TRUE(inserted.has_value());
+  ASSERT_TRUE(inserted->front().ok());
+  ASSERT_TRUE(writer.value()->flush().ok());
+
+  auto second = docs("second");
+  inserted = writer.value()->insert(second);
+  ASSERT_TRUE(inserted.has_value());
+  ASSERT_TRUE(inserted->front().ok());
+  const auto removed = writer.value()->delete_({"first"});
+  ASSERT_TRUE(removed.has_value());
+  ASSERT_TRUE(removed->front().ok());
+
+  const auto blocked =
+      FileHelper::MakeFilePath(collection_path, FileID::MANIFEST_FILE, 2);
+  ASSERT_TRUE(std::filesystem::create_directory(blocked));
+  const auto failure = writer.value()->flush();
+  auto third = docs("third");
+  const auto blocked_write = writer.value()->insert(third);
+  ASSERT_TRUE(std::filesystem::remove(blocked));
+  ASSERT_FALSE(failure.ok());
+  ASSERT_TRUE(blocked_write.has_value()) << blocked_write.error().message();
+  ASSERT_FALSE(blocked_write->front().ok());
+  {
+    auto fetched = writer.value()->fetch({"first", "second"});
+    ASSERT_TRUE(fetched.has_value()) << fetched.error().message();
+    EXPECT_EQ(nullptr, fetched->at("first"));
+    EXPECT_NE(nullptr, fetched->at("second"));
+  }
+  inserted = writer.value()->insert(third);
+  ASSERT_TRUE(inserted.has_value());
+  ASSERT_TRUE(inserted->front().ok()) << inserted->front().message();
+  ASSERT_TRUE(writer.value()->close().ok());
+  auto reopened = Collection::Open(collection_path, {true, false, kMiB});
+  ASSERT_TRUE(reopened.has_value()) << reopened.error().message();
+  auto fetched = reopened.value()->fetch({"first", "second", "third"});
+  ASSERT_TRUE(fetched.has_value()) << fetched.error().message();
+  EXPECT_EQ(nullptr, fetched->at("first"));
+  EXPECT_NE(nullptr, fetched->at("second"));
+  EXPECT_NE(nullptr, fetched->at("third"));
+}
+
+TEST_F(CollectionWriteBudgetTest, DeleteOnlyFlushIgnoresEmptyForwardWriter) {
+  const auto collection_path = path("delete_only_flush");
+  const CollectionOptions options{false, false, 64 * 1024};
+  auto writer = Collection::CreateAndOpen(collection_path, schema(), options);
+  ASSERT_TRUE(writer.has_value()) << writer.error().message();
+  auto rows = docs("deleted");
+  rows.push_back(docs("retained").front());
+  auto inserted = writer.value()->insert(rows);
+  ASSERT_TRUE(inserted.has_value());
+  ASSERT_TRUE(inserted->at(0).ok());
+  ASSERT_TRUE(inserted->at(1).ok());
+  ASSERT_TRUE(writer.value()->flush().ok());
+
+  auto version = VersionManager::Recovery(collection_path);
+  ASSERT_TRUE(version.has_value());
+  const auto meta = version.value()->get_current_version().writing_segment_meta();
+  const auto writing_block = meta->writing_forward_block();
+  ASSERT_TRUE(writing_block.has_value());
+  const auto forward_path = FileHelper::MakeForwardBlockPath(
+      collection_path, meta->id(), writing_block->id(), true);
+  ASSERT_FALSE(std::filesystem::exists(forward_path));
+
+  auto &budget = ailego::MemoryLimitPool::get_instance();
+  ASSERT_GT(budget.capacity() - budget.used(), kMiB);
+  const auto pressure = budget.capacity() - budget.used() - kMiB;
+  ASSERT_TRUE(budget.try_charge_external(pressure));
+  {
+    AILEGO_DEFER([&] { budget.release_external(pressure); });
+    auto oversized = docs("rejected", std::string(2 * kMiB, 'x'));
+    auto rejected = writer.value()->insert(oversized);
+    ASSERT_TRUE(rejected.has_value());
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, rejected->front().code());
+    EXPECT_TRUE(std::filesystem::exists(forward_path));
+  }
+
+  auto removed = writer.value()->delete_({"deleted"});
+  ASSERT_TRUE(removed.has_value());
+  ASSERT_TRUE(removed->front().ok());
+  ASSERT_TRUE(writer.value()->flush().ok());
+  ASSERT_TRUE(writer.value()->close().ok());
+
+  auto reopened = Collection::Open(collection_path, options);
+  ASSERT_TRUE(reopened.has_value()) << reopened.error().message();
+  auto appended = docs("appended");
+  inserted = reopened.value()->insert(appended);
+  ASSERT_TRUE(inserted.has_value());
+  ASSERT_TRUE(inserted->front().ok()) << inserted->front().message();
+  auto fetched = reopened.value()->fetch({"deleted", "retained", "appended"});
+  ASSERT_TRUE(fetched.has_value()) << fetched.error().message();
+  EXPECT_EQ(nullptr, fetched->at("deleted"));
+  ASSERT_NE(nullptr, fetched->at("retained"));
+  ASSERT_NE(nullptr, fetched->at("appended"));
+  EXPECT_LT(fetched->at("retained")->doc_id(), fetched->at("appended")->doc_id());
+}
+
+TEST_F(CollectionWriteBudgetTest, RolloverCanRetryAfterReplacementCreateFails) {
+  const auto collection_path = path("rollover_failure");
+  const auto small_segments = schema();
+  auto writer = Collection::CreateAndOpen(collection_path, small_segments,
+                                          {false, false, kMiB});
+  ASSERT_TRUE(writer.has_value()) << writer.error().message();
+  std::vector<Doc> rows;
+  rows.reserve(small_segments.max_doc_count_per_segment());
+  for (size_t i = 0; i < small_segments.max_doc_count_per_segment(); ++i) {
+    Doc row;
+    row.set_pk("row" + std::to_string(i));
+    row.set("payload", std::string("original value"));
+    rows.push_back(std::move(row));
+  }
+  const auto inserted = writer.value()->insert(rows);
+  ASSERT_TRUE(inserted.has_value()) << inserted.error().message();
+  ASSERT_EQ(rows.size(), inserted->size());
+  for (const auto &status : *inserted)
+    ASSERT_TRUE(status.ok()) << status.message();
+
+  auto version = VersionManager::Recovery(collection_path);
+  ASSERT_TRUE(version.has_value());
+  const auto blocked = FileHelper::MakeSegmentPath(
+      collection_path, version.value()->get_current_version().next_segment_id());
+  ASSERT_TRUE(std::filesystem::create_directory(blocked));
+  auto next = docs("next");
+  const auto failure = writer.value()->insert(next);
+  ASSERT_TRUE(std::filesystem::remove(blocked));
+  ASSERT_FALSE(failure.has_value());
+  {
+    auto fetched = writer.value()->fetch({"row0", "next"});
+    ASSERT_TRUE(fetched.has_value()) << fetched.error().message();
+    ASSERT_NE(nullptr, fetched->at("row0"));
+    EXPECT_EQ("original value", fetched->at("row0")->get<std::string>("payload"));
+    EXPECT_EQ(nullptr, fetched->at("next"));
+  }
+  const auto retried = writer.value()->insert(next);
+  ASSERT_TRUE(retried.has_value()) << retried.error().message();
+  ASSERT_TRUE(retried->front().ok()) << retried->front().message();
+  ASSERT_TRUE(writer.value()->close().ok());
+  auto reopened = Collection::Open(collection_path, {true, false, kMiB});
+  ASSERT_TRUE(reopened.has_value()) << reopened.error().message();
+  auto fetched = reopened.value()->fetch({"row0", "next"});
+  ASSERT_TRUE(fetched.has_value()) << fetched.error().message();
+  ASSERT_NE(nullptr, fetched->at("row0"));
+  ASSERT_NE(nullptr, fetched->at("next"));
+  EXPECT_EQ(rows.size(), fetched->at("next")->doc_id());
+}
+
+TEST_F(CollectionWriteBudgetTest, BufferedVectorRefusalPrecedesWalAndMutation) {
+  const auto collection_path = path("vector_write_admission");
+  auto schema_with_vectors = schema();
+  ASSERT_TRUE(schema_with_vectors
+                  .add_field(std::make_shared<FieldSchema>(
+                      "emb", DataType::VECTOR_FP32, 4096, true,
+                      std::make_shared<FlatIndexParams>(MetricType::L2)))
+                  .ok());
+  auto writer = Collection::CreateAndOpen(collection_path, schema_with_vectors,
+                                          {false, false, 8 * kMiB});
+  ASSERT_TRUE(writer.has_value()) << writer.error().message();
+  const std::vector<float> vector(4096, 1.0f);
+  auto anchor = docs("anchor");
+  ASSERT_TRUE(anchor.front().set("emb", vector));
+  const auto inserted = writer.value()->insert(anchor);
+  ASSERT_TRUE(inserted.has_value());
+  ASSERT_TRUE(inserted->front().ok()) << inserted->front().message();
+
+  auto version = VersionManager::Recovery(collection_path);
+  ASSERT_TRUE(version.has_value());
+  const auto meta = version.value()->get_current_version().writing_segment_meta();
+  const auto wal = FileHelper::MakeWalPath(
+      collection_path, meta->id(), meta->writing_forward_block()->id());
+  const auto wal_size = std::filesystem::file_size(wal);
+  auto next = docs("next");
+  ASSERT_TRUE(next.front().set("emb", vector));
+
+  auto &budget = ailego::MemoryLimitPool::get_instance();
+  constexpr size_t step = 1024;
+  ASSERT_GT(budget.capacity(), budget.external_used() + budget.metadata_used() +
+                                   step);
+  auto pressure = budget.capacity() - budget.external_used() -
+                  budget.metadata_used() - step;
+  // The effective hard pressure accounts for uncharged allocator fragments
+  // and evicts unused index pages. No writer or WAL reserve is bypassed.
+  while (pressure > step && !budget.try_charge_external(pressure))
+    pressure -= step;
+  ASSERT_GT(pressure, step);
+  {
+    AILEGO_DEFER([&] { budget.release_external(pressure); });
+    auto refused = writer.value()->insert(next);
+    ASSERT_TRUE(refused.has_value()) << refused.error().message();
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, refused->front().code());
+    EXPECT_NE(std::string::npos,
+              refused->front().message().find("Failed to prepare vector insert"));
+    EXPECT_EQ(wal_size, std::filesystem::file_size(wal));
+  }
+  {
+    auto fetched = writer.value()->fetch({"anchor", "next"});
+    ASSERT_TRUE(fetched.has_value()) << fetched.error().message();
+    ASSERT_NE(nullptr, fetched->at("anchor"));
+    EXPECT_EQ(nullptr, fetched->at("next"));
+    EXPECT_EQ(vector, fetched->at("anchor")->get<std::vector<float>>("emb"));
+  }
+  const auto retried = writer.value()->insert(next);
+  ASSERT_TRUE(retried.has_value()) << retried.error().message();
+  ASSERT_TRUE(retried->front().ok()) << retried->front().message();
+  ASSERT_TRUE(writer.value()->flush().ok());
+}
+
+TEST_F(CollectionWriteBudgetTest, BufferedVectorWriteHandlesQuantizedNullableGaps) {
+  const auto collection_path = path("vector_write_gaps");
+  auto schema_with_vectors = schema();
+  ASSERT_TRUE(schema_with_vectors
+                  .add_field(std::make_shared<FieldSchema>(
+                      "emb", DataType::VECTOR_FP32, 4, true,
+                      std::make_shared<FlatIndexParams>(MetricType::L2,
+                                                        QuantizeType::FP16)))
+                  .ok());
+  ASSERT_TRUE(schema_with_vectors
+                  .add_field(std::make_shared<FieldSchema>(
+                      "other", DataType::VECTOR_FP32, 4, true,
+                      std::make_shared<FlatIndexParams>(MetricType::L2)))
+                  .ok());
+  auto writer = Collection::CreateAndOpen(collection_path, schema_with_vectors,
+                                          {false, false, kMiB});
+  ASSERT_TRUE(writer.has_value()) << writer.error().message();
+  auto rows = docs("gap");
+  Doc next;
+  next.set_pk("both");
+  const std::vector<float> emb{1, 2, 3, 4};
+  const std::vector<float> other{4, 3, 2, 1};
+  ASSERT_TRUE(next.set("payload", std::string("both vectors")));
+  ASSERT_TRUE(next.set("emb", emb));
+  ASSERT_TRUE(next.set("other", other));
+  rows.push_back(std::move(next));
+  const auto inserted = writer.value()->insert(rows);
+  ASSERT_TRUE(inserted.has_value()) << inserted.error().message();
+  ASSERT_TRUE(inserted->at(0).ok()) << inserted->at(0).message();
+  ASSERT_TRUE(inserted->at(1).ok()) << inserted->at(1).message();
+  ASSERT_TRUE(writer.value()->close().ok());
+  auto reopened = Collection::Open(collection_path, {true, false, kMiB});
+  ASSERT_TRUE(reopened.has_value()) << reopened.error().message();
+  auto fetched = reopened.value()->fetch({"gap", "both"});
+  ASSERT_TRUE(fetched.has_value()) << fetched.error().message();
+  ASSERT_NE(nullptr, fetched->at("gap"));
+  ASSERT_NE(nullptr, fetched->at("both"));
+  EXPECT_EQ(emb, fetched->at("both")->get<std::vector<float>>("emb"));
+  EXPECT_EQ(other, fetched->at("both")->get<std::vector<float>>("other"));
+  SearchQuery query;
+  query.topk_ = 2;
+  query.target_.field_name_ = "emb";
+  query.target_.set_vector(std::string(reinterpret_cast<const char *>(emb.data()),
+                                       emb.size() * sizeof(float)));
+  auto matches = reopened.value()->query(query);
+  ASSERT_TRUE(matches.has_value()) << matches.error().message();
+  ASSERT_EQ(1u, matches->size());
+  EXPECT_EQ("both", matches->front()->pk_ref());
+}
+
+TEST_F(CollectionWriteBudgetTest, WalRecoveryRemovesTornTailBeforeAppend) {
+  for (const auto tail_bytes : {2, 6, 9}) {
+    SCOPED_TRACE(tail_bytes);
+    const auto wal_path = path(("torn_wal_" + std::to_string(tail_bytes)).c_str());
+    WalFilePtr wal;
+    ASSERT_EQ(0, WalFile::CreateAndOpen(wal_path, {0, true}, &wal));
+    ASSERT_EQ(0, wal->append("first"));
+    ASSERT_EQ(0, wal->flush());
+    const auto first_end = std::filesystem::file_size(wal_path);
+    ASSERT_EQ(0, wal->append("incomplete"));
+    ASSERT_EQ(0, wal->close());
+    std::filesystem::resize_file(wal_path, first_end + tail_bytes);
+
+    ASSERT_EQ(0, WalFile::CreateAndOpen(wal_path, {0, false}, &wal));
+    ASSERT_EQ(0, wal->prepare_for_read());
+    EXPECT_EQ("first", wal->next());
+    EXPECT_TRUE(wal->next().empty());
+    EXPECT_TRUE(wal->read_status().ok());
+    ASSERT_EQ(0, wal->close());
+
+    ASSERT_EQ(0, WalFile::CreateAndOpen(wal_path, {0, false}, &wal));
+    ASSERT_EQ(0, wal->append("second"));
+    ASSERT_EQ(0, wal->prepare_for_read());
+    EXPECT_EQ("first", wal->next());
+    EXPECT_EQ("second", wal->next());
+    EXPECT_TRUE(wal->next().empty());
+    EXPECT_TRUE(wal->read_status().ok());
   }
 }
 

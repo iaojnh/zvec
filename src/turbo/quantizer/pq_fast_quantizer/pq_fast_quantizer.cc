@@ -314,8 +314,9 @@ int PqFastQuantizer::train(IndexHolder::Pointer holder, int thread_count) try {
   // Preserve the seeded partial Fisher-Yates sample order without copying
   // the full corpus before sampling.
   std::vector<uint8_t> all_data;
-  if (!CollectPqTrainingSamples(holder, kMaxTrainVectors, vec_bytes, &all_data))
-    return kErrUnsupported;
+  int input_status =
+      ReadPqTrainingSamples(holder, kMaxTrainVectors, vec_bytes, &all_data);
+  if (input_status != 0) return input_status;
 
   size_t data_stride = original_dim_ * elem_size;
 

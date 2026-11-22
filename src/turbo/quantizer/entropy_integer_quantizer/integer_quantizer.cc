@@ -52,8 +52,9 @@ static inline void MakeSmooth(ailego::BudgetedVector<float> &dist) {
 }
 
 //! Compute the Entropy of distribution p/q by  Kullback-Leibler Divergence
-static inline double ComputeKlDivergence(const ailego::BudgetedVector<float> &p,
-                                         const ailego::BudgetedVector<float> &q) {
+static inline double ComputeKlDivergence(
+    const ailego::BudgetedVector<float> &p,
+    const ailego::BudgetedVector<float> &q) {
   if (p.size() != q.size() || p.size() == 0) {
     return std::numeric_limits<float>::max();
   }
@@ -72,8 +73,8 @@ static inline double ComputeKlDivergence(const ailego::BudgetedVector<float> &p,
 //! [-threshold, threshold]
 static inline void ExpandCandidateDistribution(
     const ailego::BudgetedVector<uint32_t> &distribution,
-    const ailego::BudgetedVector<float> &quantized_distribution, size_t threshold,
-    ailego::BudgetedVector<float> *expand_distribution) {
+    const ailego::BudgetedVector<float> &quantized_distribution,
+    size_t threshold, ailego::BudgetedVector<float> *expand_distribution) {
   expand_distribution->resize(threshold * 2, 0);
   float merged_cnt = static_cast<float>(expand_distribution->size()) /
                      quantized_distribution.size();
@@ -127,8 +128,8 @@ static inline void ExpandCandidateDistribution(
  *  Implement Int8 Quantization Algorithm ref:
  *  http://on-demand.gputechconf.com/gtc/2017/presentation/s7310-8-bit-inference-with-tensorrt.pdf
  */
-static inline size_t ComputeThreshold(const ailego::BudgetedVector<uint32_t> &hist,
-                                      const size_t target_bins) {
+static inline size_t ComputeThreshold(
+    const ailego::BudgetedVector<uint32_t> &hist, const size_t target_bins) {
   ailego::BudgetedVector<float> p_distribution(hist.size());
   size_t zero_point_index = hist.size() / 2;
 
@@ -276,7 +277,7 @@ static inline float QuantizeValue(float val, float scale, float bias) {
     if (!non_bias_) {                                                    \
       bias_ += (MAX_VALUE + MIN_VALUE) * 0.5f / scale_;                  \
     }                                                                    \
-    ailego::BudgetedVector<uint32_t>().swap(histogram_);                         \
+    ailego::BudgetedVector<uint32_t>().swap(histogram_);                 \
     scale_reciprocal_ = 1 / scale_;                                      \
     return true;                                                         \
   }

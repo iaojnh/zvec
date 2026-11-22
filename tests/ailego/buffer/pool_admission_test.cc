@@ -11,6 +11,7 @@
 #include <ailego/pattern/defer.h>
 #include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/memory_helper.h>
+#include <future>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/budgeted_allocator.h>
@@ -260,6 +261,43 @@ TEST_F(PoolAdmissionTest, MandatoryConsumersWaitWhileCapacityMakesProgress) {
   }
 }
 
+
+TEST_F(PoolAdmissionTest, RequiredWorkspaceWaitsForMappedOwnerReleases) {
+  using namespace std::chrono_literals;
+  ASSERT_EQ(0, pool_.init(baseline_ + 32 * page_));
+  MemoryLimitPoolTestPeer::stop_background(pool_);
+  BudgetedMappedBuffer first, second, request;
+  ASSERT_EQ(0, first.resize(4 * page_));
+  ASSERT_EQ(0, second.resize(4 * page_));
+  const size_t bytes = pool_.available() / page_ * page_ + 6 * page_;
+  ASSERT_LT(bytes, pool_.capacity());
+
+  const auto initial_waits = pool_.stats().capacity_waits;
+  auto required = std::async(std::launch::async, [&] {
+    return request.resize(bytes);
+  });
+  const auto observe_wait_after = [&](uint64_t prior_waits) {
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (pool_.stats().capacity_waits <= prior_waits &&
+           required.wait_for(0s) != std::future_status::ready &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+    return pool_.stats().capacity_waits > prior_waits;
+  };
+
+  EXPECT_TRUE(observe_wait_after(initial_waits));
+  const auto before_release = pool_.stats().capacity_waits;
+  first.clear();
+  EXPECT_LT(pool_.available(), bytes);
+  EXPECT_TRUE(observe_wait_after(before_release));
+  // The second owner may still be active after the next 100 ms poll.
+  EXPECT_EQ(std::future_status::timeout, required.wait_for(250ms));
+  second.clear();
+  EXPECT_EQ(0, required.get());
+  EXPECT_EQ(bytes, request.size());
+  expect_bounded();
+}
 
 TEST_F(PoolAdmissionTest, BackingRefusalRollsBackUsedReservation) {
   {

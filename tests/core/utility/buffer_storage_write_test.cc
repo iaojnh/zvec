@@ -200,6 +200,65 @@ TEST_F(BufferStorageWriteTest, WritableReopenNeedsCacheAndAllowsRetry) {
   ASSERT_EQ(0, storage->close());
 }
 
+TEST_F(BufferStorageWriteTest, MappingOpenRefusalReleasesPendingMapping) {
+  IndexMapping mapping;
+  ASSERT_EQ(0, mapping.create(file_path_, 128));
+  const size_t mapping_bytes = mapping.index_size();
+  mapping.close();
+
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t baseline = pool.external_used();
+  bool refused = false;
+  bool opened = false;
+  for (size_t slack = 0; slack <= 1024 && !opened; slack += 8) {
+    const size_t available = mapping_bytes + slack;
+    ASSERT_GT(pool.available(), available);
+    const size_t held = pool.available() - available;
+    ASSERT_TRUE(pool.try_charge_external(held));
+    const int ret = mapping.open(file_path_, false, true);
+    mapping.close();
+    pool.release_external(held);
+    ASSERT_EQ(baseline, pool.external_used()) << "slack=" << slack;
+    ASSERT_TRUE(ret == 0 || ret == IndexError_NoMemory) << ret;
+    refused |= ret == IndexError_NoMemory;
+    opened |= ret == 0;
+  }
+  EXPECT_TRUE(refused);
+  EXPECT_TRUE(opened);
+}
+
+TEST_F(BufferStorageWriteTest, MappingAppendRefusalKeepsDirectoryAndFile) {
+  IndexMapping mapping;
+  ASSERT_EQ(0, mapping.create(file_path_, 128));
+  const size_t initial_size = mapping.index_size();
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  bool refused = false;
+  bool appended = false;
+  for (size_t available = 0; available <= 1024 && !appended; available += 8) {
+    ASSERT_GT(pool.available(), available);
+    const size_t held = pool.available() - available;
+    ASSERT_TRUE(pool.try_charge_external(held));
+    const int ret = mapping.append("payload", 32);
+    pool.release_external(held);
+    ASSERT_TRUE(ret == 0 || ret == IndexError_NoMemory) << ret;
+    if (ret == IndexError_NoMemory) {
+      refused = true;
+      EXPECT_FALSE(mapping.has("payload"));
+      ASSERT_EQ(initial_size, mapping.index_size()) << "available=" << available;
+      EXPECT_EQ(0u, mapping.footer().segment_count);
+    } else {
+      appended = true;
+    }
+  }
+  EXPECT_TRUE(refused);
+  ASSERT_TRUE(appended);
+  ASSERT_EQ(0, mapping.flush());
+  mapping.close();
+  ASSERT_EQ(0, mapping.open(file_path_, false, true));
+  EXPECT_TRUE(mapping.has("payload"));
+  EXPECT_EQ(1u, mapping.segment_count());
+}
+
 TEST_F(BufferStorageWriteTest, MissingFileReturnsErrorAndAllowsRetry) {
   auto storage = IndexFactory::CreateStorage("BufferStorage");
   ASSERT_NE(nullptr, storage);
@@ -258,6 +317,125 @@ TEST_F(BufferStorageWriteTest, FailedFileCapturePreservesPublishedState) {
   std::fill(actual.begin(), actual.end(), '\0');
   ASSERT_EQ(actual.size(), segment->fetch(0, actual.data(), actual.size()));
   EXPECT_EQ(expected, actual);
+  EXPECT_EQ(0, storage->close());
+}
+
+TEST_F(BufferStorageWriteTest, BudgetRefusedReopenPreservesPublishedState) {
+  auto storage = open_writable();
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->append("old", 4096));
+  constexpr char payload[] = "pending writes survive same-file reopen";
+  auto writable = storage->get("old");
+  ASSERT_NE(nullptr, writable);
+  ASSERT_EQ(sizeof(payload), writable->write(0, payload, sizeof(payload)));
+  writable.reset();
+  ASSERT_EQ(0, storage->open(file_path_, false));
+  auto original = storage->get("old");
+  ASSERT_NE(nullptr, original);
+  char actual[sizeof(payload)]{};
+  ASSERT_EQ(sizeof(actual), original->fetch(0, actual, sizeof(actual)));
+  EXPECT_STREQ(payload, actual);
+  const auto original_pool = storage->vec_buffer_pool();
+
+  const std::string candidate_path = file_path_ + "-candidate";
+  AILEGO_DEFER([&] { ailego::File::Delete(candidate_path); });
+  auto candidate = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_NE(nullptr, candidate);
+  ASSERT_EQ(0, candidate->init(ailego::Params{}));
+  ASSERT_EQ(0, candidate->open(candidate_path, true));
+  ASSERT_EQ(0, candidate->append("new", 4096));
+  ASSERT_EQ(0, candidate->close());
+
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t held = pool.available();
+  ASSERT_TRUE(pool.try_charge_external(held));
+  const int ret = storage->open(candidate_path, false);
+  pool.release_external(held);
+  ASSERT_EQ(IndexError_NoMemory, ret);
+  ASSERT_EQ(original_pool, storage->vec_buffer_pool());
+  EXPECT_EQ(file_path_, storage->file_path());
+  EXPECT_TRUE(storage->has("old"));
+  ASSERT_EQ(sizeof(actual), original->fetch(0, actual, sizeof(actual)));
+  EXPECT_STREQ(payload, actual);
+  original.reset();
+
+  ASSERT_EQ(0, storage->open(candidate_path, false));
+  EXPECT_EQ(candidate_path, storage->file_path());
+  EXPECT_TRUE(storage->has("new"));
+  EXPECT_FALSE(storage->has("old"));
+  EXPECT_EQ(0, storage->close());
+}
+
+TEST_F(BufferStorageWriteTest, PreparedWritesCommitAcrossSegmentsAtFullBudget) {
+  auto storage = open_writable();
+  ASSERT_NE(nullptr, storage);
+  const size_t page = ailego::kVectorPageSize;
+  ASSERT_EQ(0, storage->append("first", 2 * page));
+  ASSERT_EQ(0, storage->append("second", page));
+  auto first = storage->get("first");
+  auto second = storage->get("second");
+  ASSERT_NE(nullptr, first);
+  ASSERT_NE(nullptr, second);
+
+  const size_t cross_page = page - 2;
+  constexpr char existing[] = "old";
+  ASSERT_EQ(sizeof(existing),
+            first->write(cross_page, existing, sizeof(existing)));
+  ASSERT_EQ(0, storage->flush());
+
+  using PreparedWrite = IndexStorage::Segment::PreparedWrite;
+  std::unique_ptr<PreparedWrite> first_write, second_write;
+  char first_input[] = "new";
+  char second_input[] = "second segment";
+  const IndexStorage::SegmentData first_fragment = {
+      cross_page, sizeof(first_input), first_input};
+  const IndexStorage::SegmentData second_fragment = {
+      8, sizeof(second_input), second_input};
+  ASSERT_EQ(0, first->prepare_write_batch(&first_fragment, 1, &first_write));
+  ASSERT_NE(nullptr, first_write);
+  EXPECT_EQ(IndexError_Runtime, storage->close());
+  EXPECT_EQ(IndexError_Runtime, storage->open(file_path_, false));
+  ASSERT_EQ(0, storage->append("third", page));
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  {
+    const size_t held = pool.available();
+    ASSERT_TRUE(pool.try_charge_external(held));
+    AILEGO_DEFER([&] { pool.release_external(held); });
+    EXPECT_EQ(IndexError_NoMemory,
+              second->prepare_write_batch(&second_fragment, 1, &second_write));
+  }
+  EXPECT_EQ(nullptr, second_write);
+  EXPECT_FALSE(storage->is_dirty());
+  first_write.reset();
+  char before[sizeof(existing)]{};
+  ASSERT_EQ(sizeof(before), first->fetch(cross_page, before, sizeof(before)));
+  EXPECT_STREQ(existing, before);
+  EXPECT_EQ(0u, second->data_size());
+
+  ASSERT_EQ(0, first->prepare_write_batch(&first_fragment, 1, &first_write));
+  ASSERT_EQ(0, second->prepare_write_batch(&second_fragment, 1, &second_write));
+  ASSERT_NE(nullptr, first_write);
+  ASSERT_NE(nullptr, second_write);
+  first_input[0] = second_input[0] = 'X';
+  {
+    const size_t held = pool.available();
+    ASSERT_TRUE(pool.try_charge_external(held));
+    AILEGO_DEFER([&] { pool.release_external(held); });
+    first_write->commit();
+    second_write->commit();
+  }
+  first_write.reset();
+  second_write.reset();
+  EXPECT_TRUE(storage->is_dirty());
+  EXPECT_EQ(8 + sizeof(second_input), second->data_size());
+  char actual_first[sizeof(first_input)]{};
+  char actual_second[sizeof(second_input)]{};
+  ASSERT_EQ(sizeof(actual_first),
+            first->fetch(cross_page, actual_first, sizeof(actual_first)));
+  ASSERT_EQ(sizeof(actual_second),
+            second->fetch(8, actual_second, sizeof(actual_second)));
+  EXPECT_STREQ("new", actual_first);
+  EXPECT_STREQ("second segment", actual_second);
   EXPECT_EQ(0, storage->close());
 }
 

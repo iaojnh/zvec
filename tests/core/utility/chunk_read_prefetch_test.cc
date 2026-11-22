@@ -20,7 +20,8 @@ struct MemoryLimitPoolTestPeer {
     pool.stop_background_evictor();
   }
   static void set_workspace_waiting(MemoryLimitPool &pool, size_t bytes) {
-    pool.workspace_waiting_size_.store(bytes, std::memory_order_relaxed);
+    pool.native_waiting_bytes_.store(bytes, std::memory_order_relaxed);
+    pool.mandatory_waiters_.store(bytes != 0, std::memory_order_relaxed);
   }
 };
 }  // namespace zvec::ailego
@@ -125,6 +126,41 @@ TEST_F(ChunkReadPrefetchTest, FullQueueReportsBackpressureAndRefillsAfterConsume
   EXPECT_LE(stats.prefetch_peak_bytes, 6 * page);
   EXPECT_EQ(0u, stats.prefetch_pending_requests);
   EXPECT_EQ(0u, stats.prefetch_failed);
+}
+
+TEST_F(ChunkReadPrefetchTest, ReleasingPreparedHintsKeepsOtherReaderHints) {
+  auto other = segment->clone();
+  ASSERT_TRUE(segment->try_prefetch(0, page));
+  ASSERT_TRUE(segment->try_prefetch(page, page));
+  ASSERT_TRUE(other->try_prefetch(2 * page, page));
+  ASSERT_FALSE(other->try_prefetch(3 * page, page));
+  EXPECT_EQ(0u, storage->stats().prefetch_submitted);
+
+  ChunkReadStorage::release_prefetch(segment.get());
+  EXPECT_EQ(1u, storage->stats().prefetch_pending_requests);
+  EXPECT_TRUE(other->try_prefetch(3 * page, page));
+  IndexStorage::MemoryBlock block;
+  ASSERT_EQ(64u, other->read(2 * page + 17, block, 64));
+  EXPECT_EQ(0, std::memcmp(block.data(), payload.data() + 2 * page + 17, 64));
+  ChunkReadStorage::release_prefetch(other.get());
+  EXPECT_EQ(0u, storage->stats().prefetch_pending_requests);
+  EXPECT_EQ(0u, storage->stats().prefetch_pending_bytes);
+  block.reset();
+  reclaim_all();
+  EXPECT_EQ(0u, storage->stats().cache_bytes);
+}
+
+TEST_F(ChunkReadPrefetchTest, ReleasingSubmittedHintsMakesBackingEvictable) {
+  using Priority = IndexStorage::Segment::CachePriority;
+  ASSERT_TRUE(segment->try_prefetch(0, 3 * page, Priority::kNormal));
+  ASSERT_GT(storage->stats().prefetch_submitted, 0u);
+  ASSERT_GT(storage->stats().prefetch_pending_requests, 0u);
+
+  ChunkReadStorage::release_prefetch(segment.get());
+  EXPECT_EQ(0u, storage->stats().prefetch_pending_requests);
+  EXPECT_EQ(0u, storage->stats().prefetch_pending_bytes);
+  reclaim_all();
+  EXPECT_EQ(0u, storage->stats().cache_bytes);
 }
 
 TEST_F(ChunkReadPrefetchTest, OversizedHintFallsBackWithoutBlockingNextChunk) {

@@ -162,6 +162,10 @@ Status GlobalConfig::validate(const ConfigData &config) const {
 Status GlobalConfig::initialize(const ConfigData &config) {
   {
     std::unique_lock<std::mutex> lock(initialization_mutex_);
+    if (initializing_thread_ == std::this_thread::get_id())
+      return Status::FailedPrecondition(
+          "Global configuration initialization is already running on this "
+          "thread");
     initialization_cv_.wait(lock, [this] {
       return initialization_state_ != InitializationState::kInitializing;
     });
@@ -170,10 +174,12 @@ Status GlobalConfig::initialize(const ConfigData &config) {
       return initialization_status_;
     }
     initialization_state_ = InitializationState::kInitializing;
+    initializing_thread_ = std::this_thread::get_id();
   }
 
   Status result;
   bool validation_failed = false;
+  bool published_resources = false;
   try {
     result = validate(config);
     validation_failed = !result.ok();
@@ -225,16 +231,7 @@ Status GlobalConfig::initialize(const ConfigData &config) {
     }
 
     if (result.ok()) {
-      if (!ailego::FileHelper::SetTemporaryDirectory(
-              effective_config.temporary_directory)) {
-        result =
-            Status::InvalidArgument("Failed to configure temporary_directory: ",
-                                    ailego::FileHelper::GetLastErrorString());
-      }
-    }
-
-    if (result.ok()) {
-      const int resource_result = GlobalResource::Instance().initialize(
+      const int resource_result = GlobalResource::Instance().prepare(
           effective_config.memory_limit_bytes,
           effective_config.query_thread_count,
           effective_config.query_thread_binding,
@@ -248,6 +245,13 @@ Status GlobalConfig::initialize(const ConfigData &config) {
       }
     }
 
+    if (result.ok() && !ailego::FileHelper::SetTemporaryDirectory(
+                           effective_config.temporary_directory)) {
+      result =
+          Status::InvalidArgument("Failed to configure temporary_directory: ",
+                                  ailego::FileHelper::GetLastErrorString());
+    }
+
     if (result.ok()) {
       auto old_config = config_snapshot();
       if (old_config->log_config != published_config->log_config) {
@@ -255,6 +259,11 @@ Status GlobalConfig::initialize(const ConfigData &config) {
       }
       std::atomic_store_explicit(&config_, std::move(published_config),
                                  std::memory_order_release);
+      // Resource accessors may immediately use these settings, including
+      // RocksDB worker counts. Publish the configuration before opening the
+      // resource fast path or releasing callers waiting for explicit startup.
+      published_resources = !GlobalResource::Instance().initialized_.exchange(
+          true, std::memory_order_acq_rel);
     }
   } catch (const std::exception &e) {
     result = Status::InternalError(
@@ -275,8 +284,10 @@ Status GlobalConfig::initialize(const ConfigData &config) {
         validation_failed ? InitializationState::kUninitialized
                           : (result.ok() ? InitializationState::kInitialized
                                          : InitializationState::kFailed);
+    initializing_thread_ = {};
   }
   initialization_cv_.notify_all();
+  if (published_resources) GlobalResource::Instance().log_initialized();
   return result;
 }
 
@@ -288,10 +299,17 @@ Status GlobalConfig::set_memory_pressure(MemoryPressure level) {
   using Pressure = ailego::ProcessRssBudget::PressureLevel;
   Pressure pressure;
   switch (level) {
-    case MemoryPressure::kNormal: pressure = Pressure::kNormal; break;
-    case MemoryPressure::kBackground: pressure = Pressure::kBackground; break;
-    case MemoryPressure::kCritical: pressure = Pressure::kCritical; break;
-    default: return Status::InvalidArgument("Invalid memory pressure level");
+    case MemoryPressure::kNormal:
+      pressure = Pressure::kNormal;
+      break;
+    case MemoryPressure::kBackground:
+      pressure = Pressure::kBackground;
+      break;
+    case MemoryPressure::kCritical:
+      pressure = Pressure::kCritical;
+      break;
+    default:
+      return Status::InvalidArgument("Invalid memory pressure level");
   }
   if (!GlobalResource::Instance().initialized())
     return Status::FailedPrecondition("Global resources are not initialized");

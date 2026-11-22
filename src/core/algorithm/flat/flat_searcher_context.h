@@ -623,9 +623,9 @@ class FlatSearcherContext : public IndexSearcher::Context {
         auto flush = [&] {
           if (!pending) return;
           if (quantizer_) {
-            quantizer_->calc_distance_dp_query_batch(
-                row_batch_pointers_.data(), static_cast<int>(pending),
-                current_query, scores_);
+            quantizer_->calc_distance_dp_query_batch(row_batch_pointers_.data(),
+                                                     static_cast<int>(pending),
+                                                     current_query, scores_);
           } else {
             row_batch_distance_(
                 row_batch_pointers_.data(), current_query, pending,
@@ -635,8 +635,8 @@ class FlatSearcherContext : public IndexSearcher::Context {
           row_topk_.push_block(scores_, row_batch_indices_.data(), pending);
           pending = 0;
         };
-        const size_t row_count = Filter ? accepted_rows.size()
-                                        : size / feature_size_;
+        const size_t row_count =
+            Filter ? accepted_rows.size() : size / feature_size_;
         for (size_t i = 0; i < row_count; ++i) {
           const size_t row = Filter ? accepted_rows[i] : i;
           const size_t row_offset = row * feature_size_;

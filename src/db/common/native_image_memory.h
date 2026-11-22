@@ -10,12 +10,12 @@
 #include <new>
 #include <zvec/ailego/buffer/memory_reservation.h>
 #if defined(__linux__)
-#include <link.h>
 #include <sys/auxv.h>
+#include <link.h>
 #include <unistd.h>
 #elif defined(__APPLE__)
-#include <TargetConditionals.h>
 #include <mach-o/loader.h>
+#include <TargetConditionals.h>
 #include <dlfcn.h>
 #include <unistd.h>
 #elif defined(_WIN32)
@@ -29,7 +29,7 @@ namespace zvec::detail {
 
 #if defined(__linux__)
 inline bool IsMainElfImage(const dl_phdr_info &image,
-                           const ElfW(Phdr) *main_headers) {
+                           const ElfW(Phdr) * main_headers) {
   // Bionic uses the executable path; glibc normally reports an empty name.
   return (main_headers && image.dlpi_phdr == main_headers) ||
          !image.dlpi_name || !*image.dlpi_name;
@@ -175,7 +175,7 @@ inline size_t NativeImageBytesForAddress(const void *anchor) {
   struct Search {
     uintptr_t address;
     size_t page_size;
-    const ElfW(Phdr) *main_headers;
+    const ElfW(Phdr) * main_headers;
     size_t bytes{0};
     bool found{false};
     bool valid{false};

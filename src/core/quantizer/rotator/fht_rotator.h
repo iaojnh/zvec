@@ -15,9 +15,9 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <memory>
 #include <turbo/preprocessor/fht_rotator/fht_rotator.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include "rotator.h"
 
 namespace zvec {

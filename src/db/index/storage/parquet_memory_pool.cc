@@ -289,11 +289,11 @@ arrow::Status ParquetMemoryPool::Allocate(int64_t size, int64_t alignment,
   // Keep cold decoding and tight budgets on the original mapping path.
   // Reused query buffers remain charged through the shared retained-block
   // pool, including page rounding, refault admission and idle reclamation.
-  const bool reuse_medium =
-      reuse_medium_buffers_ && enforce_budget_ &&
-      size >= kMappedAllocationThreshold && size <= kReusableMediumBytes &&
-      budget.capacity() >= kMediumReuseMinimumBudget &&
-      budget.available() >= 4 * static_cast<size_t>(size);
+  const bool reuse_medium = reuse_medium_buffers_ && enforce_budget_ &&
+                            size >= kMappedAllocationThreshold &&
+                            size <= kReusableMediumBytes &&
+                            budget.capacity() >= kMediumReuseMinimumBudget &&
+                            budget.available() >= 4 * static_cast<size_t>(size);
   if (size < kMappedAllocationThreshold || reuse_medium) {
     // Arrow requires a non-null data address even for empty binary/string
     // buffers. Let its allocator provide and own the zero-size sentinel.

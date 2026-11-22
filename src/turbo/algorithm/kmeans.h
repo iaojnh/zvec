@@ -19,11 +19,11 @@
 #include <ailego/algorithm/lloyd_cluster.h>
 #include <ailego/container/vector_array.h>
 #include <ailego/utility/matrix_helper.h>
-#include <zvec/ailego/buffer/budgeted_buffer.h>
-#include <zvec/ailego/buffer/memory_reservation.h>
 #include <turbo/distance/matrix.h>
 #include <turbo/norm/norm2_matrix.h>
 #include <turbo/norm/normalizer.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/container/heap.h>
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/ailego/utility/float_helper.h>
@@ -169,8 +169,9 @@ class Kmc2CentroidsGenerator {
       }
     }
     if (!cache.empty()) {
-      group->submit(ailego::Closure::New(&Kmc2CentroidsGenerator::UpdateCacheScores,
-                                 owner, &probs[matrix_count]));
+      group->submit(
+          ailego::Closure::New(&Kmc2CentroidsGenerator::UpdateCacheScores,
+                               owner, &probs[matrix_count]));
     }
     group->wait_finish();
     if (owner->matrix_status() != 0) return;
@@ -450,9 +451,10 @@ class NumericalKmeansContext {
   class Cluster {
    public:
     //! Constructor
-    Cluster(size_t dim,
-            std::shared_ptr<ailego::LloydClusterMatrixStorage> storage = nullptr,
-            size_t offset = 0)
+    Cluster(
+        size_t dim,
+        std::shared_ptr<ailego::LloydClusterMatrixStorage> storage = nullptr,
+        size_t offset = 0)
         : accum_(dim, std::move(storage), offset) {}
 
     //! Constructor
@@ -679,9 +681,10 @@ class NibbleKmeansContext {
   class Cluster {
    public:
     //! Constructor
-    Cluster(size_t dim,
-            std::shared_ptr<ailego::LloydClusterMatrixStorage> storage = nullptr,
-            size_t offset = 0)
+    Cluster(
+        size_t dim,
+        std::shared_ptr<ailego::LloydClusterMatrixStorage> storage = nullptr,
+        size_t offset = 0)
         : accum_(dim, std::move(storage), offset) {}
 
     //! Constructor
@@ -883,9 +886,10 @@ class NumericalInnerProductKmeansContext {
   class Cluster {
    public:
     //! Constructor
-    Cluster(size_t dim,
-            std::shared_ptr<ailego::LloydClusterMatrixStorage> storage = nullptr,
-            size_t offset = 0)
+    Cluster(
+        size_t dim,
+        std::shared_ptr<ailego::LloydClusterMatrixStorage> storage = nullptr,
+        size_t offset = 0)
         : accum_(dim, std::move(storage), offset) {}
 
     //! Constructor
@@ -1131,9 +1135,10 @@ class NibbleInnerProductKmeansContext {
   class Cluster {
    public:
     //! Constructor
-    Cluster(size_t dim,
-            std::shared_ptr<ailego::LloydClusterMatrixStorage> storage = nullptr,
-            size_t offset = 0)
+    Cluster(
+        size_t dim,
+        std::shared_ptr<ailego::LloydClusterMatrixStorage> storage = nullptr,
+        size_t offset = 0)
         : accum_(dim, std::move(storage), offset) {}
 
     //! Constructor

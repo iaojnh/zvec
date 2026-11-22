@@ -61,6 +61,10 @@ class FlatStreamer : public IndexStreamer {
   int add_with_id_impl(uint32_t id, const void *query,
                        const IndexQueryMeta &qmeta,
                        Context::Pointer &context) override;
+  int prepare_add_with_id(uint32_t id, const void *query,
+                          const IndexQueryMeta &qmeta,
+                          Context::Pointer &context,
+                          std::unique_ptr<PreparedAdd> *out) override;
 
   //! Similarity search
   int search_impl(const void *query, const IndexQueryMeta &qmeta,
@@ -219,8 +223,7 @@ class FlatStreamer : public IndexStreamer {
                                const IndexQueryMeta &qmeta, uint32_t count,
                                Context::Pointer &context) const;
   int search_external(const void *query, const IndexQueryMeta &qmeta,
-                      uint32_t count,
-                      const std::vector<uint64_t> *keys,
+                      uint32_t count, const std::vector<uint64_t> *keys,
                       Context::Pointer &context) const;
 
   //! Constants

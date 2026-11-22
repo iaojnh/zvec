@@ -551,36 +551,44 @@ IndexSearcher::Provider::Pointer DiskAnnStreamer::create_provider() const {
 }
 
 IndexSearcher::Context::Pointer DiskAnnStreamer::create_context() const {
+  Context::Pointer context;
+  create_context_with_status(context);
+  return context;
+}
+
+int DiskAnnStreamer::create_context_with_status(
+    Context::Pointer &context) const {
+  context.reset();
   if (state_ != STATE_LOADED) {
     LOG_ERROR("Open DiskAnnStreamer before creating a context");
-    return Context::Pointer();
+    return IndexError_NoReady;
   }
   const DiskAnnEntity::Pointer search_ctx_entity = entity_.clone();
   if (!search_ctx_entity) {
     LOG_ERROR("Failed to create search context entity");
-    return Context::Pointer();
+    return IndexError_Runtime;
   }
 
-  DiskAnnContext *ctx = new (std::nothrow)
-      DiskAnnContext(meta_, measure_, search_ctx_entity, data_quantizer_);
+  auto ctx = std::unique_ptr<DiskAnnContext>(new (std::nothrow) DiskAnnContext(
+      meta_, measure_, search_ctx_entity, data_quantizer_));
   if (ctx == nullptr) {
     LOG_ERROR("Failed to allocate DiskAnn Context");
-    return Context::Pointer();
+    return IndexError_NoMemory;
   }
-  if (ailego_unlikely(ctx->init(
-          DiskAnnContext::kSearcherContext, search_ctx_entity->max_degree(),
-          search_ctx_entity->pq_chunk_num(), meta_.element_size(),
-          diskann_indexer_->requires_io_context())) != 0) {
+  const int ret = ctx->init(
+      DiskAnnContext::kSearcherContext, search_ctx_entity->max_degree(),
+      search_ctx_entity->pq_chunk_num(), meta_.element_size(),
+      diskann_indexer_->requires_io_context());
+  if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Init DiskAnn Context failed");
-    delete ctx;
-
-    return Context::Pointer();
+    return ret;
   }
 
   ctx->set_list_size(list_size_);
   ctx->set_magic(magic_);
 
-  return Context::Pointer(ctx);
+  context = std::move(ctx);
+  return 0;
 }
 
 INDEX_FACTORY_REGISTER_STREAMER(DiskAnnStreamer);

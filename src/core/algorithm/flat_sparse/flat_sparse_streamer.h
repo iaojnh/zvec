@@ -71,6 +71,12 @@ class FlatSparseStreamer : public IndexStreamer {
                        const IndexQueryMeta &qmeta,
                        Context::Pointer &context) override;
 
+  int prepare_add_with_id(uint32_t id, uint32_t sparse_count,
+                          const uint32_t *indices, const void *values,
+                          const IndexQueryMeta &qmeta,
+                          Context::Pointer &context,
+                          std::unique_ptr<PreparedAdd> *out) override;
+
   //! Similarity search with sparse inputs
   int search_impl(const uint32_t sparse_count, const uint32_t *sparse_indices,
                   const void *sparse_query, const IndexQueryMeta &qmeta,

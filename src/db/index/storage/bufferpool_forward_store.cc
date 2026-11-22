@@ -894,8 +894,8 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
         return nullptr;
       seen[output] = true;
       const int rg = request.store->find_row_group_for_row(row);
-      groups[selected_rows++] =
-          {block, rg, output, row - request.store->row_group_offsets_[rg]};
+      groups[selected_rows++] = {block, rg, output,
+                                 row - request.store->row_group_offsets_[rg]};
     }
   }
   if (selected_rows != static_cast<size_t>(row_count)) return nullptr;
@@ -930,8 +930,8 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
     if (!field) return nullptr;
     arrow::ArrayVector chunks;
     chunks.reserve(group_count);
-    detail::RequestScratchArray<std::optional<ParquetBufferContextHandle>, 4> pins(
-        group_count);
+    detail::RequestScratchArray<std::optional<ParquetBufferContextHandle>, 4>
+        pins(group_count);
     size_t pin = 0;
     for (size_t group = 0; group < group_count; ++group) {
       const auto &key = groups[group];
@@ -943,7 +943,8 @@ TablePtr BufferPoolForwardStore::fetch_blocks(
       auto &id = identities[key.block];
       id.column = column;
       id.row_group = key.group;
-      pins[pin].emplace(ParquetBufferPool::get_instance().try_acquire_buffer(id));
+      pins[pin].emplace(
+          ParquetBufferPool::get_instance().try_acquire_buffer(id));
       const auto *borrowed = pins[pin++]->borrowed_data();
       if (!borrowed ||
           borrowed->length() != store->row_group_row_nums_[key.group])
@@ -1039,13 +1040,15 @@ arrow::Result<TablePtr> BufferPoolForwardStore::fetch_checked(
   const int first_group = find_row_group_for_row(indices.front());
   const int64_t first_offset = get_row_group_offset(first_group);
   const int64_t first_end = first_offset + row_group_row_nums_[first_group];
-  const bool single_group = std::all_of(indices.begin(), indices.end(),
+  const bool single_group = std::all_of(
+      indices.begin(), indices.end(),
       [&](int row) { return row >= first_offset && row < first_end; });
   if (single_group && !col_indices.empty()) {
     auto &rows = rg_to_local[first_group];
     rows.reserve(indices.size());
     for (int row : indices)
-      rows.emplace_back(output_row++, static_cast<uint64_t>(row - first_offset));
+      rows.emplace_back(output_row++,
+                        static_cast<uint64_t>(row - first_offset));
   }
   if (!single_group) {
     for (int global_row : indices) {
@@ -1309,8 +1312,8 @@ std::shared_ptr<Doc> BufferPoolForwardStore::fetch_doc(
   }
   const int group = find_row_group_for_row(index);
   const int64_t local_row = index - get_row_group_offset(group);
-  detail::RequestScratchArray<std::optional<ParquetBufferContextHandle>, 16> pins(
-      selected.size());
+  detail::RequestScratchArray<std::optional<ParquetBufferContextHandle>, 16>
+      pins(selected.size());
   detail::RequestScratchArray<std::pair<const arrow::Array *, int64_t>, 16>
       source_rows(selected.size());
   detail::QueryResultEstimate estimate;

@@ -24,9 +24,9 @@
 namespace zvec {
 namespace {
 
-InvertedSearchResult::Ptr FinishSearch(
-    InvertedSearchResult::Ptr result, const Result<roaring_bitmap_t *> &bitmap,
-    const InvertedColumnIndexer &indexer) {
+InvertedSearchResult::Ptr FinishSearch(InvertedSearchResult::Ptr result,
+                                       const Result<roaring_bitmap_t *> &bitmap,
+                                       const InvertedColumnIndexer &indexer) {
   if (bitmap) {
     result->set_and_own_bitmap(bitmap.value());
     return result;

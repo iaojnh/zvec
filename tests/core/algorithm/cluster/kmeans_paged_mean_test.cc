@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstring>
 #include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/core/framework/index_framework.h>
@@ -37,6 +38,76 @@ class KmeansPagedMeanTest : public ::testing::Test {
     EXPECT_EQ(pool.init(previous_), 0);
   }
 };
+
+TEST_F(KmeansPagedMeanTest, StoredCentroidAssignmentsPropagateReadFailure) {
+  class CentroidSource final : public IndexCluster::FeatureStorage {
+   public:
+    int read(size_t offset, void *out, size_t bytes) const override {
+      if (error != 0) return error;
+      std::memcpy(out, reinterpret_cast<const char *>(vectors) + offset, bytes);
+      return 0;
+    }
+
+    float vectors[2][2]{{0, 1}, {3, 4}};
+    int error{IndexError_NoMemory};
+  };
+
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0, pool.init(32 * 1024 * 1024));
+  const auto storage = std::make_shared<CentroidSource>();
+  IndexMeta meta(IndexMeta::DT_FP32, 2);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params{});
+  auto features = std::make_shared<CoherentIndexFeatures>(
+      meta, storage->vectors, sizeof(storage->vectors));
+  auto threads = std::make_shared<SingleQueueIndexThreads>(2, false);
+  auto cluster = IndexFactory::CreateCluster("KmeansCluster");
+  ASSERT_EQ(0, cluster->init(meta, {}));
+  ASSERT_EQ(0, cluster->mount(features));
+  IndexCluster::CentroidList centers(2);
+  for (size_t i = 0; i < centers.size(); ++i)
+    centers[i].set_feature_storage(storage, i * meta.element_size(),
+                                   meta.element_size());
+
+  std::vector<uint32_t> labels;
+  EXPECT_EQ(IndexError_NoMemory, cluster->label(threads, centers, &labels));
+  EXPECT_EQ(IndexError_NoMemory, cluster->classify(threads, centers));
+  storage->error = 0;
+  ASSERT_EQ(0, cluster->label(threads, centers, &labels));
+  EXPECT_EQ((std::vector<uint32_t>{0, 1}), labels);
+  ASSERT_EQ(0, cluster->classify(threads, centers));
+  for (size_t i = 0; i < centers.size(); ++i) {
+    ASSERT_EQ(1u, centers[i].similars().size());
+    EXPECT_EQ(features->element(i), centers[i].similars()[0]);
+  }
+}
+
+TEST_F(KmeansPagedMeanTest, OptKmeansLabelBorrowsCentroidsUnderPressure) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0, pool.init(8 * 1024 * 1024));
+  float rows[2][2]{{0, 1}, {3, 4}};
+  IndexMeta meta(IndexMeta::DT_FP32, 2);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params{});
+  auto features = std::make_shared<CoherentIndexFeatures>(meta, rows,
+                                                          sizeof(rows));
+  auto threads = std::make_shared<SingleQueueIndexThreads>(1, false);
+  auto cluster = IndexFactory::CreateCluster("OptKmeansCluster");
+  ASSERT_EQ(0, cluster->init(meta, {}));
+  ASSERT_EQ(0, cluster->mount(features));
+  IndexCluster::CentroidList centers;
+  for (const auto &row : rows) {
+    centers.emplace_back(row, sizeof(row));
+    ailego::MemoryReservation directory;
+    directory.add(IndexCluster::Centroid::loaded_metadata_bytes());
+    centers.back().adopt_metadata(std::move(directory));
+  }
+
+  const size_t remaining = sizeof(uint32_t) * 2 * centers.size();
+  ailego::MemoryReservation pressure;
+  pressure.add(pool.capacity() - pool.used() - remaining);
+  std::vector<uint32_t> labels;
+  ASSERT_EQ(0, cluster->label(threads, centers, &labels));
+  EXPECT_EQ((std::vector<uint32_t>{0, 1}), labels);
+}
 
 TEST_F(KmeansPagedMeanTest,
        ExactStateSurvivesEvictionForNumericAndPackedMeans) {

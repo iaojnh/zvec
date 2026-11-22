@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <zvec/ailego/pattern/singleton.h>
 #include <zvec/db/status.h>
 #include <zvec/export.h>
@@ -35,6 +36,7 @@ const std::string DEFAULT_LOG_BASENAME = "zvec.log";
 
 class ZVEC_API GlobalConfig : public ailego::Singleton<GlobalConfig> {
   friend class ailego::Singleton<GlobalConfig>;
+  friend class GlobalResource;
 
  public:
   enum class MemoryPressure : uint8_t { kNormal, kBackground, kCritical };
@@ -245,6 +247,7 @@ class ZVEC_API GlobalConfig : public ailego::Singleton<GlobalConfig> {
   // the winning thread is still working.
   InitializationState initialization_state_{
       InitializationState::kUninitialized};
+  std::thread::id initializing_thread_;
   Status initialization_status_{};
   std::condition_variable initialization_cv_;
   std::mutex initialization_mutex_;

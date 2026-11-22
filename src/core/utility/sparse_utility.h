@@ -55,11 +55,12 @@ struct VectorItem {
   VectorItem() = default;
   VectorItem(key_t pkey, ailego::BudgetedVector<uint8_t> vec)
       : pkey_(pkey), vec_(std::move(vec)) {}
-  VectorItem(key_t pkey, ailego::BudgetedVector<uint8_t> vec, bool needs_convert)
+  VectorItem(key_t pkey, ailego::BudgetedVector<uint8_t> vec,
+             bool needs_convert)
       : pkey_(pkey), vec_(std::move(vec)), needs_convert_{needs_convert} {}
   // TODO: drop support for hybrid vectors
-  VectorItem(key_t pkey, ailego::BudgetedVector<uint8_t> vec, std::string sparse_buffer,
-             uint32_t sparse_unit_size)
+  VectorItem(key_t pkey, ailego::BudgetedVector<uint8_t> vec,
+             std::string sparse_buffer, uint32_t sparse_unit_size)
       : pkey_(pkey),
         vec_(std::move(vec)),
         sparse_buffer_(std::move(sparse_buffer)),

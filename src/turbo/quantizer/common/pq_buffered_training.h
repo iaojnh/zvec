@@ -22,6 +22,7 @@
 #include <limits>
 #include <type_traits>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <turbo/algorithm/kmeans.h>
 #include <turbo/norm/normalizer.h>
 #include <zvec/core/framework/index_threads.h>
@@ -98,14 +99,12 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
   // transposed Lloyd matrices. Only one shared pool-backed file is needed.
   ret = core::TemporaryBufferStorage::Create(prefix, 3 * samples_bytes, &file);
   if (ret != 0) return ret;
-  int write_error = 0;
-  if (!CollectPqTrainingSamplesTo(holder, options.sample_limit, row_bytes,
-                                  [&](size_t slot, const void *row) {
-                                    write_error = file->write(slot * row_bytes,
-                                                              row, row_bytes);
-                                    return write_error == 0;
-                                  }))
-    return write_error != 0 ? write_error : core::IndexError_ReadData;
+  ret = CollectPqTrainingSamplesTo(holder, options.sample_limit, row_bytes,
+                                   [&](size_t slot, const void *row) {
+                                     return file->write(slot * row_bytes, row,
+                                                        row_bytes);
+                                   });
+  if (ret != 0) return ret;
 
   using Workspace = std::vector<T, ailego::BudgetedAllocator<T>>;
   Workspace row(options.dimension);
@@ -179,6 +178,12 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
       const size_t bytes = num * width * sizeof(T);
       NumericalKmeans<T, core::SingleQueueIndexThreads> algorithm(
           options.centroid_count, width);
+      auto matrix_status = [&] {
+        const int status = algorithm.matrix_status();
+        return status == decltype(algorithm)::kWorkspaceNoMemory
+                   ? static_cast<int>(core::IndexError_NoMemory)
+                   : status;
+      };
       algorithm.set_feature_matrix_storage(std::make_shared<PqMatrixSlice>(
           file, 2 * samples_bytes + offset, bytes));
       const size_t batch =
@@ -192,7 +197,8 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
         if (status != 0) return status;
         for (size_t i = 0; i < count; ++i)
           algorithm.append(rows.data() + i * width, width);
-        if (algorithm.matrix_status() != 0) return algorithm.matrix_status();
+        status = matrix_status();
+        if (status != 0) return status;
       }
       // append() has copied every row into the paged Lloyd matrix. Release
       // the import tile before centroid scratch overlaps the OPQ tiles; two
@@ -210,7 +216,7 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
         if (!algorithm.cluster_once(local_threads, &cost)) break;
         if (std::abs(cost - old_cost) < options.epsilon) break;
       }
-      if (algorithm.matrix_status() != 0) return algorithm.matrix_status();
+      if (const int status = matrix_status()) return status;
       const auto &cents = algorithm.centroids();
       if (cents.count() != options.centroid_count)
         return core::IndexError_Runtime;
@@ -220,6 +226,9 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
         std::memcpy(out + c * width * sizeof(T), cents[c], width * sizeof(T));
       return 0;
     };
+    // A later submit can throw while an earlier worker still holds references
+    // to error and train_one. Join before either captured local is destroyed.
+    auto join = ailego::ScopeGuard::Make([&] { group->wait_finish(); });
     for (size_t worker = 0; worker < threads->count(); ++worker) {
       group->submit(ailego::Closure::New([&, worker]() {
         try {

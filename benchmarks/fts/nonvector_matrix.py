@@ -920,8 +920,9 @@ def summarize(args):
                 for k, r in arms.items()
             },
         }
-        if "B" in arms and "M" in arms:
-            pairs = sorted(arms["B"].keys() & arms["M"].keys())
+        pairs = sorted(arms.get("B", {}).keys() & arms.get("M", {}).keys())
+        row["pairs"] = len(pairs)
+        if pairs:
             assert all(
                 (
                     arms["B"][r]["request_fingerprint"],
@@ -943,7 +944,6 @@ def summarize(args):
                 for r in pairs
             ]
             row.update(
-                pairs=len(pairs),
                 bp_mmap_speed=math.exp(statistics.mean(logs)),
                 parent_process_failure_pairs=sum(
                     arms["B"][r]["process_exit_code"] != 0

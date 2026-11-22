@@ -135,7 +135,8 @@ class FileReadStorage : public IndexStorage {
       if (total == 0) return false;
 
       try {
-        if (total > buffer_.size()) buffer_.resize(total, AILEGO_CACHE_LINE_SIZE);
+        if (total > buffer_.size())
+          buffer_.resize(total, AILEGO_CACHE_LINE_SIZE);
       } catch (const std::bad_alloc &) {
         thread_read_error() = IndexError_NoMemory;
         return false;
@@ -480,9 +481,7 @@ class FileReadStorage : public IndexStorage {
                 file_path_.c_str(), offset, size);
       return IndexStorage::Segment::Pointer();
     }
-    auto unmap = [size](void *addr) {
-      ailego::File::MemoryUnmap(addr, size);
-    };
+    auto unmap = [size](void *addr) { ailego::File::MemoryUnmap(addr, size); };
     std::unique_ptr<void, decltype(unmap)> mapping(data, unmap);
     auto result = std::make_shared<typename T::MMapSegment>(
         *(static_cast<const T *>(this)), segment, file_ptr, index_offset_,

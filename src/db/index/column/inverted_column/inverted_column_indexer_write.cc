@@ -261,6 +261,11 @@ Status InvertedColumnIndexer::generate_statistical_indexes() {
   const uint32_t num_doc_per_range_slot = (max_id_ + 1) / num_range_slot;
   const uint32_t num_doc_per_cdf_slot = (max_id_ + 1) / num_cdf_slot;
 
+  // The iterator stays open while the ranges CF is populated. Drain the
+  // source memtables first so the iterator cannot pin the write budget.
+  auto flushed = ctx_.flush();
+  CHECK_RETURN_STATUS(flushed);
+
   // Iterator for terms in the inverted index
   auto iter_term = ctx_.db_->NewIterator(ctx_.read_opts_, cf_terms_);
   iter_term->SeekToFirst();

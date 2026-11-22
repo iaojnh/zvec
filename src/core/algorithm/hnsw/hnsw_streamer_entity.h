@@ -27,9 +27,9 @@
 #include <sparsehash/dense_hash_set>
 #include <zvec/ailego/container/heap.h>
 #include <zvec/core/framework/index_framework.h>
+#include "utility/resident_vector_batch.h"
 #include "hnsw_chunk.h"
 #include "hnsw_entity.h"
-#include "utility/resident_vector_batch.h"
 #include "hnsw_index_hash.h"
 #include "hnsw_params.h"
 
@@ -1060,12 +1060,13 @@ class HnswBufferPoolStreamerEntity : public HnswStreamerEntity {
           const auto &chunk = node_chunks_[loc.first];
           if (loc.second > chunk->data_size() ||
               bytes > chunk->data_size() - loc.second ||
-              loc.second > (std::numeric_limits<size_t>::max)() -
-                               chunk->data_offset())
+              loc.second >
+                  (std::numeric_limits<size_t>::max)() - chunk->data_offset())
             return false;
           *absolute = chunk->data_offset() + loc.second;
           return true;
-        }, views);
+        },
+        views);
   }
 
   int get_vector_for_prune(
@@ -1075,9 +1076,9 @@ class HnswBufferPoolStreamerEntity : public HnswStreamerEntity {
   inline key_t get_key_typed(node_id_t id) const {
     return HnswStreamerEntity::get_key_typed<BufferPoolMemoryBlock>(id);
   }
+
  private:
   mutable ResidentVectorBatch resident_vector_batch_;
-
 };
 
 //! Typed entity subclass for contiguous memory mode.

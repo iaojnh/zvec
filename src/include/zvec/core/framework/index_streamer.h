@@ -33,6 +33,14 @@ class IndexStreamer : public IndexRunner {
   //! Index Streamer Pointer
   typedef std::shared_ptr<IndexStreamer> Pointer;
 
+  class PreparedAdd {
+   public:
+    virtual ~PreparedAdd() = default;
+    // The index must stay open until the operation is committed or dropped.
+    // Dropping the handle does not publish the target vector.
+    virtual void commit() noexcept = 0;
+  };
+
   //! Destructor
   ~IndexStreamer() override = default;
 
@@ -76,6 +84,24 @@ class IndexStreamer : public IndexRunner {
 
   //! Retrieve meta of index
   virtual const IndexMeta &meta() const = 0;
+
+  virtual int create_context_with_status(Context::Pointer &context) const {
+    context = create_context();
+    return context ? 0 : IndexError_Runtime;
+  }
+
+  virtual int prepare_add_with_id(uint32_t, const void *,
+                                  const IndexQueryMeta &, Context::Pointer &,
+                                  std::unique_ptr<PreparedAdd> *) {
+    return IndexError_NotImplemented;
+  }
+
+  virtual int prepare_add_with_id(uint32_t, uint32_t, const uint32_t *,
+                                  const void *, const IndexQueryMeta &,
+                                  Context::Pointer &,
+                                  std::unique_ptr<PreparedAdd> *) {
+    return IndexError_NotImplemented;
+  }
 };
 
 }  // namespace core

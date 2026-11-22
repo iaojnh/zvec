@@ -16,8 +16,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <ailego/pattern/defer.h>
 #include <roaring.hh>
+#include <ailego/pattern/defer.h>
 #include <arrow/compute/api_vector.h>
 #include <arrow/type_fwd.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
@@ -267,7 +267,7 @@ Status SegmentHelper::ReduceScalar(
   auto *pool = forward_use_parquet ? detail::GetParquetMemoryPool().get()
                                    : arrow::default_memory_pool();
   auto read_or_write_error = [](const char *operation,
-                               const arrow::Status &status) {
+                                const arrow::Status &status) {
     if (status.IsOutOfMemory()) {
       return Status(StatusCode::RESOURCE_EXHAUSTED,
                     std::string(operation) + status.message());
@@ -1087,14 +1087,14 @@ arrow::Status SegmentHelper::FilterRecordBatch(
   for (int i = 0; i < batch->num_columns(); ++i) {
     arrow::Datum out;
     ARROW_ASSIGN_OR_RAISE(
-        out, arrow::compute::Take(batch->column(i), selection_array,
-                                  arrow::compute::TakeOptions::Defaults(), &ctx));
+        out,
+        arrow::compute::Take(batch->column(i), selection_array,
+                             arrow::compute::TakeOptions::Defaults(), &ctx));
     filtered_columns.push_back(out.make_array());
   }
 
   auto filtered_batch = arrow::RecordBatch::Make(
-      batch->schema(), selection_array->length(),
-      filtered_columns);
+      batch->schema(), selection_array->length(), filtered_columns);
 
   *filterd = filtered_batch;
 

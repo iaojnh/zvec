@@ -1,5 +1,6 @@
 // Copyright 2025-present the zvec project
 // SPDX-License-Identifier: Apache-2.0
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -92,6 +93,23 @@ TEST_F(ChunkReadLeaseReuseTest, WarmHitReusesChargedDescriptorAtFullBudget) {
     other.reset();
   }
   EXPECT_EQ(io_calls, storage->stats().io_calls);
+}
+TEST_F(ChunkReadLeaseReuseTest, ColdReadRefusalReportsNoMemoryAndAllowsRetry) {
+  IndexStorage::Segment::ScatterBlock block;
+  std::array<char, 64> copied{};
+  {
+    const size_t remaining = pool.available();
+    ASSERT_TRUE(pool.try_charge_external(remaining));
+    auto refund =
+        ailego::ScopeGuard::Make([&] { pool.release_external(remaining); });
+    EXPECT_EQ(0u, segment->read_scatter(32, block, copied.size()));
+    EXPECT_EQ(IndexError_NoMemory, segment->read_error());
+    EXPECT_EQ(0u, block.size);
+    EXPECT_EQ(0u, segment->fetch(32, copied.data(), copied.size()));
+    EXPECT_EQ(IndexError_NoMemory, segment->read_error());
+  }
+  ASSERT_EQ(copied.size(), segment->fetch(32, copied.data(), copied.size()));
+  EXPECT_EQ(0, std::memcmp(copied.data(), payload.data() + 32, copied.size()));
 }
 TEST_F(ChunkReadLeaseReuseTest, CopiesAndMovesSurviveReuseAndStorageClose) {
   IndexStorage::MemoryBlock first, second;

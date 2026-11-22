@@ -563,10 +563,17 @@ void forward_to_tuples(internal::ForwardFetchResult &forward, py::dict &out,
       key = keys.wrap(std::move(key));
       py::dict fields;
       for (int c = 2; c < table->num_columns(); ++c) {
-        bool is_null;
-        auto value = forward_value_to_python(*table->column(c), row, &is_null);
-        // Null fields are absent from Doc too. Unsupported non-null fields
-        // keep the legacy converter's None behavior.
+        bool is_null = false;
+        py::object value;
+        try {
+          value = forward_value_to_python(*table->column(c), row, &is_null);
+        } catch (const py::error_already_set &error) {
+          // Older or native writers can store non-UTF-8 bytes in a string
+          // field. Match the Doc converter's per-field behavior for these
+          // values, while letting unrelated errors abort the fetch.
+          if (!error.matches(PyExc_UnicodeDecodeError)) throw;
+          value = py::none();
+        }
         if (!is_null) fields[names[c - 2]] = std::move(value);
       }
       out[key] = py::make_tuple(key, 0.0, std::move(fields), py::none());

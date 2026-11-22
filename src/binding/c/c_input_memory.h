@@ -32,8 +32,10 @@ inline size_t CTargetStorage(const QueryTarget &target) {
   size_t bytes = CStringStorage(target.field_name_);
   if (const auto *vector = target.get_vector_clause()) {
     bytes = BindingMemoryBytes(1, CStringStorage(vector->query_vector_), bytes);
-    bytes = BindingMemoryBytes(1, CStringStorage(vector->sparse_indices_), bytes);
-    bytes = BindingMemoryBytes(1, CStringStorage(vector->sparse_values_), bytes);
+    bytes =
+        BindingMemoryBytes(1, CStringStorage(vector->sparse_indices_), bytes);
+    bytes =
+        BindingMemoryBytes(1, CStringStorage(vector->sparse_values_), bytes);
   } else if (const auto *fts = target.get_fts_clause()) {
     bytes = BindingMemoryBytes(1, CFtsStorage(*fts), bytes);
   }
@@ -75,8 +77,10 @@ inline size_t CInputPayload(const MultiQuery &query) {
                          CFieldsStorage(query.output_fields)));
   for (const auto &sub : query.queries)
     bytes = BindingMemoryBytes(1, CInputPayload(sub), bytes);
-  if (const auto *weights = std::get_if<reranker::WeightedParams>(&query.rerank))
-    bytes = BindingMemoryBytes(weights->weights.capacity(), sizeof(double), bytes);
+  if (const auto *weights =
+          std::get_if<reranker::WeightedParams>(&query.rerank))
+    bytes =
+        BindingMemoryBytes(weights->weights.capacity(), sizeof(double), bytes);
   return bytes;
 }
 
@@ -120,7 +124,8 @@ struct CInput final : CInputMemory, T {
 template <typename T>
 class CInputMutation {
  public:
-  CInputMutation(T &value, size_t bytes) : input_(static_cast<CInput<T> &>(value)) {
+  CInputMutation(T &value, size_t bytes)
+      : input_(static_cast<CInput<T> &>(value)) {
     const size_t before = input_.bytes();
     const size_t tracked = input_.lease.bytes();
     const size_t existing = before > tracked ? before - tracked : 0;

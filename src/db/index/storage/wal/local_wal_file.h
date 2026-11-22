@@ -96,6 +96,7 @@ class LocalWalFile : public WalFile {
   WalHeader header_;
 
   bool opened_{false};
+  bool append_failed_{false};
   Status read_status_;
   bool read_only_{false};
 };

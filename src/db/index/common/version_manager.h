@@ -203,6 +203,8 @@ class VersionManager {
   Status remove_persisted_segment_meta(SegmentID id);
 
   Status flush();
+  Status flush_writing_segment(const SegmentMeta::Ptr &meta,
+                               uint32_t delete_snapshot_path_suffix);
 
   void set_id_map_path_suffix(uint32_t suffix) {
     std::lock_guard lock(mtx_);
@@ -230,6 +232,8 @@ class VersionManager {
   }
 
  private:
+  Status flush_unlocked(const Version &version);
+
   const std::string path_;
   Version current_version_;
   mutable std::mutex mtx_;

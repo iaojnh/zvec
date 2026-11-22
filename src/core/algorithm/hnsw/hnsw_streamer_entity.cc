@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include "hnsw_streamer_entity.h"
 #include <ailego/pattern/defer.h>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/mman.h>
 #endif

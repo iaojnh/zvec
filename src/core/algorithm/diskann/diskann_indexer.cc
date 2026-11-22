@@ -1423,11 +1423,11 @@ int DiskAnnIndexer::cached_beam_search_impl(DiskAnnContext *ctx) {
           buffer_backed_ &&
           static_cast<BufferPoolAlignedFileReader *>(reader_.get())
               ->try_submit_cached_nodes(pending, frontier_read_reqs, io_ctx,
-                                         frontier.data(), max_node_size_,
-                                         node_per_sector_);
-      int submit_ret = copied_nodes
-                           ? 0
-                           : reader_->submit(pending, frontier_read_reqs, io_ctx);
+                                        frontier.data(), max_node_size_,
+                                        node_per_sector_);
+      int submit_ret =
+          copied_nodes ? 0
+                       : reader_->submit(pending, frontier_read_reqs, io_ctx);
       stats.io_us += io_timer.micro_seconds();
       if (submit_ret != 0) {
         LOG_ERROR("cached_beam_search: submit failed, ret=%d", submit_ret);
@@ -1613,7 +1613,7 @@ int DiskAnnIndexer::cached_beam_search_by_group(DiskAnnContext *ctx) {
 
     dc.bind_quantizer(quantizer_.get(), quant_codes_, quant_code_size_,
                       paged_quant_codes_,
-                    storage_ ? storage_->vec_buffer_pool().get() : nullptr);
+                      storage_ ? storage_->vec_buffer_pool().get() : nullptr);
     if (dc.quantize_query(ctx->query_rotated()) != 0) return dc.error_code();
 
     uint32_t num_ios = 0;

@@ -24,9 +24,9 @@ namespace zvec::fts {
 // BM25Scorer implementation
 // ============================================================
 
-Status BM25Scorer::load_segment_stats(
-    const std::string &field_name, RocksdbContext *ctx,
-    rocksdb::ColumnFamilyHandle *stat_cf) {
+Status BM25Scorer::load_segment_stats(const std::string &field_name,
+                                      RocksdbContext *ctx,
+                                      rocksdb::ColumnFamilyHandle *stat_cf) {
   if (!ctx || !stat_cf) {
     return Status::NotFound("Missing FTS segment statistics column family");
   }
@@ -165,7 +165,8 @@ uint32_t WandOptimizer::read_max_tf(const std::string &term) const {
   const auto status =
       ctx_->db_->Get(ctx_->read_opts_, max_tf_cf_, term, &max_tf_value);
   if (!status.ok() && !status.IsNotFound())
-    throw FtsReadError(FtsReadFailure(status, "Read FTS maximum term frequency"));
+    throw FtsReadError(
+        FtsReadFailure(status, "Read FTS maximum term frequency"));
   if (max_tf_value.size() < sizeof(uint32_t)) {
     return 1;  // Default max term frequency is 1
   }

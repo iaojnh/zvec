@@ -177,7 +177,8 @@ uint32_t TermDocIterator::read_term_freq(uint32_t doc_id) const {
   }
   const std::string key = fts::make_doc_term_key(term_, doc_id);
   std::string value;
-  const auto status = ctx_->db_->Get(ctx_->read_opts_, term_freq_cf_, key, &value);
+  const auto status =
+      ctx_->db_->Get(ctx_->read_opts_, term_freq_cf_, key, &value);
   if (!status.ok() && !status.IsNotFound())
     throw FtsReadError(FtsReadFailure(status, "Read FTS term frequency"));
   if (value.size() < sizeof(uint32_t)) {

@@ -28,15 +28,15 @@
 namespace zvec::turbo {
 
 template <class WriteSample>
-inline bool CollectPqTrainingSamplesTo(const core::IndexHolder::Pointer &holder,
-                                       size_t limit, size_t vec_bytes,
-                                       WriteSample write_sample) {
-  if (!holder || !limit || !vec_bytes) return false;
-  if (vec_bytes > holder->element_size()) return false;
+inline int CollectPqTrainingSamplesTo(const core::IndexHolder::Pointer &holder,
+                                      size_t limit, size_t vec_bytes,
+                                      WriteSample write_sample) {
+  if (!holder || !limit || !vec_bytes || vec_bytes > holder->element_size())
+    return core::IndexError_InvalidArgument;
   const size_t input_count = holder->count();
   const size_t num = std::min(input_count, limit);
   if (!num || num > std::numeric_limits<size_t>::max() / vec_bytes)
-    return false;
+    return core::IndexError_InvalidArgument;
   // Perform the same seeded partial Fisher-Yates shuffle on row ordinals,
   // then stream only selected rows into their original training slots. The
   // sparse permutation and data buffer are bounded by the training limit.
@@ -64,22 +64,24 @@ inline bool CollectPqTrainingSamplesTo(const core::IndexHolder::Pointer &holder,
     std::sort(selected.begin(), selected.end());
   }
   auto iter = holder->create_iterator();
-  if (!iter) return false;
+  if (!iter) return core::IndexError_ReadData;
   size_t row = 0, copied = 0;
   for (; iter->is_valid(); iter->next(), ++row) {
-    if (iter->status() != 0) return false;
-    if (row >= input_count) return false;
+    if (iter->status() != 0) return iter->status();
+    if (row >= input_count) return core::IndexError_Mismatch;
     if (!selected.empty() && (copied == num || selected[copied].first != row))
       continue;
     const void *data = iter->data();
-    if (!data || iter->status() != 0) return false;
+    if (iter->status() != 0) return iter->status();
+    if (!data) return core::IndexError_ReadData;
     size_t slot = selected.empty() ? row : selected[copied].second;
-    if (!write_sample(slot, data)) return false;
+    const int status = write_sample(slot, data);
+    if (status != 0) return status;
     ++copied;
   }
-  if (iter->status() != 0 || row != input_count || copied != num) return false;
-  iter.reset();
-  return true;
+  if (iter->status() != 0) return iter->status();
+  if (row != input_count || copied != num) return core::IndexError_Mismatch;
+  return 0;
 }
 
 
@@ -145,15 +147,20 @@ inline int CollectPqTrainingSamplesImpl(
 
 // Preserve legacy sampling order with O(limit * vector_size) copied data.
 // Iterators may reuse their buffers. Leave output unchanged on read failure.
+inline int ReadPqTrainingSamples(const core::IndexHolder::Pointer &holder,
+                                 size_t limit, size_t vec_bytes,
+                                 std::vector<uint8_t> *output) {
+  return CollectPqTrainingSamplesImpl(
+      holder, limit, vec_bytes, vec_bytes, output,
+      [vec_bytes](std::vector<uint8_t> &data, size_t slot, const void *row) {
+        std::memcpy(data.data() + slot * vec_bytes, row, vec_bytes);
+      });
+}
+
 inline bool CollectPqTrainingSamples(const core::IndexHolder::Pointer &holder,
                                      size_t limit, size_t vec_bytes,
                                      std::vector<uint8_t> *output) {
-  return CollectPqTrainingSamplesImpl(
-             holder, limit, vec_bytes, vec_bytes, output,
-             [vec_bytes](std::vector<uint8_t> &data, size_t slot,
-                         const void *row) {
-               std::memcpy(data.data() + slot * vec_bytes, row, vec_bytes);
-             }) == 0;
+  return ReadPqTrainingSamples(holder, limit, vec_bytes, output) == 0;
 }
 
 // Borrow only from sources that explicitly guarantee immutable, stable data.

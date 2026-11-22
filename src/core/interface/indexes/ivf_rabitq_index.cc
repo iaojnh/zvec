@@ -105,9 +105,15 @@ int IVFRabitqIndex::open(const std::string &file_path,
   LOG_ERROR("%s", core::kRabitqUnsupportedPlatform);
   return core::IndexError_Unsupported;
 #else
+  if (is_open_) return core::IndexError_NoReady;
   if (storage_options.read_only && storage_options.create_new) {
     LOG_ERROR("Cannot create storage for a read-only index");
     return core::IndexError_Runtime;
+  }
+  if (streamer_needs_init_) {
+    const int ret = storage_options.create_new ? reset_build_pipeline(param_)
+                                               : reinitialize_streamer();
+    if (ret != 0) return ret;
   }
   ailego::Params storage_params;
   file_path_ = file_path;
@@ -132,16 +138,21 @@ int IVFRabitqIndex::open(const std::string &file_path,
     return ret;
   }
 
-  if (is_read_only_ || !storage_options.create_new) {
+  if (!storage_options.create_new) {
     ret = open_trained_storage(file_path_);
     if (ret != 0) return ret;
     is_trained_ = true;
+  } else {
+    if (buffered) {
+      buffered_input_ = std::make_shared<BufferedInput>(input_vector_meta_,
+                                                        file_path_ + ".input");
+    } else if (!doc_cache_) {
+      doc_cache_ = std::make_shared<DocCache>();
+    }
+    build_stage_ = BuildStage::kCollecting;
+    is_trained_ = false;
   }
-  if (storage_options.create_new && !is_read_only_ &&
-      storage_options.type == StorageOptions::StorageType::kBufferPool) {
-    buffered_input_ = std::make_shared<BufferedInput>(input_vector_meta_,
-                                                      file_path_ + ".input");
-  }
+  streamer_needs_init_ = false;
   is_open_ = true;
   return 0;
 #endif  // RABITQ_SUPPORTED

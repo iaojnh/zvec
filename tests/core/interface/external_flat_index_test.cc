@@ -22,9 +22,11 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/core/interface/index_factory.h>
 #include <zvec/core/interface/index_param_builders.h>
+#include "../../ailego/buffer/pool_payload_budget.h"
 #include "algorithm/flat/flat_streamer_context.h"
 #include "tests/test_util.h"
 
@@ -334,6 +336,70 @@ TEST_F(ExternalFlatTest, RegistrationDoesNotCopyVectorPayload) {
   EXPECT_NE(0, index->add(vector, 3));
   close_index(index);
   EXPECT_NE(0, index->add_with_source(vector, 3, source));
+}
+
+TEST_F(ExternalFlatTest, ExternalOperationsReturnMemoryRefusalOnNewWorker) {
+  auto &pool = zvec::ailego::PoolPayloadBudget::get_instance();
+  const size_t previous_capacity = pool.capacity();
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  auto restore = zvec::ailego::ScopeGuard::Make(
+      [&] { EXPECT_EQ(0, pool.init(previous_capacity)); });
+  auto index = open_index(Param(true), test_path("index"));
+  ASSERT_NE(nullptr, index);
+  BatchSource source(1);
+  const auto vector = Vector(source.rows.at(3));
+  ASSERT_EQ(0, index->add_with_source(vector, 3, source));
+  const auto query = FlatQueryParamBuilder().with_topk(1).build();
+  {
+    zvec::ailego::MemoryReservation held;
+    ASSERT_NO_THROW(held.add(pool.available()));
+    ASSERT_EQ(0u, pool.available());
+    std::thread worker([&] {
+      SearchResult result;
+      int add_status = 0;
+      EXPECT_NO_THROW(add_status = index->add_with_source(vector, 3, source));
+      EXPECT_EQ(core::IndexError_NoMemory, add_status);
+      int search_status = 0;
+      EXPECT_NO_THROW(search_status =
+                          index->search_with_source(vector, query, source, &result));
+      EXPECT_EQ(core::IndexError_NoMemory, search_status);
+    });
+    worker.join();
+  }
+  SearchResult result;
+  ASSERT_EQ(0, index->search_with_source(vector, query, source, &result));
+  ASSERT_EQ(1u, result.doc_list_.size());
+  EXPECT_EQ(3u, result.doc_list_[0].key());
+  close_index(index);
+}
+
+TEST_F(ExternalFlatTest, WorkerExitReleasesSlotsAcrossIndexSwitches) {
+  auto &pool = zvec::ailego::PoolPayloadBudget::get_instance();
+  const size_t previous_capacity = pool.capacity();
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  auto restore = zvec::ailego::ScopeGuard::Make(
+      [&] { EXPECT_EQ(0, pool.init(previous_capacity)); });
+  auto first = open_index(Param(true), test_path("first"));
+  auto second = open_index(Param(true), test_path("second"));
+  ASSERT_NE(nullptr, first);
+  ASSERT_NE(nullptr, second);
+  BatchSource source(1);
+  const auto vector = Vector(source.rows.at(3));
+  ASSERT_EQ(0, first->add_with_source(vector, 3, source));
+  ASSERT_EQ(0, second->add_with_source(vector, 3, source));
+  const auto query = FlatQueryParamBuilder().with_topk(1).build();
+  const size_t before = pool.external_used();
+  std::thread worker([&] {
+    for (auto *index : {first.get(), second.get()}) {
+      SearchResult result;
+      EXPECT_EQ(0, index->search_with_source(vector, query, source, &result));
+      EXPECT_EQ(1u, result.doc_list_.size());
+    }
+  });
+  worker.join();
+  EXPECT_EQ(before, pool.external_used());
+  close_index(first);
+  close_index(second);
 }
 
 TEST_F(ExternalFlatTest, FullScanAppliesSnapshotFilterBeforeReadingVectors) {

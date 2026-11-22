@@ -430,8 +430,9 @@ void OptKmeansAlgorithm::update_clusters(
 
     // Process in work thread·
     task_group->submit(
-        ailego::Closure::New(this, &OptKmeansAlgorithm::update_cluster_thread,
-                             index, next_index, threads, cents));
+        ailego::Closure::New([this, index, next_index, threads, &cents] {
+          update_cluster_thread(index, next_index, threads, cents);
+        }));
 
     // Next index
     index = next_index;
@@ -529,8 +530,9 @@ void OptKmeansAlgorithm::update_labels(
 
     // Process in work thread
     task_group->submit(
-        ailego::Closure::New(this, &OptKmeansAlgorithm::update_labels_thread,
-                             index, next_index, labels, cents));
+        ailego::Closure::New([this, index, next_index, labels, &cents] {
+          update_labels_thread(index, next_index, labels, cents);
+        }));
 
     // Next index
     index = next_index;
@@ -764,7 +766,8 @@ int OptKmeansAlgorithm::classify(IndexThreads::Pointer threads,
 
 int OptKmeansAlgorithm::label(IndexThreads::Pointer threads,
                               const IndexCluster::CentroidList &cents,
-                              std::vector<uint32_t> *out) {
+                              std::vector<uint32_t> *out) try {
+  if (!out) return IndexError_InvalidArgument;
   if (!threads) {
     threads = std::make_shared<SingleQueueIndexThreads>(thread_count_, false);
     if (!threads) {
@@ -786,9 +789,16 @@ int OptKmeansAlgorithm::label(IndexThreads::Pointer threads,
     return IndexError_NoReady;
   }
 
+  ailego::MemoryReservation output_memory;
+  output_memory.add_array(features_->count(), 2 * sizeof(uint32_t));
+  std::vector<uint32_t> candidate;
   read_error_.store(0);
-  this->update_labels(threads.get(), out, cents);
-  return read_error_.load();
+  this->update_labels(threads.get(), &candidate, cents);
+  const int status = read_error_.load();
+  if (status == 0) out->swap(candidate);
+  return status;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int OptKmeansAlgorithm::update(const ailego::Params &params) {

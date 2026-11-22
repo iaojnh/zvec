@@ -173,8 +173,9 @@ class LibAioLoader {
     const size_t header_bytes = header.header_bytes;
     if (header.magic != kRingMagic || header.incompat_features != 0 ||
         header_bytes < sizeof(header) || header_bytes > page || events == 0 ||
-        events > (std::numeric_limits<size_t>::max() - header_bytes -
-                  (page - 1)) / sizeof(io_event)) {
+        events >
+            (std::numeric_limits<size_t>::max() - header_bytes - (page - 1)) /
+                sizeof(io_event)) {
       return 0;
     }
     const size_t bytes = header_bytes + events * sizeof(io_event);

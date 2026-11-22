@@ -46,9 +46,8 @@ size_t ReserveMappedPages(size_t bytes, size_t page_offset = 0) {
 }
 
 size_t ReserveMappedPages(const void *addr, size_t bytes) {
-  return ReserveMappedPages(
-      bytes, reinterpret_cast<uintptr_t>(addr) %
-                 MemoryLimitPool::page_buffer_size());
+  return ReserveMappedPages(bytes, reinterpret_cast<uintptr_t>(addr) %
+                                       MemoryLimitPool::page_buffer_size());
 }
 
 void FinishMappedPages(size_t bytes, bool materialized) {

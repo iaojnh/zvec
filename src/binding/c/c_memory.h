@@ -52,8 +52,8 @@ class CResultAllocations {
     auto owner = std::make_shared<ResultMemoryAllowance::Lease>(
         &SharedResultMemoryAllowance());
     owner->absorb(admission);
-    std::unique_ptr<void, decltype(&release)> data(
-        allocate_owned(bytes, owner), &release);
+    std::unique_ptr<void, decltype(&release)> data(allocate_owned(bytes, owner),
+                                                   &release);
     populate(data.get());
     return data.release();
   }
@@ -119,8 +119,8 @@ inline void *CopyCResultBuffer(const void *source, size_t bytes) {
 }
 
 inline char *CopyCResultString(std::string_view value) {
-  return static_cast<char *>(
-      AllocateCResult(BindingMemoryBytes(1, value.size(), 1), [value](void *data) {
+  return static_cast<char *>(AllocateCResult(
+      BindingMemoryBytes(1, value.size(), 1), [value](void *data) {
         auto *text = static_cast<char *>(data);
         if (!value.empty()) std::memcpy(text, value.data(), value.size());
         text[value.size()] = '\0';

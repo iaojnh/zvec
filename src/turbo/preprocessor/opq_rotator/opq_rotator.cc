@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include "opq_rotator.h"
 #include <array>
 #include <cassert>
@@ -20,6 +19,7 @@
 #include <limits>
 #include <random>
 #include <stdexcept>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include "paged_opq_workspace.h"
 // Eigen stays inside this translation unit (baseline ISA flags) to avoid the
 // ODR hazard described in src/core/quantizer/rotator/matrix_rotator.cc.

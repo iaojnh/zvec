@@ -46,7 +46,8 @@ class SelectedRowsPlan {
         offset_count_ == static_cast<size_t>(column.num_chunks()) + 1 &&
         (*offsets_)[offset_count_ - 1] == column.length();
     for (int i = 0; matches && i < column.num_chunks(); ++i) {
-      matches = (*offsets_)[i + 1] - (*offsets_)[i] == column.chunk(i)->length();
+      matches =
+          (*offsets_)[i + 1] - (*offsets_)[i] == column.chunk(i)->length();
     }
     if (matches) return arrow::Status::OK();
 
@@ -70,7 +71,8 @@ class SelectedRowsPlan {
         const int64_t index = static_cast<int64_t>(row.second);
         const int chunk =
             std::upper_bound(offsets.begin(), offsets.begin() + offset_count_,
-                             index) - offsets.begin() - 1;
+                             index) -
+            offsets.begin() - 1;
         (*positions_)[position++] = {chunk, index - offsets[chunk]};
       }
     }

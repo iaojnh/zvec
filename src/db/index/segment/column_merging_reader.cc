@@ -68,12 +68,11 @@ arrow::Result<bool> ColumnMergingReader::read_next(
     while (current_batches_[i] == nullptr) {
       if (resident_only) {
         ARROW_ASSIGN_OR_RAISE(
-            auto ready, zvec::ReadNextResident(*input_readers_[i],
-                                               &current_batches_[i]));
+            auto ready,
+            zvec::ReadNextResident(*input_readers_[i], &current_batches_[i]));
         if (!ready) return false;
       } else {
-        ARROW_RETURN_NOT_OK(
-            input_readers_[i]->ReadNext(&current_batches_[i]));
+        ARROW_RETURN_NOT_OK(input_readers_[i]->ReadNext(&current_batches_[i]));
       }
       current_batch_offsets_[i] = 0;
       if (current_batches_[i] == nullptr) {

@@ -18,7 +18,6 @@ def vector_for(kind, dimension, row):
     return values
 
 
-
 def build(path, kind, mmap, dimension, count, *, payload_size=0):
     zvec.init(memory_limit_mb=512, query_threads=2, optimize_threads=1)
     schema = zvec.CollectionSchema(
@@ -57,7 +56,6 @@ def build(path, kind, mmap, dimension, count, *, payload_size=0):
     coll.close()
 
 
-
 def verify(path, kind, mmap, dimension, count):
     zvec.init(memory_limit_mb=128, query_threads=2, optimize_threads=1)
     coll = zvec.open(
@@ -92,7 +90,6 @@ def verify(path, kind, mmap, dimension, count):
     assert held["0"].vector("vector") == vector_for(kind, dimension, 0)
 
 
-
 def run_worker(mode, path, kind, mmap, dimension, count):
     completed = subprocess.run(
         [
@@ -113,13 +110,11 @@ def run_worker(mode, path, kind, mmap, dimension, count):
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-
 def test_large_vector_result_admission_and_recovery(tmp_path):
     mmap = False
     path = tmp_path / "large"
     run_worker("build", path, "VECTOR_FP32", mmap, 1024, 512)
     run_worker("verify", path, "VECTOR_FP32", mmap, 1024, 512)
-
 
 
 def verify_query_result_copy(path, kind, mmap, dimension, count):
@@ -145,12 +140,10 @@ def verify_query_result_copy(path, kind, mmap, dimension, count):
         coll.close()
 
 
-
 def test_large_query_result_copy_admission_and_recovery(tmp_path):
     path = tmp_path / "large_query"
     run_worker("build", path, "VECTOR_FP32", False, 4096, 2048)
     run_worker("query_copy", path, "VECTOR_FP32", False, 4096, 2048)
-
 
 
 def verify_retained(path, kind, mmap, dimension, count):
@@ -179,12 +172,10 @@ def verify_retained(path, kind, mmap, dimension, count):
     coll.close()
 
 
-
 def test_retained_vectors_reject_growth_and_release_for_retry(tmp_path):
     path = tmp_path / "retained"
     run_worker("build", path, "VECTOR_FP32", False, 1024, 64)
     run_worker("retained", path, "VECTOR_FP32", False, 1024, 64)
-
 
 
 def verify_exception(path, kind, mmap, dimension, count):
@@ -215,17 +206,51 @@ def verify_exception(path, kind, mmap, dimension, count):
     coll.close()
 
 
-
 def test_failed_wrapper_does_not_keep_materialization_lock(tmp_path):
     path = tmp_path / "exception"
     run_worker("build", path, "VECTOR_FP32", False, 64, 8)
     run_worker("exception", path, "VECTOR_FP32", False, 64, 8)
 
 
+def verify_undecodable_field(path, kind, mmap, dimension, count):
+    from zvec._zvec import _Doc
+
+    text = zvec.FieldSchema("text", zvec.DataType.STRING)
+    texts = zvec.FieldSchema("texts", zvec.DataType.ARRAY_STRING)
+    count = zvec.FieldSchema("count", zvec.DataType.INT32)
+    schema = zvec.CollectionSchema("legacy_strings", fields=[text, texts, count])
+    coll = zvec.create_and_open(
+        str(path), schema, zvec.CollectionOption(enable_mmap=mmap)
+    )
+    try:
+        legacy = _Doc()
+        legacy.set_pk("legacy")
+        legacy.set_any("text", text._get_object(), b"\xff")
+        legacy.set_any("texts", texts._get_object(), [b"valid", b"\xff"])
+        legacy.set_any("count", count._get_object(), 7)
+        assert coll._obj.Insert([legacy])[0].ok()
+        assert coll.fetch("legacy", include_vector=False)["legacy"].fields == {
+            "text": None,
+            "texts": None,
+            "count": 7,
+        }
+    finally:
+        coll.close()
+
+
+@pytest.mark.parametrize("mmap", [True, False])
+def test_forward_fetch_preserves_undecodable_field_behavior(tmp_path, mmap):
+    run_worker("undecodable", tmp_path / "collection", "STRING", mmap, 0, 0)
+
 
 if __name__ == "__main__":
     action, target, vector_kind, use_mmap, dim, rows = sys.argv[1:]
-    worker = {"build": build, "verify": verify,
-              "query_copy": verify_query_result_copy,
-              "retained": verify_retained, "exception": verify_exception}[action]
+    worker = {
+        "build": build,
+        "verify": verify,
+        "query_copy": verify_query_result_copy,
+        "retained": verify_retained,
+        "exception": verify_exception,
+        "undecodable": verify_undecodable_field,
+    }[action]
     worker(Path(target), vector_kind, bool(int(use_mmap)), int(dim), int(rows))

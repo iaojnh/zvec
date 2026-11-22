@@ -48,8 +48,8 @@ arrow::Status FilteringReader::ReadNext(
     if (!input) {
       return arrow::Status::OK();
     }
-    auto *gdoc_array = static_cast<const arrow::UInt64Array *>(
-        input->column(gdoc_col_).get());
+    auto *gdoc_array =
+        static_cast<const arrow::UInt64Array *>(input->column(gdoc_col_).get());
 
     // Build filter mask: true = keep, false = skip (deleted)
     arrow::BooleanBuilder mask_builder(pool_);
@@ -73,10 +73,10 @@ arrow::Status FilteringReader::ReadNext(
     ARROW_RETURN_NOT_OK(mask_builder.Finish(&mask_array));
 
     arrow::compute::ExecContext ctx(pool_);
-    ARROW_ASSIGN_OR_RAISE(
-        auto result,
-        arrow::compute::Filter(arrow::Datum(input), arrow::Datum(mask_array),
-                               arrow::compute::FilterOptions::Defaults(), &ctx));
+    ARROW_ASSIGN_OR_RAISE(auto result,
+                          arrow::compute::Filter(
+                              arrow::Datum(input), arrow::Datum(mask_array),
+                              arrow::compute::FilterOptions::Defaults(), &ctx));
 
     // All rows filtered out: continue to the next batch.
     if (result.record_batch()->num_rows() == 0) {

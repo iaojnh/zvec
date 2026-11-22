@@ -126,7 +126,7 @@ Result<bool> IDMap::lookup(const std::string &key, uint64_t *doc_id) const {
   if (status.IsNotFound()) return false;
   if (!status.ok()) {
     const auto code = status.IsMemoryLimit() ? StatusCode::RESOURCE_EXHAUSTED
-                                              : StatusCode::INTERNAL_ERROR;
+                                             : StatusCode::INTERNAL_ERROR;
     return tl::make_unexpected(
         Status(code, "ID map lookup failed: " + status.ToString()));
   }

@@ -343,6 +343,21 @@ class TestQueryExecutor:
                 ctx, Query(field_name="test", id="missing"), collection
             )
 
+    @pytest.mark.parametrize("vectors", [None, {"other": [1.0]}])
+    def test_build_search_query_by_id_requires_requested_vector(self, vectors):
+        vector_schema = VectorSchema(name="test", data_type=DataType.VECTOR_FP32)
+        schema = CollectionSchema(name="test_collection", vectors=[vector_schema])
+        executor = QueryExecutor(schema)
+        collection = MagicMock()
+        collection.FetchTuples.return_value = {"doc": ("doc", 0.0, None, vectors)}
+
+        with pytest.raises(
+            ValueError, match="Document with id 'doc' has no vector for 'test'"
+        ):
+            executor._build_search_query(
+                QueryContext(topk=1), Query(field_name="test", id="doc"), collection
+            )
+
     def test_build_search_query_validates_query(self):
         vector_schema = VectorSchema(name="test", data_type=DataType.VECTOR_FP32)
         schema = CollectionSchema(name="test_collection", vectors=[vector_schema])

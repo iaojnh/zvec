@@ -273,7 +273,12 @@ class QueryExecutor:
             doc = next(iter(fetched.values()), None)
             if not doc:
                 raise ValueError(f"Document with id '{query.id}' not found")
-            vec_data = doc[3].get(vector_schema.name)
+            vectors = doc[3]
+            vec_data = vectors.get(vector_schema.name) if vectors else None
+            if vec_data is None:
+                raise ValueError(
+                    f"Document with id '{query.id}' has no vector for '{vector_schema.name}'"
+                )
         else:
             raise ValueError("Group by query requires a vector or document id")
 

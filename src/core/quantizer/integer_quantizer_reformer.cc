@@ -14,10 +14,10 @@
 
 #include <ailego/pattern/defer.h>
 #include <core/quantizer/quantizer_params.h>
-#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <turbo/norm/norm2_matrix.h>
 #include <turbo/norm/normalizer.h>
 #include <turbo/quantizer/entropy_integer_quantizer/integer_quantizer.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_factory.h>
 #include "rotator/rotator.h"
 #include "record_quantizer.h"

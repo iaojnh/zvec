@@ -24,7 +24,8 @@ inline arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeFtsRankBatch(
     return arrow::Status::OutOfMemory("FTS rank batch size overflow");
   const int64_t bytes = static_cast<int64_t>(count) * sizeof(float);
   const int64_t stride = (bytes + 63) & ~int64_t{63};
-  ARROW_ASSIGN_OR_RAISE(auto allocation, arrow::AllocateBuffer(2 * stride, pool));
+  ARROW_ASSIGN_OR_RAISE(auto allocation,
+                        arrow::AllocateBuffer(2 * stride, pool));
   std::shared_ptr<arrow::Buffer> backing = std::move(allocation);
   auto *rows = reinterpret_cast<int32_t *>(backing->mutable_data());
   auto *scores = reinterpret_cast<float *>(backing->mutable_data() + stride);

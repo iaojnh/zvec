@@ -71,7 +71,8 @@ inline int ReadPagedQuantizedCodes(
       return segment.read_error();
     views[i] = blocks[i].data();
     if (!views[i]) return IndexError_ReadData;
-    if (single_page && blocks[i].type_ == IndexStorage::MemoryBlock::MBT_BUFFERPOOL) {
+    if (single_page &&
+        blocks[i].type_ == IndexStorage::MemoryBlock::MBT_BUFFERPOOL) {
       pages[slot] = page;
       bases[slot] = static_cast<const uint8_t *>(views[i]) - within;
     }

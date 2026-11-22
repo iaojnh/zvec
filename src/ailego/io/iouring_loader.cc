@@ -309,8 +309,7 @@ IoUringRing::SetupResult IoUringRing::map_control_regions(
       cq_charge > std::numeric_limits<size_t>::max() - sq_charge - sqes_charge)
     return SetupResult::kNoMemory;
   size_t pending = sq_charge + sqes_charge + cq_charge;
-  if (!pool.try_reserve_process_backing(pending))
-    return SetupResult::kNoMemory;
+  if (!pool.try_reserve_process_backing(pending)) return SetupResult::kNoMemory;
   const auto cancel = ScopeGuard::Make([&] {
     if (pending) pool.finish_process_backing(pending, false);
   });
@@ -387,7 +386,7 @@ IoUringRing::SetupResult IoUringRing::map_control_regions(
 void IoUringRing::teardown() {
   cancel_reads();
   const auto release_region = [](void *region, size_t size,
-                                  ProcessRssBudget::MaterializationStamp stamp) {
+                                 ProcessRssBudget::MaterializationStamp stamp) {
     if (!region) return;
     if (::munmap(region, size) != 0) {
       LOG_ERROR("io_uring control unmap failed; size=%zu", size);
@@ -459,8 +458,9 @@ bool IoUringRing::ensure_staging(size_t bytes) {
   // bypass malloc arenas, so release_staging() really returns physical pages.
   void *ptr = File::MemoryMap(bytes, 0);
   const auto prepaid_projection =
-      prepaid_staging_bytes_ ? pool.finish_materialization(bytes, ptr != nullptr)
-                             : ProcessRssBudget::MaterializationStamp{};
+      prepaid_staging_bytes_
+          ? pool.finish_materialization(bytes, ptr != nullptr)
+          : ProcessRssBudget::MaterializationStamp{};
   if (!ptr) {
     LOG_WARN("io_uring staging mapping failed; size=%zu", bytes);
     return false;

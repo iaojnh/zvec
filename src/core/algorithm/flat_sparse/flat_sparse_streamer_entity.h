@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 #include <ailego/parallel/lock.h>
@@ -71,6 +72,11 @@ class FlatSparseStreamerEntity : public FlatSparseEntity {
   //! Add sparse vector to linear index with id
   int add_vector_with_id(uint32_t id, std::string_view sparse_vector,
                          uint32_t sparse_count);
+
+  int prepare_add_with_id(uint32_t id, std::string_view sparse_vector,
+                          uint32_t sparse_count,
+                          std::shared_lock<ailego::SharedMutex> writer_guard,
+                          std::unique_ptr<IndexStreamer::PreparedAdd> *out);
 
   //! Clone entity
   FlatSparseStreamerEntity::Pointer clone() const;
@@ -156,27 +162,31 @@ class FlatSparseStreamerEntity : public FlatSparseEntity {
     return streamer_meta_.offset_chunk_size / offset_size_per_node();
   }
 
-  Chunk::Pointer alloc_new_offset_chunk(uint32_t chunk_id) {
+  int alloc_new_offset_chunk(uint32_t chunk_id, Chunk::Pointer *out) {
     std::string segment_id = ailego::StringHelper::Concat(
         PARAM_FLAT_SPARSE_OFFSET_SEG_ID_PREFIX, chunk_id);
     // LOG_INFO("Alloc new offset chunk %s", segment_id.c_str());
-    return alloc_new_chunk(segment_id, streamer_meta_.offset_chunk_size);
+    return alloc_new_chunk(segment_id, streamer_meta_.offset_chunk_size, out);
   }
 
-  Chunk::Pointer alloc_new_data_chunk(uint32_t chunk_id) {
+  int alloc_new_data_chunk(uint32_t chunk_id, Chunk::Pointer *out) {
     std::string segment_id = ailego::StringHelper::Concat(
         PARAM_FLAT_SPARSE_DATA_SEG_ID_PREFIX, chunk_id);
     // LOG_INFO("Alloc new data chunk %s", segment_id.c_str());
-    return alloc_new_chunk(segment_id, streamer_meta_.data_chunk_size);
+    return alloc_new_chunk(segment_id, streamer_meta_.data_chunk_size, out);
   }
 
-  Chunk::Pointer alloc_new_chunk(const std::string &segment_id, uint32_t size) {
-    int ret = storage_->append(segment_id, size);
-    if (ailego_unlikely(ret != 0)) {
-      return nullptr;
+  int alloc_new_chunk(const std::string &segment_id, uint32_t size,
+                      Chunk::Pointer *out) {
+    // A previous append may have succeeded before acquiring its Segment
+    // handle failed. Reuse that directory entry on retry.
+    if (!storage_->has(segment_id)) {
+      int ret = storage_->append(segment_id, size);
+      if (ret != 0) return ret;
+      *stats_.mutable_index_size() += size;
     }
-    *stats_.mutable_index_size() += size;
-    return storage_->get(segment_id);
+    *out = storage_->get(segment_id);
+    return *out ? 0 : IndexError_Runtime;
   }
 
   inline uint32_t get_offset_info_number_per_chunk() const {
@@ -187,6 +197,9 @@ class FlatSparseStreamerEntity : public FlatSparseEntity {
                                    const uint32_t sparse_vector_len,
                                    uint32_t &sparse_data_chunk_index,
                                    uint32_t &sparse_data_chunk_offset);
+
+  int get_sparse_data_slot(uint32_t sparse_vector_len, uint32_t &chunk_index,
+                           uint32_t &chunk_offset);
 
   int get_new_sparse_offset_chunk(uint32_t &sparse_offset_chunk_index,
                                   uint32_t &sparse_offset_chunk_offset);
@@ -219,6 +232,7 @@ class FlatSparseStreamerEntity : public FlatSparseEntity {
 
 
  private:
+  class PreparedInsert;
   using KeyMap =
       std::map<uint64_t, node_id_t, std::less<uint64_t>,
                ailego::BudgetedAllocator<std::pair<const uint64_t, node_id_t>>>;

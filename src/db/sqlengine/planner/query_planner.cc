@@ -678,8 +678,9 @@ Result<PlanInfo::Ptr> QueryPlanner::invert_scan(
           break;
       }
     }
-    const bool headroom = ailego::MemoryLimitPool::get_instance()
-                              .prefetch_available() >= 128UL * 1024 * 1024;
+    const bool headroom =
+        ailego::MemoryLimitPool::get_instance().prefetch_available() >=
+        128UL * 1024 * 1024;
     batch_size = std::min(batch_size, narrow && headroom ? 4096 : 256);
   }
   auto recall_node =

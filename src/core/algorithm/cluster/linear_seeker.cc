@@ -18,6 +18,12 @@ namespace zvec {
 namespace core {
 
 int LinearSeeker::seek(const void *query, size_t len, Document *out) {
+  return seek(query, len, out, nullptr, nullptr);
+}
+
+int LinearSeeker::seek(const void *query, size_t len, Document *out,
+                       const IndexCluster::CentroidList *stored_centroids,
+                       ailego::BudgetedAlignedBuffer *scratch) {
   if (ailego_unlikely(!query || !out || meta_.element_size() != len)) {
     return IndexError_InvalidArgument;
   }
@@ -25,15 +31,33 @@ int LinearSeeker::seek(const void *query, size_t len, Document *out) {
   float sel_score = std::numeric_limits<float>::max();
   uint32_t sel_column = 0;
   uint32_t total = static_cast<uint32_t>(features_->count());
+  constexpr uint32_t batch_size = 32;
+  if (stored_centroids) {
+    const size_t rows = quantizer_ ? std::min(batch_size, total) : 1;
+    if (rows && len > std::numeric_limits<size_t>::max() / rows)
+      return IndexError_Overflow;
+    scratch->resize(rows * len, 64);
+  }
+
+  auto read_feature = [&](uint32_t id, size_t slot, const void **ptr) -> int {
+    if (!stored_centroids) {
+      *ptr = features_->element(id);
+      return 0;
+    }
+    auto *destination = static_cast<char *>(scratch->data()) + slot * len;
+    int ret = (*stored_centroids)[id].read_feature(destination, len);
+    if (ret == 0) *ptr = destination;
+    return ret;
+  };
 
   if (quantizer_) {
-    constexpr uint32_t batch_size = 32;
     const void *vectors[batch_size];
     float scores[batch_size];
     for (uint32_t base = 0; base < total;) {
       uint32_t count = std::min(batch_size, total - base);
       for (uint32_t j = 0; j < count; ++j) {
-        vectors[j] = features_->element(base + j);
+        int ret = read_feature(base + j, j, &vectors[j]);
+        if (ret != 0) return ret;
       }
       quantizer_->calc_distance_dp_query_batch(vectors, count, query, scores);
       for (uint32_t j = 0; j < count; ++j) {
@@ -47,8 +71,10 @@ int LinearSeeker::seek(const void *query, size_t len, Document *out) {
   } else {
     for (uint32_t i = 0; i < total; ++i) {
       float score = 0.0f;
-
-      distance_func_(features_->element(i), query, meta_.dimension(), &score);
+      const void *feature = nullptr;
+      int ret = read_feature(i, 0, &feature);
+      if (ret != 0) return ret;
+      distance_func_(feature, query, meta_.dimension(), &score);
       if (score < sel_score) {
         sel_score = score;
         sel_column = i;

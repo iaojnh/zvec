@@ -163,10 +163,8 @@ int IndexMapping::init_meta_section() {
   using Pending = ailego::MemoryLimitPool::PendingAllocation;
   Pending mapping_memory(pool, Pending::Kind::kWorkspace);
   if (!mapping_memory.reserve(charge)) return IndexError_NoMemory;
-  HeaderMap pending;
-  pending.emplace(current_header_start_offset_,
-                  MetaMapping{nullptr, len, charge});
-  auto pending_node = pending.extract(pending.begin());
+  auto pending_node = stage_header_mapping(len, charge);
+  if (!pending_node) return IndexError_InvalidValue;
 
   IndexFormat::MetaHeader meta_header;
   IndexFormat::MetaFooter meta_footer;
@@ -224,10 +222,8 @@ int IndexMapping::init_hugepage_meta_section() {
   using Pending = ailego::MemoryLimitPool::PendingAllocation;
   Pending mapping_memory(pool, Pending::Kind::kWorkspace);
   if (!mapping_memory.reserve(charge)) return IndexError_NoMemory;
-  HeaderMap pending;
-  pending.emplace(current_header_start_offset_,
-                  MetaMapping{nullptr, len, charge});
-  auto pending_node = pending.extract(pending.begin());
+  auto pending_node = stage_header_mapping(len, charge);
+  if (!pending_node) return IndexError_InvalidValue;
 
   int opts = ailego::File::MMAP_SHARED | ailego::File::MMAP_HUGE_PAGE;
   void *addr =
@@ -346,12 +342,12 @@ int IndexMapping::append(const std::string &id, size_t size) try {
     return IndexError_Duplicate;
   }
 
-  SegmentMap pending;
-  pending.emplace(std::string_view(id), SegmentInfo{});
-  auto pending_node = pending.extract(pending.begin());
   size_t id_size = std::strlen(id.c_str()) + 1;
   size_t need_size = sizeof(IndexFormat::SegmentMeta) + id_size;
   if (need_size > footer_->segments_meta_size) return IndexError_InvalidLength;
+  // Stage in the destination so a first insert also admits the lazy map.
+  auto entry = segments_.try_emplace(std::string_view(id), SegmentInfo{});
+  auto pending_node = segments_.extract(entry.first);
   if (sizeof(IndexFormat::SegmentMeta) * footer_->segment_count + need_size >
       segment_ids_offset_) {
     LOG_DEBUG("segment meta section expanded: %s", path_.c_str());
@@ -572,20 +568,24 @@ int IndexMapping::init_index_mapping(size_t len) {
   using Pending = ailego::MemoryLimitPool::PendingAllocation;
   Pending mapping_memory(pool, Pending::Kind::kWorkspace);
   if (!mapping_memory.reserve(charge)) return IndexError_NoMemory;
-  HeaderMap pending;
-  pending.emplace(current_header_start_offset_,
-                  MetaMapping{nullptr, len, charge});
-  auto pending_node = pending.extract(pending.begin());
+  auto pending_node = stage_header_mapping(len, charge);
+  if (!pending_node) return IndexError_InvalidValue;
   return init_index_mapping_admitted(len, std::move(pending_node),
                                      mapping_memory);
+}
+
+IndexMapping::HeaderMap::node_type IndexMapping::stage_header_mapping(
+    size_t len, size_t charge) {
+  // Admit both the map and its node before acquiring the native mapping.
+  auto entry = header_addr_map_.try_emplace(current_header_start_offset_,
+                                            MetaMapping{nullptr, len, charge});
+  return entry.second ? header_addr_map_.extract(entry.first)
+                      : HeaderMap::node_type{};
 }
 
 int IndexMapping::init_index_mapping_admitted(
     size_t len, HeaderMap::node_type pending_node,
     ailego::MemoryLimitPool::PendingAllocation &mapping_memory) {
-  if (header_addr_map_.find(current_header_start_offset_) !=
-      header_addr_map_.end())
-    return IndexError_InvalidValue;
   // The managed header already has a pending reservation for the whole view.
   // MAP_POPULATE would run the separate optional prefault admission again.
   int opts = ailego::File::MMAP_SHARED;

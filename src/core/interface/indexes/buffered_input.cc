@@ -92,10 +92,10 @@ struct BufferedInput::State {
     const size_t bytes = meta.element_size();
     const size_t segment = slot / rows_per_segment;
     if (segment >= segments.size()) return core::IndexError_OutOfRange;
-    return segments[segment]->fetch((slot % rows_per_segment) * bytes, out,
-                                    bytes) == bytes
+    const auto &input = segments[segment];
+    return input->fetch((slot % rows_per_segment) * bytes, out, bytes) == bytes
                ? 0
-               : core::IndexError_ReadData;
+               : input->read_error();
   }
 };
 
@@ -150,7 +150,7 @@ int BufferedInput::add(uint32_t key, const void *data) {
     }
     if (written != element_size()) {
       if (inserted.second) s.slots.erase(inserted.first);
-      return core::IndexError_WriteData;
+      return s.segments[segment]->write_error();
     }
     inserted.first->second = slot;
     if (slot == s.allocated_slots) ++s.allocated_slots;
