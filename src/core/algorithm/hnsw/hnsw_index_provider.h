@@ -93,7 +93,7 @@ class HnswIndexProvider : public IndexProvider, public StableVectorHolder {
       return error;
     if (!snapshot_vectors_) return entity_->get_vector_by_key(key, block);
     const auto id = entity_->get_id(key);
-    if (id >= entity_->doc_cnt()) return IndexError_NoExist;
+    if (id >= entity_->committed_doc_count()) return IndexError_NoExist;
     return entity_->get_vector_snapshot(id, block);
   }
 

@@ -108,6 +108,11 @@ class HnswStreamerEntity : public HnswEntity {
     return mutation_error();
   }
 
+  // Point readers hold the graph lock while checking the shared count.
+  node_id_t committed_doc_count() const {
+    return buffered_graph_ ? buffered_graph_->doc_count : doc_cnt();
+  }
+
   HnswGraphMutex *buffered_graph_mutex() const {
     return buffered_graph_ ? &buffered_graph_->mutex : nullptr;
   }
@@ -428,6 +433,7 @@ class HnswStreamerEntity : public HnswEntity {
   struct BufferedGraph {
     HnswGraphMutex mutex;
     InsertUndo *undo{nullptr};
+    node_id_t doc_count{0};
     int error{0};
     bool closed{false};
   };
@@ -447,6 +453,7 @@ class HnswStreamerEntity : public HnswEntity {
                   bool immutable) const;
   int read_key(node_id_t id, key_t &key) const;
   int write_node_data(Chunk &chunk, size_t offset, const void *vec, key_t key);
+  void set_doc_count(node_id_t count);
 
   //! Add upper neighbor header and reserve space for upper neighbor
   int add_upper_neighbor(level_t level, node_id_t id) {

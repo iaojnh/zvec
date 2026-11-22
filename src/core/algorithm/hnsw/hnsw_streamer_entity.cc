@@ -149,11 +149,16 @@ int HnswStreamerEntity::insert_buffered(
     return ret;
   }
 
-  *mutable_doc_cnt() = std::max(doc_cnt(), id + 1);
+  set_doc_count(std::max(doc_cnt(), id + 1));
   if (undo.entry_point != kInvalidNodeId)
     HnswEntity::update_ep_and_level(undo.entry_point, undo.max_level);
   broker_->mark_dirty();
   return 0;
+}
+
+void HnswStreamerEntity::set_doc_count(node_id_t count) {
+  *mutable_doc_cnt() = count;
+  if (buffered_graph_) buffered_graph_->doc_count = count;
 }
 
 HnswStreamerEntity::HnswStreamerEntity(IndexStreamer::Stats &stats)
@@ -499,27 +504,35 @@ int HnswStreamerEntity::get_vector_snapshot(
 int HnswStreamerEntity::read_vector(node_id_t id,
                                     IndexStorage::MemoryBlock &block,
                                     bool immutable) const {
-  auto loc = get_vector_chunk_loc(id);
-  ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
+  const uint32_t chunk_index = id >> node_index_mask_bits_;
+  const size_t offset = (id & node_index_mask_) * node_size();
 
   // Fast path: mmap backend.
   // Bounds-check guards against new chunks added after clone() was taken.
-  if (node_chunk_bases_ && loc.first < node_chunk_bases_->size() &&
-      (*node_chunk_bases_)[loc.first]) {
-    block.reset((void *)((*node_chunk_bases_)[loc.first] + loc.second));
+  if (node_chunk_bases_ && chunk_index < node_chunk_bases_->size() &&
+      (*node_chunk_bases_)[chunk_index]) {
+    block.reset((void *)((*node_chunk_bases_)[chunk_index] + offset));
     return 0;
   }
 
-  ailego_assert_with(loc.second < node_chunks_[loc.first]->data_size(),
-                     "invalid chunk offset");
-  size_t read_size = vector_size();
-  auto &chunk = *node_chunks_[loc.first];
-  const size_t ret = immutable
-                         ? chunk.read_immutable(loc.second, block, read_size)
-                         : chunk.read(loc.second, block, read_size);
+  Chunk::Pointer appended_chunk;
+  if (!immutable && chunk_index >= node_chunks_.size()) {
+    // Providers share their clone across readers. Resolve a newly appended
+    // chunk without changing the clone's chunk array.
+    appended_chunk =
+        broker_->get_chunk(ChunkBroker::CHUNK_TYPE_NODE, chunk_index);
+    if (!appended_chunk) return IndexError_ReadData;
+  } else {
+    sync_chunks(ChunkBroker::CHUNK_TYPE_NODE, chunk_index, &node_chunks_);
+  }
+  auto &chunk = appended_chunk ? *appended_chunk : *node_chunks_[chunk_index];
+  ailego_assert_with(offset < chunk.data_size(), "invalid chunk offset");
+  const size_t read_size = vector_size();
+  const size_t ret = immutable ? chunk.read_immutable(offset, block, read_size)
+                               : chunk.read(offset, block, read_size);
   if (ailego_unlikely(ret != read_size)) {
-    LOG_ERROR("Read vector failed, offset=%u, read size=%zu, ret=%zu",
-              loc.second, read_size, ret);
+    LOG_ERROR("Read vector failed, offset=%zu, read size=%zu, ret=%zu", offset,
+              read_size, ret);
     const int error = chunk.read_error();
     block.reset();
     return error;
@@ -789,6 +802,7 @@ int HnswStreamerEntity::open(IndexStorage::Pointer stg, uint64_t max_index_size,
       LOG_ERROR("Write header chunk failed");
       return IndexError_WriteData;
     }
+    set_doc_count(0);
     return 0;
   }
 
@@ -822,8 +836,8 @@ int HnswStreamerEntity::open(IndexStorage::Pointer stg, uint64_t max_index_size,
   //! try to correct the docCnt if index not fully flushed
   if (doc_cnt() != total_vecs) {
     LOG_WARN("Index closed abnormally, using totalVecs as curDocCnt");
-    *mutable_doc_cnt() = total_vecs;
   }
+  set_doc_count(total_vecs);
   if ((filter_same_key_ || get_vector_enabled_) && use_key_info_map_) {
     for (node_id_t id = 0U; id < doc_cnt(); ++id) {
       key_t key;
@@ -1051,7 +1065,7 @@ int HnswStreamerEntity::add_vector(level_t level, key_t key, const void *vec,
     }
   }
 
-  *mutable_doc_cnt() += 1;
+  set_doc_count(doc_cnt() + 1);
   broker_->mark_dirty();
 
   return 0;
@@ -1152,7 +1166,7 @@ int HnswStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
   record_stored = true;
   if (insert_undo()) return 0;
 
-  if (grows) *mutable_doc_cnt() = id + 1;
+  if (grows) set_doc_count(id + 1);
   if (filter_same_key_ || get_vector_enabled_) {
     if (use_key_info_map_) {
       keys_map_lock_->lock();

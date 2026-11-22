@@ -72,6 +72,42 @@ TEST_F(HnswStreamerTest, MaxDegreeIsNeighborCountNotSerializedBytes) {
             entity.upper_neighbors_size());
 }
 
+TEST_F(HnswStreamerTest, ExportedProviderReadsKeyInsertedInNewChunk) {
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
+  auto storage = IndexFactory::CreateStorage("BufferStorage");
+  auto streamer = IndexFactory::CreateStreamer("HnswStreamer");
+  ASSERT_TRUE(storage);
+  ASSERT_TRUE(streamer);
+  ASSERT_EQ(0, storage->init({}));
+  ASSERT_EQ(0, storage->open(dir_ + "ProviderBeforeInsert", true));
+  Params params;
+  params.set(PARAM_HNSW_STREAMER_GET_VECTOR_ENABLE, true);
+  ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+  ASSERT_EQ(0, streamer->open(storage, false));
+  auto context = streamer->create_context();
+  ASSERT_TRUE(context);
+
+  const auto provider = streamer->create_provider();
+  ASSERT_TRUE(provider);
+  constexpr uint64_t key = 42;
+  IndexStorage::MemoryBlock block;
+  EXPECT_EQ(IndexError_NoExist, provider->get_vector(key, block));
+
+  const float vector[dim] = {1.25f, -2.5f};
+  const IndexQueryMeta query_meta(IndexMeta::DT_FP32, dim);
+  ASSERT_EQ(0, streamer->add_impl(key, vector, query_meta, context));
+  ASSERT_EQ(0, provider->get_vector(key, block));
+  ASSERT_NE(nullptr, block.data());
+  EXPECT_TRUE(std::equal(vector, vector + dim,
+                         static_cast<const float *>(block.data())));
+  const auto *legacy = static_cast<const float *>(provider->get_vector(key));
+  ASSERT_NE(nullptr, legacy);
+  EXPECT_TRUE(std::equal(vector, vector + dim, legacy));
+
+  EXPECT_EQ(0, streamer->close());
+  EXPECT_EQ(0, storage->close());
+}
+
 TEST_F(HnswStreamerTest, ProviderDistinguishesKeyReadFailureFromUnusedId) {
   class FailingKey : public IndexSegmentStorage::Segment {
    public:

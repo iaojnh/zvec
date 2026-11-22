@@ -654,8 +654,8 @@ void RunHnswExportedProviderAcrossRollback() {
                                   kDim * sizeof(float)));
   ASSERT_EQ(0, exported->get_vector(1, retained));
   EXPECT_FLOAT_EQ(9.0f, static_cast<const float *>(retained.data())[0]);
-  EXPECT_EQ(core::IndexError_NoExist, exported->get_vector(2, retained));
-  EXPECT_EQ(nullptr, retained.data());
+  ASSERT_EQ(0, exported->get_vector(2, retained));
+  EXPECT_FLOAT_EQ(9.0f, static_cast<const float *>(retained.data())[0]);
   EXPECT_EQ(0, index->close());
   EXPECT_EQ(core::IndexError_NoReady, exported->get_vector(1, retained));
 }
