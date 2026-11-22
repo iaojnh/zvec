@@ -11,6 +11,7 @@
 #include <algorithm/hnsw/hnsw_context.h>
 #include <algorithm/hnsw/hnsw_entity.h>
 #include <algorithm/hnsw/hnsw_graph_mutex.h>
+#include <algorithm/hnsw/hnsw_index_provider.h>
 #include <algorithm/hnsw/hnsw_params.h>
 #include <algorithm/hnsw/hnsw_streamer_entity.h>
 #include <gtest/gtest.h>
@@ -69,6 +70,81 @@ TEST_F(HnswStreamerTest, MaxDegreeIsNeighborCountNotSerializedBytes) {
             entity.neighbors_size());
   EXPECT_EQ(sizeof(NeighborsHeader) + 96U * sizeof(node_id_t),
             entity.upper_neighbors_size());
+}
+
+TEST_F(HnswStreamerTest, ProviderDistinguishesKeyReadFailureFromUnusedId) {
+  class FailingKey : public IndexSegmentStorage::Segment {
+   public:
+    FailingKey(const Chunk::Pointer &chunk, size_t key_offset)
+        : IndexSegmentStorage::Segment(chunk, 0, chunk->data_size(),
+                                       chunk->padding_size(), 0),
+          key_offset_(key_offset) {}
+
+    size_t fetch(size_t offset, void *data, size_t len) const override {
+      return fail && offset == key_offset_ ? 0 : Segment::fetch(offset, data, len);
+    }
+
+    int read_error() const override {
+      return IndexError_NoMemory;
+    }
+
+    bool fail{false};
+
+   private:
+    const size_t key_offset_;
+  };
+
+  class TestEntity : public HnswBufferPoolStreamerEntity {
+   public:
+    using HnswBufferPoolStreamerEntity::HnswBufferPoolStreamerEntity;
+
+    std::shared_ptr<FailingKey> wrap_key(node_id_t id) {
+      const auto [index, offset] = get_key_chunk_loc(id);
+      auto segment = std::make_shared<FailingKey>(node_chunks_[index], offset);
+      node_chunks_[index] = segment;
+      return segment;
+    }
+  };
+
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
+  auto storage = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->init({}));
+  ASSERT_EQ(0, storage->open(dir_ + "ProviderKeyReadError", true));
+
+  IndexStreamer::Stats stats;
+  auto entity = std::make_shared<TestEntity>(stats);
+  entity->set_vector_size(dim * sizeof(float));
+  entity->set_l0_neighbor_cnt(4);
+  entity->set_upper_neighbor_cnt(4);
+  entity->set_scaling_factor(5);
+  entity->set_use_key_info_map(true);
+  ASSERT_EQ(0, entity->init(8));
+  ASSERT_EQ(0, entity->open(storage, 8UL << 20, false));
+  const float vector[dim]{};
+  ASSERT_EQ(0, entity->add_vector_with_id(0, 0, vector));
+  ASSERT_EQ(0, entity->add_vector_with_id(0, 2, vector));
+  entity->update_ep_and_level(0, 0);
+
+  auto segment = entity->wrap_key(2);
+  HnswIndexProvider provider(*index_meta_ptr_, entity, "test", nullptr, true);
+  auto iter = provider.create_iterator();
+  ASSERT_TRUE(iter);
+  EXPECT_EQ(0u, iter->key());
+  iter->next();
+  ASSERT_TRUE(iter->is_valid());
+  EXPECT_EQ(2u, iter->key());
+
+  segment->fail = true;
+  EXPECT_EQ(zvec::core::kInvalidKey, iter->key());
+  EXPECT_EQ(IndexError_NoMemory, iter->status());
+  iter = provider.create_iterator();
+  ASSERT_TRUE(iter);
+  iter->next();
+  EXPECT_FALSE(iter->is_valid());
+  EXPECT_EQ(IndexError_NoMemory, iter->status());
+  ASSERT_EQ(0, entity->close());
+  ASSERT_EQ(0, storage->close());
 }
 
 TEST_F(HnswStreamerTest, ProviderReadErrorDuringTraversalRollsBackInsert) {

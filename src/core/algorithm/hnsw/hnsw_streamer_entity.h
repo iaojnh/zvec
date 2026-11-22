@@ -72,7 +72,7 @@ class HnswStreamerEntity : public HnswEntity {
 
   int get_vector_snapshot(node_id_t id,
                           IndexStorage::MemoryBlock &block) const override;
-  key_t get_key_snapshot(node_id_t id) const;
+  int read_key_snapshot(node_id_t id, key_t &key) const;
 
   int get_vector_borrowed(const node_id_t id,
                           IndexStorage::MemoryBlock &block) const override;
@@ -445,6 +445,7 @@ class HnswStreamerEntity : public HnswEntity {
 
   int read_vector(node_id_t id, IndexStorage::MemoryBlock &block,
                   bool immutable) const;
+  int read_key(node_id_t id, key_t &key) const;
   int write_node_data(Chunk &chunk, size_t offset, const void *vec, key_t key);
 
   //! Add upper neighbor header and reserve space for upper neighbor
@@ -914,21 +915,9 @@ inline key_t HnswStreamerEntity::get_key_typed<MmapMemoryBlock>(
 template <>
 inline key_t HnswStreamerEntity::get_key_typed<BufferPoolMemoryBlock>(
     node_id_t id) const {
-  if (!use_key_info_map_) {
-    return id;
-  }
-  auto loc = get_key_chunk_loc(id);
-  ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
-  ailego_assert_with(loc.second < node_chunks_[loc.first]->data_size(),
-                     "invalid chunk offset");
-  IndexStorage::MemoryBlock key_block;
-  size_t ret = node_chunks_[loc.first]->read_borrowed(loc.second, key_block,
-                                                      sizeof(key_t));
-  if (ailego_unlikely(ret != sizeof(key_t))) {
-    LOG_ERROR("Read key failed, ret=%zu", ret);
-    return kInvalidKey;
-  }
-  return *reinterpret_cast<const key_t *>(key_block.data());
+  if (!use_key_info_map_) return id;
+  key_t key;
+  return read_key(id, key) == 0 ? key : kInvalidKey;
 }
 
 //! Typed entity subclass for mmap mode.

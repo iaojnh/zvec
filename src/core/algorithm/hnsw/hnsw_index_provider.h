@@ -132,9 +132,10 @@ class HnswIndexProvider : public IndexProvider, public StableVectorHolder {
     //! Retrieve primary key
     uint64_t key() const override {
       const HnswGraphLock guard(entity_->buffered_graph_mutex());
-      return check_graph(guard) && is_valid()
-                 ? entity_->get_key_snapshot(cur_id_)
-                 : kInvalidKey;
+      if (!check_graph(guard) || !is_valid()) return kInvalidKey;
+      key_t key;
+      status_ = entity_->read_key_snapshot(cur_id_, key);
+      return status_ == 0 ? key : kInvalidKey;
     }
 
     //! Next iterator
@@ -156,9 +157,10 @@ class HnswIndexProvider : public IndexProvider, public StableVectorHolder {
 
     node_id_t get_next_valid_id(node_id_t start_id) {
       for (node_id_t i = start_id; i < entity_->doc_cnt(); i++) {
-        if (entity_->get_key_snapshot(i) != kInvalidKey) {
-          return i;
-        }
+        key_t key;
+        status_ = entity_->read_key_snapshot(i, key);
+        if (status_ != 0) break;
+        if (key != kInvalidKey) return i;
       }
       return kInvalidNodeId;
     }

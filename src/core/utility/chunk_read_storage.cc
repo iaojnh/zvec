@@ -108,6 +108,12 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     return Clock::now() + std::chrono::milliseconds(wait_ms);
   }
 
+  // Workspace admission and native read-ahead are separate waits. A zero
+  // workspace wait still allows completion to release its optional buffer.
+  static Clock::time_point read_ahead_deadline() {
+    return Clock::now() + std::chrono::milliseconds(100);
+  }
+
   // Negative ref values exclusively own loading/eviction transitions. Pinning
   // precedes pointer access; only a successful 0 -> kEvicting may free backing.
   struct Layout;
@@ -288,7 +294,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       ready = true;
     }
     ~ReadAhead() {
-      const auto deadline = owner.wait_deadline();
+      const auto deadline = read_ahead_deadline();
       while (inflight) reap(&deadline);
       for (auto &slot : slots)
         if (slot.item) {
@@ -497,7 +503,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     // pins, including hints beyond the first header. Keep unconfirmed kernel
     // destinations isolated and leave independent demand pins intact.
     void yield_for_parsing(size_t offset, size_t length) {
-      const auto deadline = owner.wait_deadline();
+      const auto deadline = read_ahead_deadline();
       std::lock_guard<std::timed_mutex> lock(mutex);
       yield_for_parsing_locked(offset, length, deadline);
     }
@@ -514,7 +520,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       }
     }
     void begin_parsing() {
-      const auto deadline = owner.wait_deadline();
+      const auto deadline = read_ahead_deadline();
       std::lock_guard<std::timed_mutex> lock(mutex);
       ++parsers;
       // No new hints can enter until the last parser exits. Retire completed
@@ -1168,7 +1174,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
                  ? layout->find(position)
                  : entry(position / chunk_bytes, populate && cache_limit != 0);
     };
-    const auto deadline = wait_deadline();
+    const auto deadline = read_ahead_deadline();
     const auto source = [&](Entry *item) -> Entry * {
       if (populate) return cached(item, deadline);
         // Parsing may borrow an already-funded cache hit, but must not add
@@ -1331,7 +1337,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       return layout ? layout->find(position)
                     : entry(position / chunk_bytes, cache_limit != 0);
     };
-    const auto deadline = wait_deadline();
+    const auto deadline = read_ahead_deadline();
     auto *first = locate(offset);
     const bool single = first && len <= first->bytes - (offset - first->offset);
     if (single) {

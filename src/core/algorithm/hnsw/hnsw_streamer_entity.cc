@@ -606,43 +606,46 @@ int HnswBufferPoolStreamerEntity::get_vector_for_prune(
 }
 
 key_t HnswStreamerEntity::get_key(node_id_t id) const {
-  if (use_key_info_map_) {
-    auto loc = get_key_chunk_loc(id);
-    ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
-
-    // Fast path: mmap backend.
-    // Bounds-check guards against new chunks added after clone() was taken.
-    if (node_chunk_bases_ && loc.first < node_chunk_bases_->size() &&
-        (*node_chunk_bases_)[loc.first]) {
-      return *reinterpret_cast<const key_t *>((*node_chunk_bases_)[loc.first] +
-                                              loc.second);
-    }
-
-    ailego_assert_with(loc.second < node_chunks_[loc.first]->data_size(),
-                       "invalid chunk offset");
-    IndexStorage::MemoryBlock key_block;
-    size_t ret =
-        node_chunks_[loc.first]->read(loc.second, key_block, sizeof(key_t));
-    if (ailego_unlikely(ret != sizeof(key_t))) {
-      LOG_ERROR("Read vector failed, ret=%zu", ret);
-      return kInvalidKey;
-    }
-    return *reinterpret_cast<const key_t *>(key_block.data());
-  } else {
-    return id;
-  }
+  key_t key;
+  return read_key(id, key) == 0 ? key : kInvalidKey;
 }
 
-key_t HnswStreamerEntity::get_key_snapshot(node_id_t id) const {
+int HnswStreamerEntity::read_key(node_id_t id, key_t &key) const {
+  if (!use_key_info_map_) {
+    key = id;
+    return 0;
+  }
+
+  const auto loc = get_key_chunk_loc(id);
+  ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
+  // Clones can discover chunks appended after their base pointers were cached.
+  if (node_chunk_bases_ && loc.first < node_chunk_bases_->size() &&
+      (*node_chunk_bases_)[loc.first]) {
+    std::memcpy(&key, (*node_chunk_bases_)[loc.first] + loc.second,
+                sizeof(key));
+    return 0;
+  }
+
+  const auto &chunk = *node_chunks_[loc.first];
+  ailego_assert_with(loc.second < chunk.data_size(), "invalid chunk offset");
+  // Fetch into the caller's stack buffer while observing dirty cache pages.
+  const size_t size = chunk.fetch(loc.second, &key, sizeof(key));
+  if (ailego_unlikely(size != sizeof(key))) {
+    LOG_ERROR("Read key failed, id=%u, ret=%zu", id, size);
+    return chunk.read_error();
+  }
+  return 0;
+}
+
+int HnswStreamerEntity::read_key_snapshot(node_id_t id, key_t &key) const {
   if (auto *undo = insert_undo(); use_key_info_map_ && undo &&
                                   id == undo->overwritten_id &&
                                   undo->overwritten_key_write) {
-    key_t key;
     const auto &previous = undo->writes[*undo->overwritten_key_write].bytes;
     std::memcpy(&key, previous.data(), sizeof(key));
-    return key;
+    return 0;
   }
-  return get_key(id);
+  return read_key(id, key);
 }
 
 int HnswStreamerEntity::add_neighbor(level_t level, node_id_t id, uint32_t size,
@@ -821,14 +824,12 @@ int HnswStreamerEntity::open(IndexStorage::Pointer stg, uint64_t max_index_size,
     LOG_WARN("Index closed abnormally, using totalVecs as curDocCnt");
     *mutable_doc_cnt() = total_vecs;
   }
-  if (filter_same_key_ || get_vector_enabled_) {
-    if (use_key_info_map_) {
-      for (node_id_t id = 0U; id < doc_cnt(); ++id) {
-        if (get_key(id) == kInvalidKey) {
-          continue;
-        }
-        (*keys_map_)[get_key(id)] = id;
-      }
+  if ((filter_same_key_ || get_vector_enabled_) && use_key_info_map_) {
+    for (node_id_t id = 0U; id < doc_cnt(); ++id) {
+      key_t key;
+      const int status = read_key(id, key);
+      if (status != 0) return status;
+      if (key != kInvalidKey) (*keys_map_)[key] = id;
     }
   }
 

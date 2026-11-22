@@ -968,8 +968,7 @@ TEST_F(BufferPoolTest, OptionalWritebackRingLeavesRoomForData) {
     GTEST_SKIP() << "io_uring unavailable";
   }
   const size_t fixed = VecBufferPool::metadata_bytes_for_page_count(1, true);
-  constexpr size_t optional =
-      VecBufferPool::kWritebackBatchPages * kVectorPageSize;
+  const size_t optional = VecBufferPool::kWritebackBatchPages * kVectorPageSize;
   ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(fixed + optional));
   const std::string path = new_file(1);
   VecBufferPool pool(path, true);

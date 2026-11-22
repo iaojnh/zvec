@@ -134,7 +134,7 @@ const Neighbors VamanaStreamerEntity::get_neighbors(node_id_t id) const {
     LOG_ERROR("Read neighbor header failed, ret=%zu", ret);
     return Neighbors(loc.first->read_error());
   }
-  return Neighbors(mem_block);
+  return Neighbors(std::move(mem_block));
 }
 
 int VamanaStreamerEntity::add_vector(key_t key, const void *vec,
