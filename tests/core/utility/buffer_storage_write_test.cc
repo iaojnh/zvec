@@ -2408,6 +2408,29 @@ TEST_F(BufferStorageWriteTest, SnapshotDoesNotWaitForOptionalScratchMetadata) {
   EXPECT_EQ(before.capacity_waits, pool.stats().capacity_waits);
 }
 
+TEST_F(BufferStorageWriteTest, IndexMetadataCanBeParsedWhenViewIsDenied) {
+  auto storage = open_writable();
+  ASSERT_NE(nullptr, storage);
+  IndexMeta original(IndexMeta::DT_FP32, 16);
+  ASSERT_EQ(0, IndexHelper::SerializeToStorage(original, storage.get()));
+  ASSERT_EQ(0, storage->flush());
+  const auto segment = storage->get("IndexMeta");
+  ASSERT_NE(nullptr, segment);
+
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous_limit = pool.process_rss_limit();
+  AILEGO_DEFER(
+      [&] { EXPECT_TRUE(pool.configure_process_rss_limit(previous_limit)); });
+  ASSERT_TRUE(pool.configure_process_rss_limit(1));
+
+  IndexStorage::MemoryBlock block;
+  ASSERT_EQ(0u, segment->read_for_parsing(0, block, segment->data_size()));
+  EXPECT_EQ(IndexError_NoMemory, segment->read_error());
+  IndexMeta parsed;
+  ASSERT_EQ(0, IndexHelper::DeserializeFromStorage(storage.get(), &parsed));
+  EXPECT_EQ(original.dimension(), parsed.dimension());
+}
+
 TEST_F(BufferStorageWriteTest, EndOfSegmentReadClearsEarlierBudgetError) {
   auto storage = open_writable();
   ASSERT_TRUE(storage);
