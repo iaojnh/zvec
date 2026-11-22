@@ -348,6 +348,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
                           std::chrono::milliseconds timeout);
   bool wait_for_available(size_t buffer_size, std::chrono::milliseconds timeout,
                           bool required);
+  // A last-pin release makes a cache entry eligible before it refunds bytes.
+  void notify_reclaimable();
 
   //! Reserve bounded capacity outside the page cache, evicting if needed.
   bool try_charge_external(const size_t buffer_size);
@@ -718,6 +720,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   size_t trim_free_buffers(size_t bytes_needed);
   bool trim_idle_buffers();
   bool reclaim_process_cache();
+  void request_required_reclaim(size_t bytes);
+  void reclaim_for_required_waiters();
   size_t trim_retained_blocks(size_t bytes_needed);
   size_t trim_cache_buffers(size_t bytes_needed);
   void register_cache_mapping(CacheBuffer *buffer);
@@ -790,6 +794,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   std::atomic<size_t> external_used_size_{0};
   std::atomic<size_t> evictable_cache_size_{0};
   std::atomic<size_t> cache_reclaim_requested_{0};
+  std::atomic<size_t> required_reclaim_requested_{0};
+  std::atomic<bool> required_reclaim_active_{false};
   std::atomic<size_t> metadata_used_size_{0};
   // Logical priority only: reserve actual native growth for mandatory work,
   // while RSS-only/proof waiters merely signal maintenance and optional caches.
@@ -856,6 +862,7 @@ class ZVEC_AILEGO_API MemoryLimitPool {
 
   std::mutex capacity_mutex_;
   std::condition_variable capacity_cv_;
+  std::atomic<uint64_t> reclaimable_generation_{0};
   std::atomic<size_t> workspace_releases_in_progress_{0};
 
   std::thread bg_thread_;

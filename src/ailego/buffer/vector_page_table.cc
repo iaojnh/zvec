@@ -637,6 +637,7 @@ void VectorPageTable::release_block(block_id_t block_id) {
   // Installation normally registers the page; retry only after queue failure.
   if (e.ref_count.fetch_sub(1, std::memory_order_release) == 1) {
     if (e.in_evict_queue.load(std::memory_order_relaxed)) {
+      MemoryLimitPool::get_instance().notify_reclaimable();
       return;
     }
     std::atomic_thread_fence(std::memory_order_acquire);
@@ -654,6 +655,7 @@ void VectorPageTable::release_block(block_id_t block_id) {
         eviction_requeue_failed(block_id, owner_version_);
       }
     }
+    MemoryLimitPool::get_instance().notify_reclaimable();
   }
 }
 

@@ -244,6 +244,8 @@ class ExternalCache : public EvictableBlockOwner {
       if (!entry.in_evict_queue.compare_exchange_strong(
               expected, true, std::memory_order_acq_rel,
               std::memory_order_relaxed)) {
+        lock.unlock();
+        MemoryLimitPool::get_instance().notify_reclaimable();
         return;
       }
       std::atomic_thread_fence(std::memory_order_acquire);
@@ -258,6 +260,7 @@ class ExternalCache : public EvictableBlockOwner {
               block, BlockEvictionQueue::kExplicitHotPriority)) {
         eviction_requeue_failed(block.owner_key, block.version);
       }
+      MemoryLimitPool::get_instance().notify_reclaimable();
     }
   }
 

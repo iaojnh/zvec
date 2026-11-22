@@ -1933,6 +1933,57 @@ bool MemoryLimitPool::reclaim_process_cache() {
   return true;
 }
 
+void MemoryLimitPool::notify_reclaimable() {
+  if (mandatory_waiters_.load(std::memory_order_relaxed) == 0) return;
+  {
+    std::lock_guard<std::mutex> lock(capacity_mutex_);
+    reclaimable_generation_.fetch_add(1, std::memory_order_release);
+  }
+  capacity_cv_.notify_all();
+}
+
+void MemoryLimitPool::request_required_reclaim(size_t bytes) {
+  if (!bytes || !bg_running_.load(std::memory_order_acquire)) return;
+  size_t pending = required_reclaim_requested_.load(std::memory_order_relaxed);
+  while (pending < bytes && !required_reclaim_requested_.compare_exchange_weak(
+                                pending, bytes, std::memory_order_release,
+                                std::memory_order_relaxed)) {
+  }
+  bg_cv_.notify_one();
+}
+
+void MemoryLimitPool::reclaim_for_required_waiters() {
+  if (required_reclaim_requested_.load(std::memory_order_acquire) == 0) return;
+  // Publish the active scan before removing its request. A waiter can see an
+  // empty queue while the worker owns the page that can satisfy it.
+  required_reclaim_active_.store(true, std::memory_order_release);
+  auto done = ScopeGuard::Make([this] {
+    required_reclaim_active_.store(false, std::memory_order_release);
+    { std::lock_guard<std::mutex> lock(capacity_mutex_); }
+    capacity_cv_.notify_all();
+  });
+  const size_t requested =
+      required_reclaim_requested_.exchange(0, std::memory_order_acq_rel);
+  if (mandatory_waiters_.load(std::memory_order_relaxed) == 0) return;
+  try {
+    const size_t trimmed = trim_free_buffers(requested);
+    bool evicted = false;
+    if (trimmed < requested &&
+        mandatory_waiters_.load(std::memory_order_relaxed) != 0) {
+      const size_t remaining = requested - trimmed;
+      evicted = BlockEvictionQueue::get_instance().reclaim_for_allocation(
+                    remaining) != 0;
+      if (evicted) trim_free_buffers(remaining);
+    }
+    if ((trimmed || evicted) && process_rss_.limit())
+      process_rss_.refresh(true);
+  } catch (const std::exception &error) {
+    LOG_WARN("Required allocation reclaim failed: %s", error.what());
+  } catch (...) {
+    LOG_WARN("Required allocation reclaim failed");
+  }
+}
+
 int MemoryLimitPool::init(size_t pool_size) {
   // Queue storage can exist before a pool is configured. Construct it first
   // and adopt all retained allocations when publishing a non-zero budget.
@@ -2016,6 +2067,7 @@ int MemoryLimitPool::init(size_t pool_size) {
   pool_size_.store(0, std::memory_order_relaxed);
   process_rss_.configure(0, nullptr);
   set_process_rss_reclaimer({});
+  required_reclaim_requested_.store(0, std::memory_order_relaxed);
   pool_size_.store(pool_size, std::memory_order_relaxed);
   if (pool_size != 0) {
     queue_charged_size_.store(queue_bytes, std::memory_order_relaxed);
@@ -2143,6 +2195,8 @@ void MemoryLimitPool::background_evict_loop() {
                                should_background_reclaim() ||
                                cache_reclaim_requested_.load(
                                    std::memory_order_relaxed) != 0 ||
+                               required_reclaim_requested_.load(
+                                   std::memory_order_acquire) != 0 ||
                                page_admission_pressure();
                       });
     }
@@ -2155,6 +2209,7 @@ void MemoryLimitPool::background_evict_loop() {
     (defined(__APPLE__) && TARGET_OS_OSX)
     refresh_owned_sample();
 #endif
+    reclaim_for_required_waiters();
     if (requested && (used() > low_watermark() || process_rss_.pressure())) {
       reclaim_to_low = true;
       const size_t n =
@@ -2669,9 +2724,11 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
   // Close the race between the first denial and publishing priority.
   if (wait && admit()) return true;
   auto next_reclaim = Clock::time_point::min();
+  auto observed_reclaimable =
+      reclaimable_generation_.load(std::memory_order_acquire);
   size_t previous_shortfall = std::numeric_limits<size_t>::max();
   while (Clock::now() < deadline) {
-    if (Clock::now() >= next_reclaim) {
+    if (!wait) {
       const size_t shortfall = admission_shortfall(request);
       // Retry inline only after useful reclamation. A failed combined RSS gate
       // must never retry merely because either component would fit by itself.
@@ -2696,10 +2753,9 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
           continue;
         }
       }
-      previous_shortfall = std::numeric_limits<size_t>::max();
-      next_reclaim = Clock::now() + retry_interval;
+      break;
     }
-    if (!wait || impossible()) break;
+    if (impossible()) break;
 
     const auto room = room_for_request();
     observe_progress(room);
@@ -2715,7 +2771,7 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
           request.native_bytes <= capacity - std::min(fixed, capacity) ||
           request.native_bytes <= available();
       bool has_queued_work = false;
-      if (queue_can_help) {
+      if (queue_can_help && bg_running_.load(std::memory_order_acquire)) {
         const auto queues = BlockEvictionQueue::get_instance().stats();
         has_queued_work = std::any_of(queues.approximate_queue_sizes.begin(),
                                       queues.approximate_queue_sizes.end(),
@@ -2726,6 +2782,10 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
           (request.rss_bytes == 0 || room.rss < request.rss_bytes) &&
           process_rss_.has_resident_uncertainty();
       if (!has_reclaimer && !has_queued_work && !needs_rss_proof &&
+          !required_reclaim_requested_.load(std::memory_order_acquire) &&
+          !required_reclaim_active_.load(std::memory_order_acquire) &&
+          reclaimable_generation_.load(std::memory_order_acquire) ==
+              observed_reclaimable &&
           workspace_releases_in_progress_.load(std::memory_order_acquire) ==
               0) {
         // Read the ledger after the release check. A release may already have
@@ -2735,6 +2795,13 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
       }
     }
 
+    const auto generation =
+        reclaimable_generation_.load(std::memory_order_acquire);
+    if (Clock::now() >= next_reclaim || generation != observed_reclaimable) {
+      observed_reclaimable = generation;
+      request_required_reclaim(admission_shortfall(request));
+      next_reclaim = Clock::now() + retry_interval;
+    }
     auto check_at = std::min(deadline, next_reclaim);
     if (Clock::now() < quiet_until) check_at = std::min(check_at, quiet_until);
     capacity_waits_.fetch_add(1, std::memory_order_relaxed);
@@ -2742,7 +2809,9 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
       std::unique_lock<std::mutex> lock(capacity_mutex_);
       if (!capacity_cv_.wait_until(lock, check_at, [&] {
             const auto current = room_for_request();
-            return current.native > room.native || current.rss > room.rss;
+            return current.native > room.native || current.rss > room.rss ||
+                   reclaimable_generation_.load(std::memory_order_acquire) !=
+                       observed_reclaimable;
           })) {
         capacity_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
       }
