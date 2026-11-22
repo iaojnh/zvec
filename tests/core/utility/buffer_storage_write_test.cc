@@ -2301,6 +2301,35 @@ TEST_F(BufferStorageWriteTest, SnapshotDoesNotWaitForOptionalScratchMetadata) {
   EXPECT_EQ(before.capacity_waits, pool.stats().capacity_waits);
 }
 
+TEST_F(BufferStorageWriteTest, EndOfSegmentReadClearsEarlierBudgetError) {
+  auto storage = open_writable();
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->append("data", ailego::kVectorPageSize));
+  auto segment = storage->get("data");
+  ASSERT_TRUE(segment);
+
+  const std::string bytes(1024, 's');
+  ASSERT_EQ(bytes.size(), segment->write(0, bytes.data(), bytes.size()));
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous_limit = pool.process_rss_limit();
+  AILEGO_DEFER(
+      [&] { EXPECT_TRUE(pool.configure_process_rss_limit(previous_limit)); });
+  ASSERT_TRUE(pool.configure_process_rss_limit(1));
+
+  using Segment = IndexStorage::Segment;
+  using Read = size_t (Segment::*)(size_t, IndexStorage::MemoryBlock &, size_t);
+  const Read reads[] = {&Segment::read, &Segment::read_immutable,
+                        &Segment::read_borrowed,
+                        &Segment::read_borrowed_immutable};
+  for (auto read : reads) {
+    IndexStorage::MemoryBlock result;
+    ASSERT_EQ(0u, segment->read(0, result, bytes.size()));
+    ASSERT_EQ(IndexError_NoMemory, segment->read_error());
+    EXPECT_EQ(0u, ((*segment).*read)(bytes.size(), result, 1));
+    EXPECT_EQ(IndexError_ReadData, segment->read_error());
+  }
+}
+
 TEST_F(BufferStorageWriteTest,
        RollbackRestoresColdAndDirtyPagesWithoutAdmission) {
   const size_t page = ailego::kVectorPageSize;

@@ -198,6 +198,7 @@ class BufferStorageFile
     //! Read data from segment
     //! Read data into a bounded-lifetime block.
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {
+      buffer_storage_read_error = IndexError_ReadData;
       if (ailego_unlikely(!owner_->buffer_pool_handle_)) {
         LOG_ERROR(
             "WrappedSegment::read(MemoryBlock&): handle is null, file[%s], "
@@ -217,6 +218,7 @@ class BufferStorageFile
 
     size_t read_immutable(size_t offset, MemoryBlock &data,
                           size_t len) override {
+      buffer_storage_read_error = IndexError_ReadData;
       if (ailego_unlikely(!owner_->buffer_pool_handle_)) {
         return 0;
       }
@@ -247,6 +249,7 @@ class BufferStorageFile
     //! Borrowed read: the caller keeps the Segment alive until block release.
     size_t read_borrowed(size_t offset, MemoryBlock &data,
                          size_t len) override {
+      buffer_storage_read_error = IndexError_ReadData;
       if (ailego_unlikely(!owner_->buffer_pool_handle_)) {
         LOG_ERROR(
             "WrappedSegment::read_borrowed: handle is null, file[%s], "
@@ -266,6 +269,7 @@ class BufferStorageFile
 
     size_t read_borrowed_immutable(size_t offset, MemoryBlock &data,
                                    size_t len) override {
+      buffer_storage_read_error = IndexError_ReadData;
       if (ailego_unlikely(!owner_->buffer_pool_handle_)) {
         return 0;
       }
@@ -1101,7 +1105,6 @@ class BufferStorageFile
     size_t read_memory_block(size_t abs_offset, MemoryBlock &data, size_t len,
                              bool borrow_handle, bool immutable,
                              bool populate = true) const try {
-      buffer_storage_read_error = IndexError_ReadData;
       const bool can_pin = owner_->cache_enabled_ &&
                            (immutable || !owner_->buffer_pool_->writable());
       bool force_bypass = !populate || !owner_->cache_enabled_;

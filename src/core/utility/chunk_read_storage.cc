@@ -1198,9 +1198,8 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     }
     if (!view && !strategy) view = acquire_view(required);
     if (!view) {
-      chunk_read_error = strategy   ? IndexError_Unsupported
-                         : populate ? IndexError_NoMemory
-                                    : IndexError_ReadData;
+      chunk_read_error =
+          strategy ? IndexError_Unsupported : IndexError_NoMemory;
       return 0;
     }
     // Parsing may reuse funded backing. When it needs temporary growth the
@@ -1211,13 +1210,12 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
       view->busy.store(false, std::memory_order_release);
       changed.notify_one();
       chunk_read_error =
-          strategy ? IndexError_Unsupported : IndexError_ReadData;
+          strategy ? IndexError_Unsupported : IndexError_NoMemory;
       return 0;
     }
     out.lease = lease(out, view, layout);
     if (!ensure_workspace(*view, required, !populate)) {
-      chunk_read_error =
-          populate || strategy ? IndexError_NoMemory : IndexError_ReadData;
+      chunk_read_error = IndexError_NoMemory;
       out.reset();
       return 0;
     }
@@ -1285,8 +1283,7 @@ struct ChunkReadStorage::State : ailego::EvictableBlockOwner,
     return len;
   } catch (const std::bad_alloc &) {
     out.reset();
-    chunk_read_error =
-        populate || strategy ? IndexError_NoMemory : IndexError_ReadData;
+    chunk_read_error = IndexError_NoMemory;
     return 0;
   }
   size_t scatter(size_t offset, size_t len, Segment::ScatterBlock &out,
