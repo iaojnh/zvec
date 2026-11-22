@@ -1698,11 +1698,8 @@ class BufferStorage : public IndexStorage {
 
   //! Append a segment into storage.
   int append_segment(const std::string &id, size_t size) try {
-    if (id.find('\0') != std::string::npos) return IndexError_InvalidArgument;
     AllShardsExclusiveLatch latch(mapping_shards_);
-    // Persist dirty data and metadata before preparing a directory update.
-    const int flush_ret = flush_index_locked();
-    if (flush_ret != 0) return flush_ret;
+    if (id.find('\0') != std::string::npos) return IndexError_InvalidArgument;
 
     if (!buffer_pool_ || !buffer_pool_handle_) {
       LOG_ERROR("append_segment: pool not ready, file[%s]", file_name_.c_str());
@@ -1730,6 +1727,10 @@ class BufferStorage : public IndexStorage {
       LOG_ERROR("append_segment: invalid state, file[%s]", file_name_.c_str());
       return IndexError_Runtime;
     }
+
+    // Persist dirty data and metadata before preparing a directory update.
+    const int flush_ret = flush_index_locked();
+    if (flush_ret != 0) return flush_ret;
 
     // Page-aligned padded size; matches IndexMapping::CalcPageAlignedSize().
     const size_t page_size = ailego::kVectorPageSize;
