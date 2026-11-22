@@ -1611,8 +1611,42 @@ class BufferStorageFile
     if (size > max_file_size - (page_size - 1)) return IndexError_InvalidLength;
     const size_t padded_size = (size + page_size - 1) / page_size * page_size;
 
-    size_t id_size = id.length() + 1;
-    size_t need_size = sizeof(IndexFormat::SegmentMeta) + id_size;
+    const size_t id_size = id.length() + 1;
+    const size_t need_size = sizeof(IndexFormat::SegmentMeta) + id_size;
+    MetaChain *chain = &meta_chains_.back();
+    const size_t entries_size =
+        sizeof(IndexFormat::SegmentMeta) * chain->footer.segment_count;
+    const bool split = need_size > chain->segment_ids_offset - entries_size;
+    const size_t reachable_end =
+        chain->header_start_offset + chain->footer.total_size;
+    constexpr size_t overhead =
+        sizeof(IndexFormat::MetaHeader) + sizeof(IndexFormat::MetaFooter);
+    size_t new_chain_start = 0;
+    size_t new_meta_total = 0;
+    size_t new_seg_abs_offset = chain->header_start_offset +
+                                chain->header->content_offset +
+                                chain->footer.content_size;
+    if (split) {
+      // Use the end of the reachable chains, reusing any unpublished tail.
+      new_chain_start = reachable_end;
+      if (new_chain_start > max_file_size - (page_size - 1) ||
+          segment_meta_capacity_ > static_cast<size_t>(INT32_MAX) - overhead)
+        return IndexError_InvalidLength;
+      new_chain_start =
+          (new_chain_start + page_size - 1) / page_size * page_size;
+      new_meta_total =
+          (segment_meta_capacity_ + overhead + page_size - 1) / page_size *
+          page_size;
+      if (new_meta_total > INT32_MAX ||
+          new_meta_total > max_file_size - new_chain_start ||
+          need_size > new_meta_total - overhead)
+        return IndexError_InvalidLength;
+      new_seg_abs_offset = new_chain_start + new_meta_total;
+    }
+    if (new_seg_abs_offset > max_file_size ||
+        padded_size > max_file_size - new_seg_abs_offset)
+      return IndexError_InvalidLength;
+
     // Admit the directory node, rehash, and rollback bytes before publishing
     // either metadata chain. The key is rebound to the owned metadata below.
     if (segments_.size() + 1 >
@@ -1625,9 +1659,22 @@ class BufferStorageFile
 
     const int flush_ret = flush_index_locked();
     if (flush_ret != 0) return flush_ret;
+    // An abandoned metadata chain may have left nonzero bytes in the tail.
+    // Drop it before a new segment can make those offsets reachable.
+    if (reachable_end < buffer_pool_->file_size() &&
+        !buffer_pool_->discard_unpublished_tail(reachable_end)) {
+      return IndexError_WriteData;
+    }
+    bool published = false;
+    AILEGO_DEFER([&] {
+      // Roll back file growth once directory rollback has unlinked the tail.
+      // A later append can retry the truncation if it fails here.
+      if (!published && !is_corrupted() &&
+          reachable_end < buffer_pool_->file_size()) {
+        (void)buffer_pool_->discard_unpublished_tail(reachable_end);
+      }
+    });
 
-    MetaChain *chain = &meta_chains_.back();
-    IndexFormat::MetaHeader *header = chain->header.get();
     char *meta_buf = chain->segment_meta.data();
     IndexFormat::MetaFooter *footer = &chain->footer;
 
@@ -1637,25 +1684,7 @@ class BufferStorageFile
     bool link_attempted = false;
 
     // Step 1: split a full metadata chain.
-    if (sizeof(IndexFormat::SegmentMeta) * footer->segment_count + need_size >
-        chain->segment_ids_offset) {
-      // Use the end of the reachable chains, reusing any unpublished tail.
-      size_t new_chain_start = chain->header_start_offset + footer->total_size;
-      if (new_chain_start > max_file_size - (page_size - 1))
-        return IndexError_InvalidLength;
-      new_chain_start =
-          (new_chain_start + page_size - 1) / page_size * page_size;
-      constexpr size_t overhead =
-          sizeof(IndexFormat::MetaHeader) + sizeof(IndexFormat::MetaFooter);
-      if (segment_meta_capacity_ > static_cast<size_t>(INT32_MAX) - overhead)
-        return IndexError_InvalidLength;
-      const size_t new_meta_total =
-          (segment_meta_capacity_ + overhead + page_size - 1) / page_size *
-          page_size;
-      if (new_meta_total > INT32_MAX ||
-          new_meta_total > max_file_size - new_chain_start ||
-          need_size > new_meta_total - overhead)
-        return IndexError_InvalidLength;
+    if (split) {
       const uint32_t new_segments_meta_size =
           static_cast<uint32_t>(new_meta_total - overhead);
 
@@ -1679,7 +1708,6 @@ class BufferStorageFile
       IndexFormat::UpdateMetaFooter(&new_footer, committed_checkpoint_);
 
       meta_chains_.reserve(meta_chains_.size() + 1);
-      chain = &meta_chains_.back();
 
       // Extend the file and write the new chain's header + (zero) footer.
       // The segment_meta region is zero-filled by ftruncate.
@@ -1709,7 +1737,6 @@ class BufferStorageFile
                                        new_segments_meta_size, new_footer});
 
       chain = &meta_chains_.back();
-      header = chain->header.get();
       meta_buf = chain->segment_meta.data();
       footer = &chain->footer;
       chain_split = true;
@@ -1732,20 +1759,12 @@ class BufferStorageFile
         }
         meta_chains_.pop_back();
         meta_chains_.back().footer = footer_before_split;
-        // The unreachable file tail is reusable; shrinking is unnecessary.
       }
     };
 
     // Step 2: append the segment metadata and persist the last chain.
-    uint64_t new_data_index = footer->content_size;
-    uint64_t new_seg_abs_offset =
-        chain->header_start_offset + header->content_offset + new_data_index;
-    if (new_seg_abs_offset > max_file_size ||
-        padded_size > max_file_size - new_seg_abs_offset) {
-      rollback_chain_split();
-      return IndexError_InvalidLength;
-    }
-    uint64_t new_file_size = new_seg_abs_offset + padded_size;
+    const uint64_t new_data_index = footer->content_size;
+    const uint64_t new_file_size = new_seg_abs_offset + padded_size;
     const auto growth = buffer_pool_->extend_file_status(new_file_size);
     if (growth != ailego::PageWriteStatus::kOk) {
       rollback_chain_split();
@@ -1868,6 +1887,7 @@ class BufferStorageFile
       return IndexError_Runtime;
     }
     // extend_file() already grew the page table in place.
+    published = true;
     return 0;
   } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;

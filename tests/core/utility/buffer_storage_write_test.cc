@@ -13,10 +13,12 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <string>
@@ -31,12 +33,18 @@
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/file.h>
+#include <zvec/ailego/utility/file_helper.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_helper.h>
 #include <zvec/core/framework/index_mapping.h>
 #include "utility/utility_params.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
+
+#ifdef __linux__
+#include <csignal>
+#include <sys/resource.h>
+#endif
 
 namespace zvec::ailego {
 struct VecBufferPoolTestPeer {
@@ -1863,7 +1871,9 @@ TEST_F(BufferStorageWriteTest, RejectedAppendDoesNotFlushPendingWrites) {
     AILEGO_DEFER([&] { ailego::File::Delete(path); });
     auto storage = IndexFactory::CreateStorage(backend);
     ASSERT_TRUE(storage);
-    ASSERT_EQ(0, storage->init({}));
+    ailego::Params params;
+    params.set(MMAPFILE_STORAGE_SEGMENT_META_CAPACITY, 4096u);
+    ASSERT_EQ(0, storage->init(params));
     ASSERT_EQ(0, storage->open(path, true));
     ASSERT_EQ(0, storage->append("data", 4096));
     ASSERT_EQ(0, storage->flush());
@@ -1876,9 +1886,88 @@ TEST_F(BufferStorageWriteTest, RejectedAppendDoesNotFlushPendingWrites) {
     EXPECT_TRUE(storage->is_dirty());
     EXPECT_EQ(IndexError_InvalidArgument, storage->append("empty", 0));
     EXPECT_TRUE(storage->is_dirty());
+    const std::string long_id(4 * ailego::kVectorPageSize, 'i');
+    EXPECT_EQ(IndexError_InvalidLength, storage->append(long_id, 16));
+    EXPECT_TRUE(storage->is_dirty());
+    ASSERT_EQ(1u, segment->write(1, "y", 1));
+    const size_t page = ailego::kVectorPageSize;
+    const size_t max_size = (std::numeric_limits<ssize_t>::max)();
+    EXPECT_EQ(IndexError_InvalidLength,
+              storage->append("oversize", max_size - (page - 1)));
+    EXPECT_TRUE(storage->is_dirty());
     EXPECT_EQ(0, storage->close());
   }
 }
+
+#ifdef __linux__
+TEST_F(BufferStorageWriteTest, SplitFailureDoesNotExposeUnlinkedMetadata) {
+  const size_t page = ailego::kVectorPageSize;
+  const std::string first_id(page, 'a');
+  const std::string split_id(page, 'b');
+  for (const char *backend : {"MMapFileStorage", "BufferStorage"}) {
+    SCOPED_TRACE(backend);
+    for (bool reopen : {false, true}) {
+      SCOPED_TRACE(reopen);
+      ailego::File::Delete(file_path_);
+      auto storage = IndexFactory::CreateStorage(backend);
+      ASSERT_TRUE(storage);
+      ailego::Params params;
+      params.set(MMAPFILE_STORAGE_SEGMENT_META_CAPACITY,
+                 static_cast<uint32_t>(page));
+      ASSERT_EQ(0, storage->init(params));
+      ASSERT_EQ(0, storage->open(file_path_, true));
+      ASSERT_EQ(0, storage->append(first_id, page));
+      ASSERT_EQ(0, storage->flush());
+      const size_t original_size =
+          ailego::FileHelper::FileSize(file_path_.c_str());
+
+      {
+        struct rlimit saved;
+        ASSERT_EQ(0, getrlimit(RLIMIT_FSIZE, &saved));
+        auto limit = saved;
+        // Allow the new directory to be written, but reject its first
+        // segment's growth. The current directory still fits a short ID.
+        limit.rlim_cur = original_size + 2 * page;
+        ASSERT_EQ(0, setrlimit(RLIMIT_FSIZE, &limit));
+        AILEGO_DEFER([&] { EXPECT_EQ(0, setrlimit(RLIMIT_FSIZE, &saved)); });
+        const auto saved_signal = std::signal(SIGXFSZ, SIG_IGN);
+        ASSERT_NE(SIG_ERR, saved_signal);
+        AILEGO_DEFER([&] { std::signal(SIGXFSZ, saved_signal); });
+        ASSERT_NE(0, storage->append(split_id, page));
+      }
+      EXPECT_EQ(original_size, ailego::FileHelper::FileSize(file_path_.c_str()));
+      if (reopen) {
+        ASSERT_EQ(0, storage->close());
+        const char *retry_backend = std::strcmp(backend, "BufferStorage") == 0
+                                        ? "MMapFileStorage"
+                                        : "BufferStorage";
+        storage = IndexFactory::CreateStorage(retry_backend);
+        ASSERT_TRUE(storage);
+        ASSERT_EQ(0, storage->init(params));
+        ASSERT_EQ(0, storage->open(file_path_, true));
+      }
+      EXPECT_TRUE(storage->has(first_id));
+      EXPECT_FALSE(storage->has(split_id));
+      ASSERT_EQ(0, storage->append("small", page));
+      auto segment = storage->get("small");
+      ASSERT_TRUE(segment);
+      constexpr std::array<char, 32> zeros{};
+      ASSERT_EQ(zeros.size(), segment->resize(zeros.size()));
+      ASSERT_EQ(0, storage->close());
+
+      auto reader = IndexFactory::CreateStorage("MMapFileReadStorage");
+      ASSERT_TRUE(reader);
+      ASSERT_EQ(0, reader->init({}));
+      ASSERT_EQ(0, reader->open(file_path_, false));
+      segment = reader->get("small");
+      ASSERT_TRUE(segment);
+      std::array<char, zeros.size()> bytes;
+      ASSERT_EQ(bytes.size(), segment->fetch(0, bytes.data(), bytes.size()));
+      EXPECT_EQ(zeros, bytes);
+    }
+  }
+}
+#endif
 
 // ===== Code Review Issue Tests =====
 // The following tests target specific bugs/races found during code review.
@@ -2454,6 +2543,76 @@ TEST_F(BufferStorageWriteTest, EndOfSegmentReadClearsEarlierBudgetError) {
     ASSERT_EQ(IndexError_NoMemory, segment->read_error());
     EXPECT_EQ(0u, ((*segment).*read)(bytes.size(), result, 1));
     EXPECT_EQ(IndexError_ReadData, segment->read_error());
+  }
+}
+
+TEST_F(BufferStorageWriteTest, FetchReadsDirtyAndColdPagesWithoutAdmission) {
+  const size_t page = ailego::kVectorPageSize;
+  for (const char *backend : {"MMapFileStorage", "BufferStorage"}) {
+    SCOPED_TRACE(backend);
+    ailego::File::Delete(file_path_);
+    auto storage = IndexFactory::CreateStorage(backend);
+    ASSERT_TRUE(storage);
+    ASSERT_EQ(0, storage->init({}));
+    ASSERT_EQ(0, storage->open(file_path_, true));
+    ASSERT_EQ(0, storage->append("data", 2 * page));
+    auto segment = storage->get("data");
+    ASSERT_TRUE(segment);
+    ASSERT_EQ(4u, segment->write(page - 2, "abcd", 4));
+    ASSERT_EQ(0, storage->flush());
+    ASSERT_EQ(2u, segment->write(page - 2, "xy", 2));
+    auto pages = storage->vec_buffer_pool();
+    const size_t cold = (segment->data_offset() + page) / page;
+    IndexStorage::MemoryBlock pin;
+    if (pages) {
+      ASSERT_EQ(1u, segment->read_borrowed_immutable(page - 2, pin, 1));
+      (void)ailego::VecBufferPoolTestPeer::evict_clean(*pages, cold);
+      ASSERT_FALSE(pages->is_page_resident(cold));
+    }
+
+    {
+      auto &budget = ailego::MemoryLimitPool::get_instance();
+      using Pressure = ailego::ProcessRssBudget::PressureLevel;
+      AILEGO_DEFER([&] { budget.set_memory_pressure(Pressure::kNormal); });
+      budget.set_memory_pressure(Pressure::kCritical);
+      char data[4]{};
+      ASSERT_EQ(sizeof(data), segment->fetch(page - 2, data, sizeof(data)));
+      EXPECT_EQ("xycd", std::string(data, sizeof(data)));
+      if (pages) EXPECT_FALSE(pages->is_page_resident(cold));
+    }
+    ASSERT_EQ(0, storage->close());
+  }
+}
+
+TEST_F(BufferStorageWriteTest, RestoreSurvivesFirstAdmissionOfNewPage) {
+  const size_t page = ailego::kVectorPageSize;
+  for (const char *backend : {"MMapFileStorage", "BufferStorage"}) {
+    SCOPED_TRACE(backend);
+    ailego::File::Delete(file_path_);
+    auto storage = IndexFactory::CreateStorage(backend);
+    ASSERT_TRUE(storage);
+    ASSERT_EQ(0, storage->init({}));
+    ASSERT_EQ(0, storage->open(file_path_, true));
+    ASSERT_EQ(0, storage->append("data", page));
+    auto segment = storage->get("data");
+    ASSERT_TRUE(segment);
+    ASSERT_EQ(5u, segment->resize(5));
+    ASSERT_TRUE(segment->restore(0, "saved", 5));
+    char data[5]{};
+    ASSERT_EQ(sizeof(data),
+              segment->fetch_for_parsing(0, data, sizeof(data)));
+    ASSERT_EQ("saved", std::string(data, sizeof(data)));
+    ASSERT_EQ(sizeof(data), segment->fetch(0, data, sizeof(data)));
+    EXPECT_EQ("saved", std::string(data, sizeof(data)));
+    ASSERT_EQ(1u, segment->write(4, "!", 1));
+    ASSERT_EQ(0, storage->close());
+
+    auto reader = open_read_only();
+    ASSERT_TRUE(reader);
+    auto reopened = reader->get("data");
+    ASSERT_TRUE(reopened);
+    ASSERT_EQ(sizeof(data), reopened->fetch(0, data, sizeof(data)));
+    EXPECT_EQ("save!", std::string(data, sizeof(data)));
   }
 }
 

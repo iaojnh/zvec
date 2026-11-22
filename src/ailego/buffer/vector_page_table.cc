@@ -66,6 +66,9 @@ static ssize_t zvec_pwrite(int fd, const void *buf, size_t count,
   }
   return static_cast<ssize_t>(bytes_written);
 }
+static bool zvec_resize_file(int fd, size_t size) {
+  return _chsize_s(fd, static_cast<int64_t>(size)) == 0;
+}
 #else
 #include <unistd.h>
 static inline ssize_t zvec_pread(int fd, void *buf, size_t count,
@@ -75,6 +78,9 @@ static inline ssize_t zvec_pread(int fd, void *buf, size_t count,
 static inline ssize_t zvec_pwrite(int fd, const void *buf, size_t count,
                                   size_t offset) {
   return ::pwrite(fd, buf, count, static_cast<off_t>(offset));
+}
+static bool zvec_resize_file(int fd, size_t size) {
+  return ::ftruncate(fd, static_cast<off_t>(size)) == 0;
 }
 #endif
 
@@ -226,6 +232,8 @@ void VectorPageTable::initialize_segment(Entry *entries,
     metadata_entries[i].writeback_pending.store(false,
                                                 std::memory_order_relaxed);
     metadata_entries[i].ever_loaded.store(false, std::memory_order_relaxed);
+    metadata_entries[i].written_directly.store(false,
+                                               std::memory_order_relaxed);
   }
 }
 
@@ -488,7 +496,7 @@ bool VectorPageTable::rollback_extend(size_t old_entry_num) {
     if (entry_at(i).buffer.load(std::memory_order_relaxed) != nullptr ||
         entry_at(i).ref_count.load(std::memory_order_relaxed) !=
             std::numeric_limits<int>::min() ||
-        metadata_entry_at(i).ever_loaded.load(std::memory_order_relaxed)) {
+        !can_zero_fill(i)) {
       LOG_ERROR(
           "VectorPageTable::rollback_extend: new entry %zu is already in "
           "use; refusing rollback",
@@ -1886,9 +1894,9 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry,
     const size_t page_offset = page_id * kVectorPageSize;
     // Count one miss per page for which this thread won the load claim.
     miss_count_.fetch_add(1, std::memory_order_relaxed);
-    // Newly extended pages start zeroed; reload evicted pages from disk.
+    // Only untouched pages in newly extended space can skip the disk read.
     if (writable_ && page_offset >= initial_file_size_ &&
-        !page_table_.is_ever_loaded(page_id)) {
+        page_table_.can_zero_fill(page_id)) {
       std::memset(buffer, 0, kVectorPageSize);
     } else {
       // Accept and zero-pad an unaligned final page.
@@ -2413,6 +2421,8 @@ bool VecBufferPool::restore_range(size_t offset, size_t length,
       const auto claim = page_table_.try_claim_block_load(id);
       if (claim == VectorPageTable::LoadClaimResult::kClaimed) {
         const int ret = write_meta(offset, bytes, buffer);
+        // Even a short write may leave bytes on disk for a later reader.
+        page_table_.record_direct_write(id);
         page_table_.cancel_block_load(id);
         if (ret != 0) return false;
         break;
@@ -2546,9 +2556,8 @@ PageWriteStatus VecBufferPool::extend_file_status(size_t new_size) {
     return initialized_ ? PageWriteStatus::kNoMemory : PageWriteStatus::kError;
   }
 
-#if defined(_MSC_VER)
-  if (_chsize_s(fd_, static_cast<int64_t>(new_size)) != 0) {
-    LOG_ERROR("extend_file _chsize_s failed: file[%s], new_size[%zu]",
+  if (!zvec_resize_file(fd_, new_size)) {
+    LOG_ERROR("extend_file failed to resize: file[%s], new_size[%zu]",
               file_name_.c_str(), new_size);
     if (!page_table_.rollback_extend(old_entry_num)) {
       LOG_ERROR("extend_file: failed to roll back page table for file[%s]",
@@ -2557,20 +2566,28 @@ PageWriteStatus VecBufferPool::extend_file_status(size_t new_size) {
     }
     return PageWriteStatus::kError;
   }
-#else
-  if (::ftruncate(fd_, static_cast<off_t>(new_size)) != 0) {
-    LOG_ERROR("extend_file ftruncate failed: file[%s], new_size[%zu]",
-              file_name_.c_str(), new_size);
-    if (!page_table_.rollback_extend(old_entry_num)) {
-      LOG_ERROR("extend_file: failed to roll back page table for file[%s]",
-                file_name_.c_str());
-      quarantine_writeback();
-    }
-    return PageWriteStatus::kError;
-  }
-#endif
   file_size_.store(new_size, std::memory_order_release);
   return PageWriteStatus::kOk;
+}
+
+bool VecBufferPool::discard_unpublished_tail(size_t retained_size) {
+  std::lock_guard lock(extend_mutex_);
+  if (!writable_ || writeback_quarantined() ||
+      retained_size % kVectorPageSize != 0 || retained_size > file_size()) {
+    return false;
+  }
+  if (retained_size == file_size()) return true;
+  if (!zvec_resize_file(fd_, retained_size)) {
+    LOG_ERROR("Failed to discard unpublished tail: file[%s], size[%zu]",
+              file_name_.c_str(), retained_size);
+    return false;
+  }
+  file_size_.store(retained_size, std::memory_order_release);
+  if (!page_table_.rollback_extend(retained_size / kVectorPageSize)) {
+    quarantine_writeback();
+    return false;
+  }
+  return true;
 }
 
 char *VecBufferPoolHandle::get_single_page(size_t file_offset, size_t len,
@@ -2648,10 +2665,14 @@ bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len, char *out,
   if (pool_.writable_) {
     for (size_t pg = first_page; pg <= last_page; ++pg) {
       char *page =
-          pool_.acquire_buffer(static_cast<block_id_t>(pg), 50,
+          pool_.acquire_buffer(static_cast<block_id_t>(pg), /*retry=*/0,
                                /*record_reuse=*/true, &allocation_failed);
       if (page == nullptr) {
-        return false;
+        // The destination already exists. Admission is optional, and the
+        // bypass still synchronizes with dirty resident pages and loaders.
+        return allocation_failed &&
+               pool_.read_range_bypass(file_offset + dst_cursor, remaining,
+                                       out + dst_cursor, allocation_failed);
       }
       std::shared_lock<std::shared_mutex> page_lock(
           pool_.block_mutexes_[pg % pool_.block_mutex_count_]);
