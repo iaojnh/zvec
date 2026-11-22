@@ -220,7 +220,8 @@ int IVFSearcher::search_bf(
       ivf_check_error_code(ret);
     }
     entity->normalize(q, &heap);
-    ctx->topk_to_result(q);
+    ret = ctx->topk_to_result(q);
+    ivf_check_error_code(ret);
     query = static_cast<const char *>(query) + iv_qmeta.element_size();
   }
 
@@ -301,7 +302,8 @@ int IVFSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
       ivf_check_error_code(ret);
     }
     entity->normalize(q, &heap);
-    ctx->topk_to_result(q);
+    ret = ctx->topk_to_result(q);
+    ivf_check_error_code(ret);
     query = static_cast<const char *>(query) + iv_qmeta.element_size();
   }
 

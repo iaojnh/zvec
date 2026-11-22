@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 #include <gtest/gtest.h>
+#include "ivf_searcher_context.h"
 
 using namespace zvec::core;
 
@@ -259,6 +260,35 @@ TEST(IVFIndexProviderTest, ColumnMajorEntityReadsOwnTheirResults) {
   fixture.entity.reset();
   EXPECT_EQ(static_cast<float>(kVectorCount - 1),
             *static_cast<const float *>(second.data()));
+}
+
+TEST(IVFIndexProviderTest, FetchVectorResultClearsPartialOutputOnReadDenial) {
+  MappingProvider fixture(/*column_major=*/true);
+  ASSERT_EQ(0, fixture.load_status);
+  IndexSearcher::Context::Pointer centroid_context;
+  IVFSearcherContext context(fixture.entity, centroid_context);
+  context.set_topk(2);
+  context.set_fetch_vector(true);
+  const auto candidates = [&] {
+    context.reset_results(1);
+    context.mutable_result_heap().emplace(kVectorCount, 0.0f);
+    context.mutable_result_heap().emplace(1, 1.0f);
+  };
+
+  fixture.mapping->deny_read_at(0);  // Only the second candidate needs it.
+  candidates();
+  EXPECT_EQ(IndexError_NoMemory, context.topk_to_result(0));
+  EXPECT_TRUE(context.result().empty());
+
+  fixture.mapping->deny_read_at(std::numeric_limits<size_t>::max());
+  candidates();
+  ASSERT_EQ(0, context.topk_to_result(0));
+  ASSERT_EQ(2, context.result().size());
+  ASSERT_NE(nullptr, context.result()[0].vector());
+  ASSERT_NE(nullptr, context.result()[1].vector());
+  EXPECT_EQ(static_cast<float>(kVectorCount),
+            *static_cast<const float *>(context.result()[0].vector()));
+  EXPECT_EQ(1.0f, *static_cast<const float *>(context.result()[1].vector()));
 }
 
 TEST(IVFIndexProviderTest, MappingFetchFailuresAreStickyAndNotNormalEof) {
