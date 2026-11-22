@@ -219,9 +219,18 @@ class ZVEC_AILEGO_API BlockEvictionQueue {
 
   size_t recover_owner_queues();
 
+  struct ReclaimCheck {
+    const void *context;
+    bool (*pending)(const void *);
+    bool allows_work() const {
+      return pending(context);
+    }
+  };
+  size_t reclaim_for_allocation(size_t bytes, const ReclaimCheck *check);
   size_t recycle_inactive(size_t max_attempts);
   size_t batch_recycle_impl(size_t count, size_t scan_count, bool age_protected,
-                            size_t bytes = 0);
+                            size_t bytes = 0,
+                            const ReclaimCheck *check = nullptr);
 
   BlockEvictionQueue();
 
@@ -682,7 +691,18 @@ class ZVEC_AILEGO_API MemoryLimitPool {
     size_t native_bytes;
     size_t rss_bytes;
   };
+  using AdmissionClock = std::chrono::steady_clock;
+  struct RequiredWaiter {
+    AdmissionRequest request;
+    AdmissionClock::time_point deadline;
+    AdmissionClock::time_point retry_after{AdmissionClock::time_point::min()};
+    uint64_t generation{0};
+    uint64_t ticket{0};
+    bool reclaiming{false};
+    RequiredWaiter *next{nullptr};
+  };
   size_t native_available() const;
+  AdmissionRequest admission_deficit(AdmissionRequest request) const;
   size_t admission_shortfall(AdmissionRequest request) const;
   size_t queue_lifetime_bytes() const;
   size_t rss_allocation_limit() const;
@@ -717,13 +737,25 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   char *acquire_slab_buffer(size_t *reserved_pages = nullptr);
   bool reclaim_slab_buffer(char *buffer);
   bool release_all_slabs_locked();
-  size_t trim_free_buffers(size_t bytes_needed);
+  size_t trim_free_buffers(
+      size_t bytes_needed,
+      const BlockEvictionQueue::ReclaimCheck *check = nullptr);
   bool trim_idle_buffers();
   bool reclaim_process_cache();
-  void request_required_reclaim(size_t bytes);
-  void reclaim_for_required_waiters();
-  size_t trim_retained_blocks(size_t bytes_needed);
-  size_t trim_cache_buffers(size_t bytes_needed);
+  void register_required_waiter(RequiredWaiter &waiter);
+  void unregister_required_waiter(RequiredWaiter &waiter);
+  RequiredWaiter *find_required_waiter(uint64_t ticket);
+  bool required_reclaim_pending(const RequiredWaiter &waiter);
+  bool required_reclaim_needed(uint64_t ticket);
+  void required_reclaim_loop();
+  bool reclaim_one_required_batch(std::unique_lock<std::mutex> &lock,
+                                  AdmissionClock::time_point &next_check);
+  size_t trim_retained_blocks(
+      size_t bytes_needed,
+      const BlockEvictionQueue::ReclaimCheck *check = nullptr);
+  size_t trim_cache_buffers(
+      size_t bytes_needed,
+      const BlockEvictionQueue::ReclaimCheck *check = nullptr);
   void register_cache_mapping(CacheBuffer *buffer);
   bool unmap_cache_mapping(CacheBuffer *buffer);
   size_t pick_shard();
@@ -794,8 +826,6 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   std::atomic<size_t> external_used_size_{0};
   std::atomic<size_t> evictable_cache_size_{0};
   std::atomic<size_t> cache_reclaim_requested_{0};
-  std::atomic<size_t> required_reclaim_requested_{0};
-  std::atomic<bool> required_reclaim_active_{false};
   std::atomic<size_t> metadata_used_size_{0};
   // Logical priority only: reserve actual native growth for mandatory work,
   // while RSS-only/proof waiters merely signal maintenance and optional caches.
@@ -862,12 +892,19 @@ class ZVEC_AILEGO_API MemoryLimitPool {
 
   std::mutex capacity_mutex_;
   std::condition_variable capacity_cv_;
-  std::atomic<uint64_t> reclaimable_generation_{0};
+  // All waiter records are linked only for the lifetime of their call.
+  // The worker keeps a ticket, never a waiter pointer, across a reclaim call.
+  std::condition_variable required_reclaim_cv_;
+  RequiredWaiter *required_waiters_{nullptr};
+  uint64_t next_required_ticket_{0};
+  uint64_t reclaimable_generation_{0};
   std::atomic<size_t> workspace_releases_in_progress_{0};
 
   std::thread bg_thread_;
+  std::thread required_reclaim_thread_;
   std::mutex bg_identity_mutex_;
   std::thread::id bg_identity_{};
+  std::thread::id required_reclaim_identity_{};
   std::atomic<bool> bg_running_{false};
   std::mutex bg_mutex_;
   std::condition_variable bg_cv_;

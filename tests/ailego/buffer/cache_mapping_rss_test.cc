@@ -16,6 +16,7 @@
 #include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
+#include <zvec/ailego/buffer/external_cache.h>
 #include <zvec/ailego/buffer/retained_block_allocator.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/io/file.h>
@@ -576,6 +577,178 @@ TEST_F(CacheMappingRssTest, CacheUnpinBeforeDeadlineGetsReclaimAttempt) {
   pinned = 0;
   ASSERT_EQ(std::future_status::ready, pending.wait_for(2s));
   EXPECT_TRUE(pending.get());
+}
+
+struct SmallCacheLoader {
+  using Value = std::shared_ptr<std::vector<char>>;
+  bool load(size_t, Value &value, size_t &bytes) {
+    bytes = MemoryLimitPool::page_buffer_size();
+    value = std::make_shared<std::vector<char>>(bytes, 73);
+    return true;
+  }
+  Value value(const Value &value) const {
+    return value;
+  }
+  void clear(Value &value) const {
+    value.reset();
+  }
+};
+using SmallCache =
+    ExternalCache<size_t, SmallCacheLoader::Value, SmallCacheLoader,
+                  std::hash<size_t>, std::equal_to<size_t>>;
+
+void FillReclaimCache(SmallCache &cache, size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    ASSERT_NE(nullptr, cache.acquire(i));
+    cache.release(i);
+  }
+  ASSERT_EQ(count, cache.entry_count());
+}
+
+TEST_F(CacheMappingRssTest, CleanCacheCanReclaimWhileUnrelatedWorkerIsBlocked) {
+  using namespace std::chrono_literals;
+  constexpr size_t count = 256;
+  const size_t page_bytes = pool_.page_buffer_size();
+  VectorPageTable pages;
+  ASSERT_TRUE(pages.init(count));
+  pages.set_adaptive_priority(false);
+  for (size_t i = 0; i < count; ++i) {
+    char *page = nullptr;
+    ASSERT_TRUE(pool_.try_acquire_buffer(page_bytes, page, true));
+    ASSERT_EQ(page, pages.set_block_acquired(i, page, i * page_bytes));
+    pages.release_block(i);
+  }
+  std::promise<void> entered, resume;
+  auto active = entered.get_future();
+  auto release = resume.get_future();
+  std::atomic<bool> first{true};
+  pool_.set_process_rss_reclaimer([&] {
+    if (first.exchange(false)) {
+      entered.set_value();
+      release.wait();
+    }
+  });
+  auto shutdown = ScopeGuard::Make([&] {
+    resume.set_value();
+    MemoryLimitPoolTestPeer::stop_background(pool_);
+    pool_.set_process_rss_reclaimer({});
+    pool_.set_memory_pressure(ProcessRssBudget::PressureLevel::kNormal);
+    pages.force_evict_all_loaded();
+  });
+  pool_.set_memory_pressure(ProcessRssBudget::PressureLevel::kBackground);
+  MemoryLimitPoolTestPeer::start_background(pool_);
+  ASSERT_EQ(std::future_status::ready, active.wait_for(500ms));
+  pool_.set_memory_pressure(ProcessRssBudget::PressureLevel::kNormal);
+  const size_t request = pool_.available() + 128 * 1024;
+  const bool admitted = AllocateNative(request);
+  EXPECT_TRUE(admitted);
+}
+
+TEST_F(CacheMappingRssTest,
+       RequiredRssReclaimFinishesMultipleBatchesWithinCap) {
+  using namespace std::chrono_literals;
+  const size_t page = pool_.page_buffer_size();
+  const size_t count = 24 * kMiB / page;
+  SmallCache cache;
+  ASSERT_NO_FATAL_FAILURE(FillReclaimCache(cache, count));
+  ASSERT_TRUE(MemoryLimitPoolTestPeer::fixed_rss_limit_without_overlap(
+      pool_, 64 * kMiB + pool_.committed() + 24 * kMiB));
+  const size_t request = MemoryLimitPoolTestPeer::rss_room(pool_) + 16 * kMiB;
+  ASSERT_GT(pool_.available(), request);
+  MemoryLimitPoolTestPeer::start_background(pool_);
+  auto shutdown = ScopeGuard::Make([&] {
+    MemoryLimitPoolTestPeer::stop_background(pool_);
+    EXPECT_TRUE(pool_.configure_process_rss_limit(0));
+  });
+
+  BudgetedMappedBuffer required;
+  ASSERT_EQ(0, required.resize(request));
+  EXPECT_EQ(request, required.size());
+  // Other idle backing may also be returned while this request waits.
+  // The real cache must still have supplied more than one eviction batch.
+  EXPECT_GT(count - cache.entry_count(), 256u);
+}
+
+
+TEST_F(CacheMappingRssTest, ExpiredReclaimStopsBeforeServingNextWaiter) {
+  using namespace std::chrono_literals;
+  for (bool resume_first : {true, false}) {
+    SCOPED_TRACE(resume_first);
+    const size_t page = pool_.page_buffer_size();
+    VectorPageTable dirty;
+    ASSERT_TRUE(dirty.init(1));
+    dirty.set_adaptive_priority(false);
+    char *buffer = nullptr;
+    ASSERT_TRUE(pool_.try_acquire_buffer(page, buffer, true));
+    ASSERT_EQ(buffer, dirty.set_block_acquired(0, buffer, 0));
+    dirty.mark_dirty(0);
+    dirty.release_block(0);
+    SmallCache cache;
+    ASSERT_NO_FATAL_FAILURE(FillReclaimCache(cache, 4 * kMiB / page));
+    ASSERT_TRUE(MemoryLimitPoolTestPeer::fixed_rss_limit_without_overlap(
+        pool_, 64 * kMiB + pool_.committed() + 24 * kMiB));
+
+    std::promise<void> entered, resume;
+    auto active = entered.get_future();
+    auto release = resume.get_future();
+    std::atomic<bool> first_flush{true};
+    dirty.set_flush_callback([&](block_id_t, char *, size_t, size_t) {
+      if (first_flush.exchange(false)) {
+        entered.set_value();
+        release.wait();
+      }
+      return -1;
+    });
+    auto maintenance = MemoryLimitPoolTestPeer::lock_background(pool_);
+    const size_t large_request =
+        MemoryLimitPoolTestPeer::rss_room(pool_) + 2 * kMiB;
+    size_t small_request = 0;
+    bool resumed = false;
+    std::future<bool> large, small;
+    auto cleanup = ScopeGuard::Make([&] {
+      if (!resumed) resume.set_value();
+      if (large.valid() && large.get())
+        pool_.release_process_backing(large_request);
+      if (small.valid() && small.get())
+        pool_.release_process_backing(small_request);
+      if (maintenance.owns_lock()) maintenance.unlock();
+      MemoryLimitPoolTestPeer::stop_background(pool_);
+      dirty.clear_dirty(0);
+      dirty.force_evict_all_loaded();
+      EXPECT_TRUE(pool_.configure_process_rss_limit(0));
+    });
+    MemoryLimitPoolTestPeer::start_background(pool_);
+    large = std::async(std::launch::async, [&] {
+      return pool_.try_charge_process_backing(large_request, 0, false);
+    });
+    ASSERT_EQ(std::future_status::ready, active.wait_for(500ms));
+    // Expire the large request while the reclaim worker is inside its first
+    // dirty-page eviction. The small request can only arrive after that exit.
+    ASSERT_EQ(std::future_status::ready, large.wait_for(1300ms));
+    const bool large_admitted = large.get();
+    if (large_admitted) pool_.release_process_backing(large_request);
+    ASSERT_FALSE(large_admitted);
+    const size_t before_small = cache.entry_count();
+    small_request = MemoryLimitPoolTestPeer::rss_room(pool_) + page;
+    const auto waits = pool_.stats().capacity_waits;
+    small = std::async(std::launch::async, [&] {
+      return pool_.try_charge_process_backing(small_request, 0, false);
+    });
+    ASSERT_TRUE(EnteredWaitAfter(waits, small));
+    if (resume_first) {
+      resume.set_value();
+      resumed = true;
+    } else {
+      // The ordinary maintenance worker can take the small request while
+      // the unrelated writeback still occupies the dedicated worker.
+      maintenance.unlock();
+    }
+    ASSERT_EQ(std::future_status::ready, small.wait_for(500ms));
+    const bool small_admitted = small.get();
+    EXPECT_TRUE(small_admitted);
+    if (small_admitted) pool_.release_process_backing(small_request);
+    if (resume_first) EXPECT_LE(before_small - cache.entry_count(), 4u);
+  }
 }
 
 TEST_F(CacheMappingRssTest, RequiredWorkspaceRejectsAndCanRetryAfterRelease) {
