@@ -1738,14 +1738,17 @@ class BufferStorage : public IndexStorage {
 
     size_t id_size = id.length() + 1;
     size_t need_size = sizeof(IndexFormat::SegmentMeta) + id_size;
-    // Admit the directory node, rehash, and rollback bytes before publishing
-    // either metadata chain. The key is rebound to the owned metadata below.
-    if (segments_.size() + 1 >
-        segments_.bucket_count() * segments_.max_load_factor())
-      segments_.reserve(std::max(size_t{8}, (segments_.size() + 1) * 2));
-    SegmentMap pending;
-    pending.emplace(std::string_view(id), IndexMapping::SegmentInfo{});
-    auto pending_node = pending.extract(pending.begin());
+    // Insert into the real directory map before any metadata is published.
+    // The exclusive latch keeps the pending entry private until commit.
+    auto pending = segments_.try_emplace(std::string_view(id),
+                                         IndexMapping::SegmentInfo{});
+    if (!pending.second) return IndexError_Duplicate;
+    bool committed = false;
+    AILEGO_DEFER([&]() {
+      if (!committed && pending.first != segments_.end()) {
+        segments_.erase(pending.first);
+      }
+    });
     ailego::BudgetedVector<char> saved_id_bytes(id_size);
 
     MetaChain *chain = &meta_chains_.back();
@@ -1834,7 +1837,6 @@ class BufferStorage : public IndexStorage {
         return false;
       }
     };
-    bool committed = false;
     AILEGO_DEFER([&]() {
       if (committed || !chain_split) return;
       if (link_attempted &&
@@ -1938,27 +1940,15 @@ class BufferStorage : public IndexStorage {
       meta_chains_[meta_chains_.size() - 2].footer = linked_footer;
     }
 
-    // Publish the segment after its on-disk directory is reachable.
-    try {
-      pending_node.key() = std::string_view(meta_buf + new_ids_off, id.size());
-      pending_node.mapped() = IndexMapping::SegmentInfo{
-          IndexMapping::Segment{new_seg}, chain->header_start_offset, header};
-      auto ins = segments_.insert(std::move(pending_node));
-      if (!ins.inserted) {
-        // Defensive: the exclusive latch should make this unreachable.
-        LOG_ERROR(
-            "append_segment: duplicate id appeared after commit, file[%s], "
-            "id[%s]",
-            file_name_.c_str(), id.c_str());
-        return IndexError_Duplicate;
-      }
-    } catch (const std::bad_alloc &) {
-      LOG_ERROR(
-          "append_segment: in-memory commit OOM, rolling back, file[%s], "
-          "id[%s]",
-          file_name_.c_str(), id.c_str());
-      return IndexError_Runtime;
-    }
+    // Rebind the key to the owned directory bytes. Reinserting the same
+    // node restores the original entry count and needs no rehash.
+    auto node = segments_.extract(pending.first);
+    pending.first = segments_.end();
+    node.key() = std::string_view(meta_buf + new_ids_off, id.size());
+    node.mapped() = IndexMapping::SegmentInfo{
+        IndexMapping::Segment{new_seg}, chain->header_start_offset, header};
+    if (!segments_.insert(std::move(node)).inserted)
+      return IndexError_Duplicate;
     committed = true;
     return 0;
   } catch (const std::bad_alloc &) {
