@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstddef>
 #include <ailego/utility/memory_helper.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_helper.h>
+#include <zvec/core/framework/index_parsing_input.h>
 
 namespace zvec {
 namespace core {
@@ -45,24 +47,24 @@ int IndexHelper::SerializeToStorage(const IndexMeta &mt, IndexStorage *storage,
 
   auto segment = storage->get(key);
   if (!segment) {
+    if (storage->has(key)) return IndexError_NoMemory;
     const size_t align_size = 4096 * 4;
     size_t meta_size =
         (buffer.size() + align_size - 1) / align_size * align_size;
 
-    if (storage->append(key, meta_size) != 0) {
-      return IndexError_WriteData;
-    }
+    const int status = storage->append(key, meta_size);
+    if (status != 0) return status;
 
     segment = storage->get(key);
-    if (!segment) {
-      return IndexError_NoExist;
-    }
+    if (!segment) return IndexError_NoMemory;
   }
 
   if (segment->write(0, buffer.data(), buffer.size()) != buffer.size()) {
-    return IndexError_WriteData;
+    return segment->write_error();
   }
-  segment->resize(buffer.size());
+  if (segment->data_size() != buffer.size() &&
+      segment->resize(buffer.size()) != buffer.size())
+    return segment->write_error();
   segment->update_data_crc(
       ailego::Crc32c::Hash(buffer.data(), buffer.size(), 0));
   return IndexError_Success;
@@ -76,13 +78,25 @@ int IndexHelper::DeserializeFromStorage(IndexStorage *storage,
     return IndexError_NoExist;
   }
 
-  uint32_t crc = segment->data_crc();
-  size_t len = segment->data_size();
+  const uint32_t crc = segment->data_crc();
+  const size_t len = segment->data_size();
+  // The serialized header alone is over 4 KiB. A small metadata record can
+  // still be parsed when the storage cannot allocate a page-aligned view.
+  alignas(std::max_align_t) char local[8192];
+  IndexParsingInput input(local, sizeof(local));
   IndexStorage::MemoryBlock block;
-  if (segment->read(0, block, len) != len) {
-    return IndexError_ReadData;
+  const void *data;
+  if (segment->read_for_parsing(0, block, len) == len) {
+    data = block.data();
+  } else {
+    const int error = segment->read_error();
+    if (error != IndexError_NoMemory) return error;
+    block.reset();
+    if (!input.prepare(len)) return IndexError_NoMemory;
+    if (segment->fetch_for_parsing(0, input.data(), len) != len)
+      return segment->read_error();
+    data = input.data();
   }
-  const void *data = block.data();
   if (crc != 0u && ailego::Crc32c::Hash(data, len, 0u) != crc) {
     return IndexError_InvalidChecksum;
   }

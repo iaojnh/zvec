@@ -13,8 +13,12 @@
 // limitations under the License.
 #pragma once
 
+#include <limits>
+#include <new>
+#include <stdexcept>
 #include <zvec/ailego/container/params.h>
 #include <zvec/core/framework/index_module.h>
+#include <zvec/core/framework/index_parsing_input.h>
 #include <zvec/core/framework/index_storage.h>
 #include <zvec/core/framework/index_unpacker.h>
 
@@ -42,12 +46,9 @@ class IndexSegmentStorage : public IndexStorage {
     //! Constructor
     Segment(const IndexStorage::Segment::Pointer &parent,
             const IndexUnpacker::SegmentMeta &segment)
-        : data_offset_(segment.data_offset()),
-          data_size_(segment.data_size()),
-          padding_size_(segment.padding_size()),
-          region_size_(segment.data_size() + segment.padding_size()),
-          data_crc_(segment.data_crc()),
-          parent_(parent->clone()) {}
+        : Segment(parent ? parent->clone() : nullptr, segment.data_offset(),
+                  segment.data_size(), segment.padding_size(),
+                  segment.data_crc()) {}
 
     //! Constructor (for clone)
     Segment(const IndexStorage::Segment::Pointer &cloned_parent,
@@ -58,7 +59,10 @@ class IndexSegmentStorage : public IndexStorage {
           padding_size_(padding_size),
           region_size_(data_size + padding_size),
           data_crc_(data_crc),
-          parent_(cloned_parent) {}
+          parent_(cloned_parent) {
+      if (!parent_)
+        throw std::runtime_error("Nested segment has no backing reader");
+    }
 
     //! Destructor
     ~Segment() override = default;
@@ -84,24 +88,114 @@ class IndexSegmentStorage : public IndexStorage {
 
     //! Fetch data from segment (with own buffer)
     size_t fetch(size_t offset, void *buf, size_t len) const override {
-      return parent_->fetch(data_offset_ + offset, buf, len);
+      if (offset >= region_size_ || !len) return 0;
+      return parent_->fetch(data_offset_ + offset, buf,
+                            std::min(len, region_size_ - offset));
+    }
+
+    size_t fetch_for_parsing(size_t offset, void *buf,
+                             size_t len) const override {
+      if (offset > region_size_) return 0;
+      len = std::min(len, region_size_ - offset);
+      return parent_->fetch_for_parsing(data_offset_ + offset, buf, len);
+    }
+
+    int read_error() const override {
+      return parent_->read_error();
+    }
+
+    size_t read_for_parsing_with_strategy(size_t offset, MemoryBlock &data,
+                                          size_t len,
+                                          ParsingReadStrategy strategy,
+                                          int &error) override {
+      if (offset > region_size_) {
+        data.reset();
+        error = IndexError_ReadData;
+        return 0;
+      }
+      return parent_->read_for_parsing_with_strategy(
+          data_offset_ + offset, data, std::min(len, region_size_ - offset),
+          strategy, error);
+    }
+
+    void begin_parsing() override {
+      parent_->begin_parsing();
+    }
+    void end_parsing() noexcept override {
+      parent_->end_parsing();
+    }
+
+    bool supports_read_chunks() const override {
+      return parent_->supports_read_chunks();
+    }
+    int set_read_chunks(const ReadChunks &chunks) override try {
+      for (const auto &chunk : chunks) {
+        if (chunk.offset > data_size_ ||
+            chunk.size > data_size_ - chunk.offset ||
+            chunk.offset > std::numeric_limits<size_t>::max() - data_offset_)
+          return IndexError_InvalidArgument;
+      }
+      ReadChunks translated;
+      translated.reserve(chunks.size());
+      for (const auto &chunk : chunks) {
+        translated.push_back({data_offset_ + chunk.offset, chunk.size});
+      }
+      return parent_->set_read_chunks(translated);
+    } catch (const std::bad_alloc &) {
+      return IndexError_NoMemory;
+    }
+
+    size_t read_scatter(size_t offset, ScatterBlock &data,
+                        size_t len) override {
+      if (offset > region_size_) {
+        data.reset();
+        return 0;
+      }
+      return parent_->read_scatter(data_offset_ + offset, data,
+                                   std::min(len, region_size_ - offset));
     }
 
     //! Read data from segment
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {
-      return parent_->read(data_offset_ + offset, data, len);
+      if (offset >= region_size_ || !len) {
+        data.reset();
+        return 0;
+      }
+      return parent_->read(data_offset_ + offset, data,
+                           std::min(len, region_size_ - offset));
+    }
+
+    size_t read_for_parsing(size_t offset, MemoryBlock &data,
+                            size_t len) override {
+      if (offset > region_size_) {
+        data.reset();
+        return 0;
+      }
+      return parent_->read_for_parsing(data_offset_ + offset, data,
+                                       std::min(len, region_size_ - offset));
     }
 
     //! Read data from segment
     bool read(SegmentData *iovec, size_t count) override {
-      for (SegmentData *it = iovec, *end = iovec + count; it != end; ++it) {
-        it->offset += data_offset_;
+      if (!count) return true;
+      if (!iovec) return false;
+      for (size_t i = 0; i < count; ++i) {
+        if (iovec[i].offset > region_size_ ||
+            iovec[i].length > region_size_ - iovec[i].offset)
+          return false;
       }
-      bool success = parent_->read(iovec, count);
-      for (SegmentData *it = iovec, *end = iovec + count; it != end; ++it) {
-        it->offset -= data_offset_;
-      }
-      return success;
+      // Parent readers use these same descriptors for the result pointers.
+      // Restore caller-relative offsets even if a backend throws.
+      struct RestoreOffsets {
+        SegmentData *items;
+        size_t count, base;
+        ~RestoreOffsets() {
+          for (size_t i = 0; i < count; ++i) items[i].offset -= base;
+        }
+      };
+      for (size_t i = 0; i < count; ++i) iovec[i].offset += data_offset_;
+      RestoreOffsets restore{iovec, count, data_offset_};
+      return parent_->read(iovec, count);
     }
 
     size_t write(size_t, const void *, size_t) override {
@@ -124,8 +218,10 @@ class IndexSegmentStorage : public IndexStorage {
     //! Clone the segment (each clone gets an independent parent buffer
     //! for thread safety — concurrent reads require separate buffers).
     IndexStorage::Segment::Pointer clone() override {
-      return std::make_shared<Segment>(parent_->clone(), data_offset_,
-                                       data_size_, padding_size_, data_crc_);
+      auto parent = parent_->clone();
+      if (!parent) return nullptr;
+      return std::make_shared<Segment>(parent, data_offset_, data_size_,
+                                       padding_size_, data_crc_);
     }
 
    private:
@@ -159,28 +255,105 @@ class IndexSegmentStorage : public IndexStorage {
   }
 
   //! Load the current segment, ignore path
-  int open(const std::string &, bool) override {
+  int open(const std::string &, bool) override try {
     if (!parent_) {
       LOG_ERROR("Failed to load an empty segment");
       return IndexError_NoReady;
     }
 
-    MemoryBlock block;
-    auto read_data = [this, &block](size_t offset, const void **data,
-                                    size_t len) {
-      size_t size = this->parent_->read(offset, block, len);
-      *data = block.data();
-      return size;
-    };
-
+    using Strategy = IndexStorage::Segment::ParsingReadStrategy;
+    struct ParsingScope {
+      explicit ParsingScope(IndexStorage::Segment &source_arg)
+          : source(source_arg) {
+        source.begin_parsing();
+      }
+      ~ParsingScope() {
+        source.end_parsing();
+      }
+      IndexStorage::Segment &source;
+    } parsing_scope(*parent_);
+    constexpr Strategy strategies[] = {Strategy::kReuse, Strategy::kBorrow,
+                                       Strategy::kGrow, Strategy::kOwned};
+    unsigned excluded = 0;
+    // Each callback owns its retry state. A refused directory entry retries
+    // only its input, preserving the required private prefix and leaving later
+    // directories free to borrow. Three exclusions and one owned-kind switch
+    // bound each input to five successful representations, without replaying
+    // preceding headers/directories or allocating a retry history.
+    IndexStorage::MemoryBlock metadata;
+    IndexParsingInput fallback;
     IndexUnpacker unpacker;
-    if (!unpacker.unpack(read_data, parent_->data_size(), false)) {
+    const size_t total = parent_->data_size();
+    int read_error = 0;
+    Strategy active = Strategy::kOwned;
+    auto read_owned = [&](size_t offset, const void **data, size_t len,
+                          bool retry) {
+      if (!fallback.prepare(len, retry)) {
+        read_error = IndexError_NoMemory;
+        return size_t{0};
+      }
+      active = Strategy::kOwned;
+      const size_t got =
+          parent_->fetch_for_parsing(offset, fallback.data(), len);
+      read_error = got == len ? 0 : parent_->read_error();
+      *data = fallback.data();
+      return got;
+    };
+    auto read_data = [&, this](size_t offset, const void **data, size_t len,
+                               bool retry = false) {
+      if (!retry) {
+        read_error = 0;
+        excluded = 0;
+      } else if (active == Strategy::kOwned) {
+        return read_owned(offset, data, len, true);
+      } else {
+        if (!metadata.release_for_parsing_retry()) {
+          read_error = IndexError_NoMemory;
+          return size_t{0};
+        }
+        excluded |= 1u << static_cast<unsigned>(active);
+      }
+      metadata.reset();
+      fallback.clear();
+      if (offset > total || len > total - offset) return size_t{0};
+      for (const auto strategy : strategies) {
+        if (excluded & (1u << static_cast<unsigned>(strategy))) continue;
+        if (strategy != Strategy::kOwned) {
+          size_t got = 0;
+          try {
+            got = parent_->read_for_parsing_with_strategy(offset, metadata, len,
+                                                          strategy, read_error);
+          } catch (const std::bad_alloc &) {
+            read_error = IndexError_NoMemory;
+          }
+          if (got == len) {
+            read_error = 0;
+            active = strategy;
+            *data = metadata.data();
+            return got;
+          }
+          metadata.reset();
+          if (read_error != IndexError_Unsupported &&
+              read_error != IndexError_NoMemory)
+            return size_t{0};
+          continue;
+        }
+        return read_owned(offset, data, len, false);
+      }
+      read_error = IndexError_NoMemory;
+      return size_t{0};
+    };
+    if (!unpacker.unpack(read_data, total, false,
+                         /*report_errors=*/false, /*retry_private=*/true)) {
+      if (read_error != 0) return read_error;
       LOG_ERROR("Failed to unpack segment data");
       return IndexError_UnpackIndex;
     }
     segments_ = std::move(*unpacker.mutable_segments());
     magic_ = unpacker.magic();
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
   }
 
   //! Retrieve a segment by id
@@ -192,7 +365,7 @@ class IndexSegmentStorage : public IndexStorage {
     if (it == segments_.end()) {
       return IndexStorage::Segment::Pointer();
     }
-    return std::make_shared<IndexSegmentStorage::Segment>(parent_, it->second);
+    return make_segment(it->second);
   }
 
   //! Test if it a segment exists
@@ -206,8 +379,9 @@ class IndexSegmentStorage : public IndexStorage {
     std::map<std::string, IndexStorage::Segment::Pointer> result;
     if (parent_) {
       for (const auto &it : segments_) {
-        result.emplace(it.first, std::make_shared<IndexSegmentStorage::Segment>(
-                                     parent_, it.second));
+        auto segment = make_segment(it.second);
+        if (!segment) return {};
+        result.emplace(it.first, std::move(segment));
       }
     }
     return result;
@@ -242,8 +416,17 @@ class IndexSegmentStorage : public IndexStorage {
   }
 
  private:
+  IndexStorage::Segment::Pointer make_segment(
+      const IndexUnpacker::SegmentMeta &meta) const {
+    auto parent = parent_->clone();
+    if (!parent) return nullptr;
+    return std::make_shared<Segment>(parent, meta.data_offset(),
+                                     meta.data_size(), meta.padding_size(),
+                                     meta.data_crc());
+  }
+
   uint32_t magic_{0};
-  std::map<std::string, IndexUnpacker::SegmentMeta> segments_{};
+  IndexUnpacker::SegmentMap segments_{};
   IndexStorage::Segment::Pointer parent_{};
 };
 

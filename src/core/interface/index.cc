@@ -213,12 +213,14 @@ thread_local static std::array<core::IndexContext::Pointer,
     context_list;
 
 
-bool Index::init_context() {
+bool Index::init_context(int *status) {
   context_index_ = (magic_enum::enum_integer(param_.index_type) - 1) * 2 +
                    static_cast<size_t>(is_sparse_);
   if (context_list[context_index_] == nullptr) {
-    if ((context_list[context_index_] = streamer_->create_context()) ==
-        nullptr) {
+    const int ret =
+        streamer_->create_context_with_status(context_list[context_index_]);
+    if (status) *status = ret;
+    if (ret != 0) {
       LOG_ERROR("Failed to create context");
       return false;
     }
@@ -227,8 +229,20 @@ bool Index::init_context() {
 }
 
 core::IndexContext::Pointer &Index::acquire_context() {
-  init_context();
-  return context_list[context_index_];
+  return acquire_query_context().first;
+}
+
+std::pair<core::IndexContext::Pointer &, int> Index::acquire_query_context() {
+  int status = 0;
+  init_context(&status);
+  return {context_list[context_index_], status};
+}
+
+int Index::ensure_trained_for_query() {
+  if (is_trained_) return 0;
+  const int status = train();
+  if (status != 0) LOG_ERROR("Failed to train index before querying");
+  return status;
 }
 
 int Index::train() {
@@ -539,8 +553,6 @@ int Index::open(const std::string &file_path, StorageOptions storage_options) {
   }
   ailego::Params storage_params;
   // storage_params.set("proxima.mmap_file.storage.memory_warmup", true);
-  // storage_params.set("proxima.mmap_file.storage.segment_meta_capacity",
-  // 1024);
 
   storage_params.set(core::MMAPFILE_STORAGE_COPY_ON_WRITE,
                      storage_options.copy_on_write);
@@ -553,6 +565,10 @@ int Index::open(const std::string &file_path, StorageOptions storage_options) {
 
   switch (storage_options.type) {
     case StorageOptions::StorageType::kMMAP: {
+      // Each vector index has a small set of named segments. Grow its directory
+      // on demand so opening many collection blocks fits the shared budget.
+      storage_params.set(core::MMAPFILE_STORAGE_SEGMENT_META_CAPACITY,
+                         uint32_t{4096});
       const char *storage_name =
           storage_options.read_only ? "MMapFileReadStorage" : "MMapFileStorage";
       storage_ = core::IndexFactory::CreateStorage(storage_name);
@@ -601,11 +617,13 @@ int Index::open(const std::string &file_path, StorageOptions storage_options) {
   if (ret != 0) {
     return ret;
   }
-  if (!pending_quantizer_training_ &&
-      (streamer_ == nullptr ||
-       streamer_->open(storage_, storage_options.read_only) != 0)) {
-    LOG_ERROR("Failed to open streamer, path: %s", file_path.c_str());
-    return core::IndexError_Runtime;
+  if (!pending_quantizer_training_) {
+    ret = streamer_ ? streamer_->open(storage_, storage_options.read_only)
+                    : core::IndexError_NoReady;
+    if (ret != 0) {
+      LOG_ERROR("Failed to open streamer, path: %s", file_path.c_str());
+      return ret;
+    }
   }
 
   // If a converter exists but reformer was not created during init() because
@@ -656,9 +674,9 @@ int Index::open(const std::string &file_path, StorageOptions storage_options) {
   }
 
   // TODO: context pool
-  if (!pending_quantizer_training_ && !init_context()) {
+  if (!pending_quantizer_training_ && !init_context(&ret)) {
     LOG_ERROR("Failed to init context");
-    return core::IndexError_Runtime;
+    return ret;
   }
 
   is_open_ = true;
@@ -800,16 +818,11 @@ int Index::search(const VectorData &vector_data,
     return core::IndexError_Unsupported;
   }
 
-  if (!is_trained_ && this->train() != 0) {
-    LOG_ERROR("Failed to train index");
-    return core::IndexError_Runtime;
-  }
+  const int train_status = ensure_trained_for_query();
+  if (train_status != 0) return train_status;
 
-  auto &context = acquire_context();
-  if (!context) {
-    LOG_ERROR("Failed to acquire context");
-    return core::IndexError_Runtime;
-  }
+  auto [context, context_status] = acquire_query_context();
+  if (context_status != 0) return context_status;
 
   int prepare_ret = _prepare_for_search(vector_data, search_param, context);
   if (prepare_ret != 0) {
@@ -865,13 +878,14 @@ int Index::search(const VectorData &vector_data,
       // cross this boundary, not document/vector materialization or
       // normalization.
       std::vector<std::vector<uint64_t>> keys(1);
-      if (_execute_dense_search(query, query_meta, search_param, context,
-                                &keys[0]) != 0) {
+      ret = _execute_dense_search(query, query_meta, search_param, context,
+                                  &keys[0]);
+      if (ret != 0) {
         LOG_ERROR("Failed to search");
         if (context) {
           context->reset();
         }
-        return core::IndexError_Runtime;
+        return ret;
       }
       result->reverted_vector_list_.clear();
       ret = reference_index->_refine_dense_candidates(vector_data, search_param,
@@ -901,7 +915,7 @@ int Index::_dense_fetch(const uint32_t doc_id,
   int ret = streamer_->get_vector_by_id(doc_id, vector_block);
   if (ret != 0) {
     LOG_ERROR("Failed to fetch vector, doc_id: %u", doc_id);
-    return core::IndexError_Runtime;
+    return ret;
   }
   const void *vector = vector_block.data();
 
@@ -937,11 +951,12 @@ int Index::_sparse_fetch(const uint32_t doc_id,
                          VectorDataBuffer *vector_data_buffer) {
   SparseVectorBuffer sparse_vector_buffer;
 
-  if (0 != streamer_->get_sparse_vector_by_id(
-               doc_id, &sparse_vector_buffer.count,
-               &sparse_vector_buffer.indices, &sparse_vector_buffer.values)) {
+  const int ret = streamer_->get_sparse_vector_by_id(
+      doc_id, &sparse_vector_buffer.count, &sparse_vector_buffer.indices,
+      &sparse_vector_buffer.values);
+  if (ret != 0) {
     LOG_ERROR("Failed to fetch vector");
-    return core::IndexError_Runtime;
+    return ret;
   }
 
   if (reformer_ != nullptr) {
@@ -966,21 +981,16 @@ int Index::_dense_add(const VectorData &vector_data, const uint32_t doc_id,
     return core::IndexError_Runtime;
   }
   const DenseVector &dense_vector = std::get<DenseVector>(vector_data.vector);
+  int ret;
   if (turbo_quantizer_ != nullptr) {
     auto *new_vector = context->mutable_features();
     new_vector->resize(turbo_quantizer_->quantized_datapoint_vector_length());
     turbo_quantizer_->quantize_data(dense_vector.data, new_vector->data());
-    if (streamer_->add_with_id_impl(doc_id, new_vector->data(),
-                                    streamer_vector_meta_, context) != 0) {
-      LOG_ERROR("Failed to add vector");
-      return core::IndexError_Runtime;
-    }
-    return 0;
-  }
-  if (reformer_ != nullptr) {
+    ret = streamer_->add_with_id_impl(doc_id, new_vector->data(),
+                                      streamer_vector_meta_, context);
+  } else if (reformer_ != nullptr) {
     core::IndexQueryMeta new_meta;
     auto *new_vector = context->mutable_features();
-    int ret;
     ret = reformer_->convert(dense_vector.data, input_vector_meta_, new_vector,
                              &new_meta);
     if (ret != 0) {
@@ -989,19 +999,13 @@ int Index::_dense_add(const VectorData &vector_data, const uint32_t doc_id,
     }
     ret = streamer_->add_with_id_impl(doc_id, new_vector->data(), new_meta,
                                       context);
-    if (ret != 0) {
-      LOG_ERROR("Failed to add vector");
-      return core::IndexError_Runtime;
-    }
   } else {
-    int ret = streamer_->add_with_id_impl(doc_id, dense_vector.data,
-                                          input_vector_meta_, context);
-    if (ret != 0) {
-      LOG_ERROR("Failed to add vector");
-      return core::IndexError_Runtime;
-    }
+    ret = streamer_->add_with_id_impl(doc_id, dense_vector.data,
+                                      input_vector_meta_, context);
   }
-  return 0;
+  if (ret == 0) return 0;
+  LOG_ERROR("Failed to add vector");
+  return ret;
 }
 
 
@@ -1101,24 +1105,27 @@ int Index::_execute_dense_search(
     std::vector<uint64_t> *candidate_keys) {
   if (candidate_keys) candidate_keys->clear();
   if (search_param->bf_pks != nullptr) {
-    if (streamer_->search_bf_by_p_keys_impl(
-            vector, std::vector<std::vector<uint64_t>>{*search_param->bf_pks},
-            new_meta, 1, context) != 0) {
+    const int ret = streamer_->search_bf_by_p_keys_impl(
+        vector, std::vector<std::vector<uint64_t>>{*search_param->bf_pks},
+        new_meta, 1, context);
+    if (ret != 0) {
       LOG_ERROR("Failed to search_bf_by_p_keys_impl vector");
-      return core::IndexError_Runtime;
+      return ret;
     }
   } else if (search_param->is_linear) {
-    if (streamer_->search_bf_impl(vector, new_meta, 1, context) != 0) {
+    const int ret = streamer_->search_bf_impl(vector, new_meta, 1, context);
+    if (ret != 0) {
       LOG_ERROR("Failed to search vector");
-      return core::IndexError_Runtime;
+      return ret;
     }
   } else if (candidate_keys) {
     return streamer_->search_candidates_impl(vector, new_meta, *candidate_keys,
                                              context);
   } else {
-    if (streamer_->search_impl(vector, new_meta, 1, context) != 0) {
+    const int ret = streamer_->search_impl(vector, new_meta, 1, context);
+    if (ret != 0) {
       LOG_ERROR("Failed to search vector");
-      return core::IndexError_Runtime;
+      return ret;
     }
   }
 
@@ -1141,13 +1148,11 @@ int Index::_refine_dense_candidates(
     LOG_ERROR("Reference index must be open and dense");
     return core::IndexError_Runtime;
   }
-  if (!is_trained_ && this->train() != 0) {
-    LOG_ERROR("Failed to train reference index");
-    return core::IndexError_Runtime;
-  }
+  const int train_status = ensure_trained_for_query();
+  if (train_status != 0) return train_status;
 
-  auto &context = acquire_context();
-  if (!context) return core::IndexError_Runtime;
+  auto [context, context_status] = acquire_query_context();
+  if (context_status != 0) return context_status;
   context->set_topk(search_param->topk);
   context->set_fetch_vector(search_param->fetch_vector);
   if (search_param->filter && search_param->filter->is_valid()) {
@@ -1358,26 +1363,22 @@ int Index::_sparse_search(const VectorData &vector_data,
     values = converted_sparse_values_buffer.data();
   }
 
+  int ret;
   if (search_param->bf_pks != nullptr) {
-    if (streamer_->search_bf_by_p_keys_impl(
-            sparse_vector.count, indices, values,
-            std::vector<std::vector<uint64_t>>{*search_param->bf_pks}, new_meta,
-            context) != 0) {
-      LOG_ERROR("Failed to search_bf_by_p_keys_impl vector");
-      return core::IndexError_Runtime;
-    }
+    ret = streamer_->search_bf_by_p_keys_impl(
+        sparse_vector.count, indices, values,
+        std::vector<std::vector<uint64_t>>{*search_param->bf_pks}, new_meta,
+        context);
   } else if (search_param->is_linear) {
-    if (streamer_->search_bf_impl(sparse_vector.count, indices, values,
-                                  new_meta, context) != 0) {
-      LOG_ERROR("Failed to search vector");
-      return core::IndexError_Runtime;
-    }
+    ret = streamer_->search_bf_impl(sparse_vector.count, indices, values,
+                                    new_meta, context);
   } else {
-    if (streamer_->search_impl(sparse_vector.count, indices, values, new_meta,
-                               context) != 0) {
-      LOG_ERROR("Failed to search vector");
-      return core::IndexError_Runtime;
-    }
+    ret = streamer_->search_impl(sparse_vector.count, indices, values, new_meta,
+                                 context);
+  }
+  if (ret != 0) {
+    LOG_ERROR("Failed to search sparse index");
+    return ret;
   }
   // Retrieve group_by results if applicable
   const bool has_group_by = has_group_by_search(search_param);
