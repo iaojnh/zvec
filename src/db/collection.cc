@@ -294,6 +294,8 @@ class CollectionImpl : public Collection {
       const IndexFilter::Ptr filter);
 
   Status execute_compact_task(std::vector<SegmentTask::Ptr> &tasks) const;
+  void discard_index_outputs(
+      std::vector<SegmentTask::Ptr> &tasks) const noexcept;
 
   std::vector<SegmentTask::Ptr> build_create_vector_index_task(
       const std::vector<Segment::Ptr> &segments, const std::string &column,
@@ -516,10 +518,6 @@ Result<Collection::Ptr> Collection::CreateAndOpen(
       if (!ailego::File::IsExist(marker)) {
         return tl::make_unexpected(
             Status::InvalidArgument("Collection already exists: ", path));
-      }
-      if (GlobalResource::Instance().initialize() != 0) {
-        return tl::make_unexpected(
-            Status::InternalError("Failed to initialize shared memory budget"));
       }
       auto version = VersionManager::Recovery(path);
       if (!version) return tl::make_unexpected(version.error());
@@ -979,6 +977,10 @@ Status CollectionImpl::create_index(const std::string &column_name,
         "] is not supported");
   }
 
+  bool published = false;
+  AILEGO_DEFER([&] {
+    if (!published) discard_index_outputs(tasks);
+  });
   if (!tasks.empty()) {
     s = execute_tasks(tasks);
     CHECK_RETURN_STATUS(s);
@@ -1009,6 +1011,7 @@ Status CollectionImpl::create_index(const std::string &column_name,
       new_schema, old_writing_segment, std::move(new_version),
       writing_min_doc_id);
   CHECK_RETURN_STATUS(s);
+  published = true;
 
   // 4. remove old segments or block
   for (auto &task : tasks) {
@@ -1095,6 +1098,72 @@ Status CollectionImpl::execute_tasks(
   return Status::OK();
 }
 
+void CollectionImpl::discard_index_outputs(
+    std::vector<SegmentTask::Ptr> &tasks) const noexcept {
+  for (auto &task : tasks) {
+    try {
+      std::visit(
+          [&](auto &index) {
+            using Task = std::decay_t<decltype(index)>;
+            if constexpr (!std::is_same_v<Task, CompactTask>) {
+              if (!index.output_segment_meta_) return;
+              if constexpr (std::is_same_v<Task, CreateVectorIndexTask>) {
+                index.output_vector_indexers_.clear();
+                index.output_quant_vector_indexers_.clear();
+              } else if constexpr (std::is_same_v<Task, DropVectorIndexTask>) {
+                index.output_vector_indexers_.clear();
+              } else if constexpr (std::is_same_v<Task,
+                                                  CreateScalarIndexTask> ||
+                                   std::is_same_v<Task, DropScalarIndexTask>) {
+                index.output_scalar_indexer_.reset();
+              } else {
+                index.output_fts_indexer_.reset();
+              }
+
+              const auto id = index.input_segment_->id();
+              const auto original = index.input_segment_->meta();
+              const auto &old_blocks = original->persisted_blocks();
+              for (const auto &block :
+                   index.output_segment_meta_->persisted_blocks()) {
+                if (std::any_of(old_blocks.begin(), old_blocks.end(),
+                                [&](const auto &old) {
+                                  return old.id() == block.id() &&
+                                         old.type() == block.type();
+                                }))
+                  continue;
+                switch (block.type()) {
+                  case BlockType::SCALAR_INDEX:
+                    FileHelper::RemoveDirectory(
+                        FileHelper::MakeInvertIndexPath(path_, id, block.id()));
+                    break;
+                  case BlockType::FTS_INDEX:
+                    FileHelper::RemoveDirectory(
+                        FileHelper::MakeFtsIndexPath(path_, id, block.id()));
+                    break;
+                  case BlockType::VECTOR_INDEX:
+                    for (const auto &column : block.columns())
+                      FileHelper::RemoveFile(FileHelper::MakeVectorIndexPath(
+                          path_, column, id, block.id()));
+                    break;
+                  case BlockType::VECTOR_INDEX_QUANTIZE:
+                    for (const auto &column : block.columns())
+                      FileHelper::RemoveFile(
+                          FileHelper::MakeQuantizeVectorIndexPath(
+                              path_, column, id, block.id()));
+                    break;
+                  default:
+                    break;
+                }
+              }
+            }
+          },
+          task->task_info());
+    } catch (...) {
+      LOG_WARN("Could not discard unpublished index files");
+    }
+  }
+}
+
 Status CollectionImpl::drop_index(const std::string &column_name) {
   CHECK_COLLECTION_READONLY_RETURN_STATUS;
 
@@ -1148,6 +1217,10 @@ Status CollectionImpl::drop_index(const std::string &column_name) {
         "] on column[", column_name, "] is not supported");
   }
 
+  bool published = false;
+  AILEGO_DEFER([&] {
+    if (!published) discard_index_outputs(tasks);
+  });
   if (!tasks.empty()) {
     s = execute_tasks(tasks);
     CHECK_RETURN_STATUS(s);
@@ -1178,6 +1251,7 @@ Status CollectionImpl::drop_index(const std::string &column_name) {
       new_schema, old_writing_segment, std::move(new_version),
       writing_min_doc_id);
   CHECK_RETURN_STATUS(s);
+  published = true;
 
   // 4. remove old segments or block
   for (auto &task : tasks) {
@@ -1259,7 +1333,9 @@ Status CollectionImpl::optimize(const OptimizeOptions &options) try {
   auto tasks =
       build_compact_task(schema_, persist_segments, options.concurrency_,
                          delete_store_clone->make_filter());
+  bool published = false;
   AILEGO_DEFER([&] {
+    if (!published) discard_index_outputs(tasks);
     // A later task can fail admission after an earlier one finished writing.
     // Discard all remaining temporary outputs from this optimize attempt.
     for (const auto &task : tasks) {
@@ -1278,11 +1354,14 @@ Status CollectionImpl::optimize(const OptimizeOptions &options) try {
   // failure aborts cleanly without a version/disk mismatch.
   std::vector<Segment::Ptr> opened_segments;
   std::vector<std::string> moved_dirs;
-  auto cleanup_moved_dirs = [&]() {
-    for (auto &dir : moved_dirs) {
-      FileHelper::RemoveDirectory(dir);
+  opened_segments.reserve(tasks.size());
+  moved_dirs.reserve(tasks.size());
+  AILEGO_DEFER([&] {
+    if (!published) {
+      opened_segments.clear();
+      for (const auto &dir : moved_dirs) FileHelper::RemoveDirectory(dir);
     }
-  };
+  });
   for (auto &task : tasks) {
     auto task_info = task->task_info();
     if (!std::holds_alternative<CompactTask>(task_info)) {
@@ -1299,10 +1378,9 @@ Status CollectionImpl::optimize(const OptimizeOptions &options) try {
     auto new_segment_path = FileHelper::MakeSegmentPath(path_, new_segment_id);
 
     if (!FileHelper::MoveDirectory(tmp_segment_path, new_segment_path)) {
-      cleanup_moved_dirs();
       return Status::InternalError("move segment directory failed");
     }
-    moved_dirs.push_back(new_segment_path);
+    moved_dirs.push_back(std::move(new_segment_path));
     compact_task.output_segment_meta_->set_id(new_segment_id);
 
     auto new_segment =
@@ -1310,9 +1388,6 @@ Status CollectionImpl::optimize(const OptimizeOptions &options) try {
                       id_map_, delete_store_, version_manager_,
                       SegmentOptions{true, options_.enable_mmap_});
     if (!new_segment.has_value()) {
-      // best-effort cleanup: these directories are not referenced by any
-      // manifest yet, so remove them rather than leaking them on disk
-      cleanup_moved_dirs();
       return new_segment.error();
     }
     opened_segments.push_back(new_segment.value());
@@ -1328,7 +1403,9 @@ Status CollectionImpl::optimize(const OptimizeOptions &options) try {
     std::unique_lock schema_lock(schema_handle_mtx_);
     std::lock_guard write_lock(write_mtx_);
 
+    CHECK_RETURN_STATUS(publish_pending_rotation());
     Version new_version = version_manager_->get_current_version();
+    std::unordered_set<SegmentID> retired;
 
     for (auto &task : tasks) {
       auto task_info = task->task_info();
@@ -1346,6 +1423,7 @@ Status CollectionImpl::optimize(const OptimizeOptions &options) try {
         for (auto input_segment : compact_task.input_segments_) {
           s = new_version.remove_persisted_segment_meta(input_segment->id());
           CHECK_RETURN_STATUS(s);
+          retired.insert(input_segment->id());
         }
       } else if (std::holds_alternative<CreateVectorIndexTask>(task_info)) {
         auto create_index_task = std::get<CreateVectorIndexTask>(task_info);
@@ -1355,32 +1433,32 @@ Status CollectionImpl::optimize(const OptimizeOptions &options) try {
       }
     }
 
-    s = version_manager_->apply(new_version);
-    CHECK_RETURN_STATUS(s);
+    auto replacement = std::make_shared<SegmentManager>();
+    for (const auto &segment : get_all_persist_segments()) {
+      if (retired.count(segment->id()) == 0)
+        CHECK_RETURN_STATUS(replacement->add_segment(segment));
+    }
+    for (const auto &segment : opened_segments)
+      CHECK_RETURN_STATUS(replacement->add_segment(segment));
 
-    s = version_manager_->flush();
-    CHECK_RETURN_STATUS(s);
+    CHECK_RETURN_STATUS(version_manager_->publish(std::move(new_version)));
+    published = true;
+    segment_manager_ = std::move(replacement);
 
     // publish new segments, retire compacted inputs and reload rebuilt
     // vector indexes
-    size_t opened_index = 0;
     for (auto &task : tasks) {
       auto task_info = task->task_info();
 
       if (std::holds_alternative<CompactTask>(task_info)) {
         auto compact_task = std::get<CompactTask>(task_info);
 
-        if (compact_task.output_segment_meta_) {
-          if (opened_index >= opened_segments.size()) {
-            return Status::InternalError("opened_segments index out of bounds");
-          }
-          s = segment_manager_->add_segment(opened_segments[opened_index++]);
-          CHECK_RETURN_STATUS(s);
-        }
-
         for (auto input_segment : compact_task.input_segments_) {
-          s = segment_manager_->destroy_segment(input_segment->id());
-          CHECK_RETURN_STATUS(s);
+          s = input_segment->destroy();
+          if (!s.ok()) {
+            LOG_WARN("Failed to retire compacted segment: %s",
+                     s.message().c_str());
+          }
         }
       } else if (std::holds_alternative<CreateVectorIndexTask>(task_info)) {
         auto create_index_task = std::get<CreateVectorIndexTask>(task_info);
@@ -2964,12 +3042,6 @@ Status CollectionImpl::recovery() {
     CHECK_RETURN_STATUS(s);
   }
 
-  // Initialize only after validating and locking the target, but before
-  // recovering metadata that can allocate against this budget.
-  if (GlobalResource::Instance().initialize() != 0) {
-    return Status::InternalError("Failed to initialize shared memory budget");
-  }
-
   // recovery version first
   auto version_manager = VersionManager::Recovery(path_);
   if (!version_manager.has_value()) {
@@ -2978,6 +3050,10 @@ Status CollectionImpl::recovery() {
 
   version_manager_ = version_manager.value();
   const auto v = version_manager_->get_current_version();
+  if (!v.writing_segment_meta() ||
+      !v.writing_segment_meta()->writing_forward_block().has_value()) {
+    return Status::InvalidArgument("Manifest has no writing segment: ", path_);
+  }
   schema_ = std::make_shared<CollectionSchema>(v.schema());
   options_.enable_mmap_ = v.enable_mmap();
 
@@ -3010,6 +3086,11 @@ Status CollectionImpl::recovery() {
     return Status::InvalidArgument(
         "Collection requires WAL recovery; open with read_only=false "
         "once before read-only access.");
+  }
+  // Manifest decoding only reconstructs metadata and tokenizer settings.
+  // Publish the shared budget before opening stores or building analyzers.
+  if (GlobalResource::Instance().initialize() != 0) {
+    return Status::InternalError("Failed to initialize shared memory budget");
   }
   if (!options_.enable_mmap_ && !options_.read_only_) {
     // Replay has separately charged record and decoded-Doc workspaces. Like

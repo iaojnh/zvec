@@ -233,6 +233,40 @@ TEST(IndexInterface, IndexTypeKeepsExistingValues) {
   EXPECT_EQ(7, static_cast<int>(IndexType::kIVFRabitq));
 }
 
+TEST(IndexInterface, InternalIdSearchPreservesBorrowedCandidateRestriction) {
+  const std::string path = "test_borrowed_internal_ids.index";
+  zvec::test_util::RemoveTestFiles(path);
+  auto param = FlatIndexParamBuilder()
+                   .with_dimension(32)
+                   .with_data_type(DataType::DT_FP32)
+                   .with_metric_type(MetricType::kL2sq)
+                   .build();
+  auto index = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_NE(nullptr, index);
+  ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kBufferPool, true}));
+
+  std::array<float, 32> values{};
+  const VectorData query{DenseVector{values.data()}};
+  ASSERT_EQ(0, index->add(query, 0));
+  values.front() = 7.0F;
+  ASSERT_EQ(0, index->add(query, 7));
+  values.front() = 0.0F;
+
+  const std::vector<uint64_t> keys{7};
+  auto query_param = FlatQueryParamBuilder().with_topk(1).build();
+  query_param->bf_pks = std::make_shared<std::vector<uint64_t>>(keys);
+  int64_t owning = -1;
+  ASSERT_EQ(0, index->search_internal_ids(query, query_param, &owning, nullptr));
+  EXPECT_EQ(7, owning);
+  query_param->bf_pks.reset();
+  query_param->borrowed_bf_pks = &keys;
+  int64_t borrowed = -1;
+  ASSERT_EQ(0, index->search_internal_ids(query, query_param, &borrowed, nullptr));
+  EXPECT_EQ(owning, borrowed);
+  ASSERT_EQ(0, index->close());
+  zvec::test_util::RemoveTestFiles(path);
+}
+
 TEST(IndexInterface, IvfCanCreateAfterAbandoningUntrainedIndex) {
   constexpr uint32_t kDimension = 16;
   const std::string abandoned = "ivf_abandoned_build.index";

@@ -1095,6 +1095,74 @@ TEST_F(CollectionWriteBudgetTest, IteratorRetriesDecoderAfterAcceptedRows) {
   EXPECT_EQ(nullptr, *end);
 }
 
+TEST_F(CollectionWriteBudgetTest, IndexPublicationFailureCanReopenAndRetry) {
+  const auto collection_path = path("index_publish_retry");
+  const CollectionOptions options{false, false, kMiB};
+  auto invert = std::make_shared<InvertIndexParams>();
+  CollectionSchema indexed("index_retry");
+  ASSERT_TRUE(indexed.add_field(std::make_shared<FieldSchema>(
+      "x", DataType::INT32, false, invert)).ok());
+  ASSERT_TRUE(indexed.add_field(std::make_shared<FieldSchema>(
+      "y", DataType::INT32, false)).ok());
+  auto writer = Collection::CreateAndOpen(collection_path, indexed, options);
+  ASSERT_TRUE(writer) << writer.error().message();
+  std::vector<Doc> rows(1);
+  rows.front().set_pk("row");
+  rows.front().set("x", int32_t{1});
+  rows.front().set("y", int32_t{2});
+  auto inserted = (*writer)->insert(rows);
+  ASSERT_TRUE(inserted && inserted->front().ok());
+  auto iterator = (*writer)->create_iterator();
+  ASSERT_TRUE(iterator) << iterator.error().message();
+  iterator.value()->close();
+  ASSERT_TRUE((*writer)->close().ok());
+  writer = Collection::Open(collection_path, options);
+  ASSERT_TRUE(writer) << writer.error().message();
+
+  const auto blocked =
+      FileHelper::MakeFilePath(collection_path, FileID::MANIFEST_FILE, 3);
+  ASSERT_TRUE(std::filesystem::create_directory(blocked));
+  const auto denied = (*writer)->create_index("y", invert);
+  ASSERT_TRUE(std::filesystem::remove(blocked));
+  ASSERT_FALSE(denied.ok());
+  ASSERT_TRUE((*writer)->close().ok());
+  writer = Collection::Open(collection_path, options);
+  ASSERT_TRUE(writer) << writer.error().message();
+  const auto retried = (*writer)->create_index("y", invert);
+  ASSERT_TRUE(retried.ok()) << retried.message();
+}
+
+TEST_F(CollectionWriteBudgetTest, OptimizePublicationFailureCanRetry) {
+  const auto collection_path = path("optimize_publish_retry");
+  auto writer = Collection::CreateAndOpen(collection_path, schema(),
+                                          {false, false, kMiB});
+  ASSERT_TRUE(writer) << writer.error().message();
+  for (const auto &key : {"first", "second"}) {
+    auto rows = docs(key);
+    auto inserted = (*writer)->insert(rows);
+    ASSERT_TRUE(inserted && inserted->front().ok());
+    auto iterator = (*writer)->create_iterator();
+    ASSERT_TRUE(iterator) << iterator.error().message();
+    iterator.value()->close();
+  }
+
+  const auto blocked =
+      FileHelper::MakeFilePath(collection_path, FileID::MANIFEST_FILE, 5);
+  ASSERT_TRUE(std::filesystem::create_directory(blocked));
+  const auto denied = (*writer)->optimize({1});
+  ASSERT_TRUE(std::filesystem::remove(blocked));
+  ASSERT_FALSE(denied.ok());
+  const auto retried = (*writer)->optimize({1});
+  ASSERT_TRUE(retried.ok()) << retried.message();
+  ASSERT_TRUE((*writer)->close().ok());
+  auto reader = Collection::Open(collection_path, {true, false, kMiB});
+  ASSERT_TRUE(reader) << reader.error().message();
+  auto result = (*reader)->fetch({"first", "second"});
+  ASSERT_TRUE(result) << result.error().message();
+  EXPECT_NE(nullptr, result->at("first"));
+  EXPECT_NE(nullptr, result->at("second"));
+}
+
 TEST_F(CollectionWriteBudgetTest, BufferedVectorRefusalPrecedesWalAndMutation) {
   const auto collection_path = path("vector_write_admission");
   auto schema_with_vectors = schema();

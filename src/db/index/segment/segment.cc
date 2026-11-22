@@ -15,8 +15,10 @@
 #include "segment.h"
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <memory>
@@ -420,6 +422,7 @@ class SegmentImpl : public Segment,
 
   BlockID allocate_block_id();
   BlockID allocate_column_block(BlockType type);
+  Status collect_stale_column_artifacts();
   std::string column_artifact_path(BlockType type, BlockID block) const;
   void remove_column_artifact(BlockType type, BlockID block) const noexcept;
 
@@ -2324,6 +2327,7 @@ Status SegmentImpl::create_all_vector_indexes(
 
   auto new_segment_meta = std::make_shared<SegmentMeta>(*segment_meta_);
   new_segment_meta->remove_writing_forward_block();
+  *segment_meta = new_segment_meta;
 
   std::set<std::string> vector_field_names;
   for (const auto &field : vector_fields) {
@@ -2344,6 +2348,10 @@ Result<VectorColumnIndexer::Ptr> SegmentImpl::merge_vector_indexer(
     const std::string &index_file_path, const FieldSchema &field,
     const std::vector<VectorColumnIndexer::Ptr> &source_indexers,
     int concurrency) {
+  bool retained = false;
+  AILEGO_DEFER([&] {
+    if (!retained) FileHelper::RemoveFile(index_file_path);
+  });
   VectorColumnIndexer::Ptr vector_indexer =
       std::make_shared<VectorColumnIndexer>(index_file_path, field);
 
@@ -2372,6 +2380,7 @@ Result<VectorColumnIndexer::Ptr> SegmentImpl::merge_vector_indexer(
   s = reopen_vector_indexer_for_serving(vector_indexer);
   CHECK_RETURN_STATUS_EXPECTED(s);
 
+  retained = true;
   return vector_indexer;
 }
 
@@ -2404,6 +2413,7 @@ Status SegmentImpl::create_vector_index(
   } else {
     new_segment_meta = *segment_meta;
   }
+  *segment_meta = new_segment_meta;
 
   if (segment_meta_->vector_indexed(column) &&
       *field->index_params() == *index_params) {
@@ -2777,7 +2787,7 @@ Status SegmentImpl::create_scalar_index(const std::vector<std::string> &columns,
 
   // create scalar indexer
   // clone original indexer
-  auto block_id = allocate_block_id();
+  auto block_id = allocate_column_block(BlockType::SCALAR_INDEX);
   std::string new_invert_index_path =
       FileHelper::MakeInvertIndexPath(path_, id(), block_id);
 
@@ -2911,9 +2921,13 @@ Status SegmentImpl::drop_scalar_index(const std::vector<std::string> &columns,
   }
 
   // clone original indexer
-  auto block_id = allocate_block_id();
+  auto block_id = allocate_column_block(BlockType::SCALAR_INDEX);
   std::string new_invert_index_path =
       FileHelper::MakeInvertIndexPath(path_, id(), block_id);
+  bool retained = false;
+  AILEGO_DEFER([&] {
+    if (!retained) FileHelper::RemoveDirectory(new_invert_index_path);
+  });
   auto s = invert_indexers_->create_snapshot(new_invert_index_path);
   CHECK_RETURN_STATUS(s);
 
@@ -2942,6 +2956,7 @@ Status SegmentImpl::drop_scalar_index(const std::vector<std::string> &columns,
 
   *segment_meta = new_segment_meta;
   *scalar_indexer = new_scalar_indexer;
+  retained = true;
 
   return Status::OK();
 }
@@ -4414,6 +4429,7 @@ Result<Segment::Ptr> SegmentImpl::stage_column_change() const try {
       std::max(staged->block_id_allocator_.load(), block_id_allocator_.load()));
   staged->column_change_ = std::make_unique<ColumnChange>();
   staged->column_change_->original = segment_meta_;
+  CHECK_RETURN_STATUS_EXPECTED(staged->collect_stale_column_artifacts());
   return staged;
 } catch (const std::bad_alloc &) {
   return tl::make_unexpected(
@@ -4421,17 +4437,55 @@ Result<Segment::Ptr> SegmentImpl::stage_column_change() const try {
              "Insufficient budget to stage a segment column change"));
 }
 
+Status SegmentImpl::collect_stale_column_artifacts() {
+  namespace fs = std::filesystem;
+  std::error_code error;
+  auto entry = fs::directory_iterator(
+      ailego::FileHelper::PathFromUtf8(seg_path_), error);
+  for (; !error && entry != fs::directory_iterator(); entry.increment(error)) {
+    const auto basename =
+        ailego::FileHelper::PathToUtf8(entry->path().filename());
+    const std::string_view name(basename);
+    constexpr std::string_view prefix = "scalar.";
+    if (name.substr(0, prefix.size()) != prefix) continue;
+    auto suffix = name.substr(prefix.size());
+    BlockType type = BlockType::SCALAR;
+    if (suffix.substr(0, 6) == "index.") {
+      type = BlockType::SCALAR_INDEX;
+      suffix.remove_prefix(6);
+    }
+    BlockID block = 0;
+    const auto parsed =
+        std::from_chars(suffix.data(), suffix.data() + suffix.size(), block);
+    if (parsed.ec != std::errc{}) continue;
+    const auto canonical =
+        ailego::FileHelper::PathFromUtf8(column_artifact_path(type, block));
+    if (canonical.filename() != entry->path().filename()) continue;
+    const auto &original = column_change_->original->persisted_blocks();
+    if (std::any_of(original.begin(), original.end(), [&](const auto &item) {
+          return item.id() == block && item.type() == type;
+        }))
+      continue;
+    if (block == std::numeric_limits<BlockID>::max())
+      return Status::FailedPrecondition("Column block IDs are exhausted");
+    column_change_->stale.emplace_back(type, block);
+    block_id_allocator_.store(std::max(block_id_allocator_.load(), block + 1));
+  }
+  return error ? Status::InternalError("Failed to inspect column artifacts: ",
+                                       error.message())
+               : Status::OK();
+}
+
 BlockID SegmentImpl::allocate_column_block(BlockType type) {
   auto block = allocate_block_id();
-  if (!column_change_) return block;
   // Recovery resumes its allocator from the last manifest. A previous
   // unpublished attempt can still own files at the next block IDs.
   while (
       ailego::FileHelper::IsExist(column_artifact_path(type, block).c_str())) {
-    column_change_->stale.emplace_back(type, block);
+    if (column_change_) column_change_->stale.emplace_back(type, block);
     block = allocate_block_id();
   }
-  column_change_->created.emplace_back(type, block);
+  if (column_change_) column_change_->created.emplace_back(type, block);
   return block;
 }
 
@@ -4440,6 +4494,8 @@ std::string SegmentImpl::column_artifact_path(BlockType type,
   if (type == BlockType::SCALAR)
     return FileHelper::MakeForwardBlockPath(path_, id(), block,
                                             !options_.enable_mmap_);
+  if (type == BlockType::FTS_INDEX)
+    return FileHelper::MakeFtsIndexPath(path_, id(), block);
   return FileHelper::MakeInvertIndexPath(path_, id(), block);
 }
 
@@ -6287,8 +6343,12 @@ Status SegmentImpl::create_fts_index(const std::string &column,
   auto new_segment_meta = std::make_shared<SegmentMeta>(*segment_meta_);
   new_segment_meta->remove_fts_index_block();
 
-  auto block_id = allocate_block_id();
+  auto block_id = allocate_column_block(BlockType::FTS_INDEX);
   auto new_fts_path = FileHelper::MakeFtsIndexPath(seg_path_, block_id);
+  bool retained = false;
+  AILEGO_DEFER([&] {
+    if (!retained) FileHelper::RemoveDirectory(new_fts_path);
+  });
 
   // Build a new schema that includes the new FTS field for the snapshot open.
   auto new_schema = std::make_shared<CollectionSchema>(*collection_schema_);
@@ -6310,7 +6370,6 @@ Status SegmentImpl::create_fts_index(const std::string &column,
         new_fts_path, new_schema->fts_fields(), true, false, &open_status);
   }
   if (!new_fts_indexer) {
-    FileHelper::RemoveDirectory(new_fts_path);
     return open_status;
   }
 
@@ -6319,7 +6378,6 @@ Status SegmentImpl::create_fts_index(const std::string &column,
   if (new_fts_indexer->has_field(column)) {
     auto s = new_fts_indexer->remove_field_indexer(column);
     if (!s.ok()) {
-      FileHelper::RemoveDirectory(new_fts_path);
       return s;
     }
   }
@@ -6329,7 +6387,6 @@ Status SegmentImpl::create_fts_index(const std::string &column,
         column, field->data_type(), field->nullable(), index_params);
     auto s = new_fts_indexer->create_field_indexer(*new_field_schema);
     if (!s.ok()) {
-      FileHelper::RemoveDirectory(new_fts_path);
       return s;
     }
   }
@@ -6341,7 +6398,6 @@ Status SegmentImpl::create_fts_index(const std::string &column,
     while (true) {
       auto batch = reader->Next();
       if (!batch.ok()) {
-        FileHelper::RemoveDirectory(new_fts_path);
         return Status::InternalError("create_fts_index: scan failed: ",
                                      batch.status().message());
       }
@@ -6361,7 +6417,6 @@ Status SegmentImpl::create_fts_index(const std::string &column,
           auto s = new_fts_indexer->insert(column, seg_doc_id,
                                            string_array->GetString(i));
           if (!s.ok()) {
-            FileHelper::RemoveDirectory(new_fts_path);
             return s;
           }
         }
@@ -6373,13 +6428,11 @@ Status SegmentImpl::create_fts_index(const std::string &column,
   // Seal the new field (flush + convert to BitPacked + drop side CFs).
   auto s = new_fts_indexer->seal(column);
   if (!s.ok()) {
-    FileHelper::RemoveDirectory(new_fts_path);
     return s;
   }
 
   s = new_fts_indexer->flush();
   if (!s.ok()) {
-    FileHelper::RemoveDirectory(new_fts_path);
     return s;
   }
 
@@ -6391,6 +6444,7 @@ Status SegmentImpl::create_fts_index(const std::string &column,
 
   *out_segment_meta = new_segment_meta;
   *out_fts_indexer = new_fts_indexer;
+  retained = true;
 
   return Status::OK();
 }
@@ -6420,7 +6474,7 @@ Status SegmentImpl::drop_fts_index(const std::string &column,
   bool has_other_fts = new_schema->has_fts_field();
 
   if (has_other_fts) {
-    auto block_id = allocate_block_id();
+    auto block_id = allocate_column_block(BlockType::FTS_INDEX);
     auto new_fts_path = FileHelper::MakeFtsIndexPath(seg_path_, block_id);
 
     // Snapshot and reopen without this field.

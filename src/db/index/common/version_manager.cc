@@ -14,13 +14,13 @@
 
 #include "version_manager.h"
 #include <cerrno>
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
-#include <regex>
 #include <sstream>
 #include <string>
 #include <ailego/pattern/scope_guard.h>
@@ -199,28 +199,28 @@ Result<VersionManager::Ptr> VersionManager::Recovery(const std::string &path) {
         Status::InvalidArgument("path", path, " is not a directory"));
   }
 
-  std::string prefix = GetFileName(FileID::MANIFEST_FILE);
-  std::string manifest_pattern = "^" + prefix + R"(\.(\d+)$)";
-  std::regex regex(manifest_pattern);
-  std::smatch match;
-
-  uint64_t max_id = UINT64_MAX;
+  const auto prefix = std::string(GetFileName(FileID::MANIFEST_FILE)) + ".";
+  uint64_t max_id = 0;
   std::string version_path;
 
   for (const auto &entry : fs::directory_iterator(u8path)) {
     if (entry.is_regular_file()) {
-      std::string filename = entry.path().filename().u8string();
-      if (std::regex_match(filename, match, regex)) {
-        uint64_t id = std::stoull(match[1].str());
-        if (id > max_id || max_id == UINT64_MAX) {
-          max_id = id;
-          version_path = entry.path().u8string();
-        }
+      const auto filename = entry.path().filename().u8string();
+      if (filename.compare(0, prefix.size(), prefix) != 0) continue;
+      uint64_t id = 0;
+      const auto end = filename.data() + filename.size();
+      const auto parsed =
+          std::from_chars(filename.data() + prefix.size(), end, id);
+      if (parsed.ec != std::errc{} || parsed.ptr != end || id == UINT64_MAX)
+        continue;
+      if (version_path.empty() || id > max_id) {
+        max_id = id;
+        version_path = entry.path().u8string();
       }
     }
   }
 
-  if (max_id == UINT64_MAX) {
+  if (version_path.empty()) {
     LOG_ERROR("Failed to find the version file in collction_path(%s)",
               path.c_str());
     return tl::make_unexpected(

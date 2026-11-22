@@ -25,7 +25,7 @@ namespace zvec::core_interface {
 namespace {
 
 bool RequiresSearchFallback(const BaseIndexQueryParam::Pointer &search_param) {
-  return search_param->refiner_param || search_param->bf_pks ||
+  return search_param->refiner_param || search_param->bf_keys() ||
          search_param->is_linear;
 }
 
@@ -61,14 +61,14 @@ int Index::search_internal_ids(const VectorData &vector_data,
   }
 
   const size_t topk = search_param->topk;
-  if (search_param->refiner_param && !search_param->bf_pks &&
+  if (search_param->refiner_param && !search_param->bf_keys() &&
       !search_param->is_linear) {
     const int ret = _search_refine_internal_ids(vector_data, search_param,
                                                 output_ids, output_scores);
     if (ret != core::IndexError_NotImplemented) return ret;
   }
   if (RequiresSearchFallback(search_param)) {
-    thread_local SearchResult result;
+    SearchResult result;
     const int ret = search(vector_data, search_param, &result);
     if (ret != 0) return ret;
     CopySearchResult(result, topk, output_ids, output_scores);
@@ -97,18 +97,16 @@ int Index::search_internal_ids(const VectorData &vector_data,
                                &query_meta);
   }
 
-  // The public runner accepts standard vectors. Charge their retained
-  // capacity here because it survives both the query and its index context.
-  thread_local ailego::MemoryReservation keys_memory;
-  thread_local std::vector<uint64_t> keys;
+  // The engine writes standard vectors. Their capacity remains admitted
+  // until the caller's ID and score buffers have been filled.
+  ailego::MemoryReservation keys_memory;
+  std::vector<uint64_t> keys;
+  ailego::MemoryReservation scores_memory;
+  std::vector<float> score_buffer;
   std::vector<float> *scores = nullptr;
   if (ret == 0) {
-    keys.clear();
     ailego::ReserveVectorCapacity(keys, keys_memory, topk);
     if (output_scores) {
-      thread_local ailego::MemoryReservation scores_memory;
-      thread_local std::vector<float> score_buffer;
-      score_buffer.clear();
       ailego::ReserveVectorCapacity(score_buffer, scores_memory, topk);
       scores = &score_buffer;
     }
@@ -166,9 +164,13 @@ int Index::_search_refine_internal_ids(
   const auto *flat =
       dynamic_cast<const core::FlatStreamer<32> *>(reference->streamer_.get());
   if (!flat) return core::IndexError_NotImplemented;
-  if ((!is_trained_ && train() != 0) ||
-      (!reference->is_trained_ && reference->train() != 0)) {
-    return core::IndexError_Runtime;
+  if (!is_trained_) {
+    const int ret = train();
+    if (ret != 0) return ret;
+  }
+  if (!reference->is_trained_) {
+    const int ret = reference->train();
+    if (ret != 0) return ret;
   }
   auto &context = acquire_context(true);
   AILEGO_DEFER([&] { release_context(); });
@@ -189,14 +191,10 @@ int Index::_search_refine_internal_ids(
   context->set_topk(coarse_topk);
   context->set_fetch_vector(false);
 
-  // Only capacity is retained across calls, never pointers into an index.
-  // This path invokes no user filter/group callbacks and is non-reentrant
-  // within a thread, as is the existing candidate/context scratch.
-  thread_local ailego::BudgetedStringWorkspace coarse_query_storage;
-  thread_local ailego::BudgetedStringWorkspace reference_query_storage;
-  thread_local ailego::MemoryReservation keys_memory;
-  thread_local std::vector<uint64_t> keys;
-  keys.clear();
+  ailego::BudgetedStringWorkspace coarse_query_storage;
+  ailego::BudgetedStringWorkspace reference_query_storage;
+  ailego::MemoryReservation keys_memory;
+  std::vector<uint64_t> keys;
   ailego::ReserveVectorCapacity(keys, keys_memory,
                                 static_cast<size_t>(coarse_topk));
   const void *query = nullptr;
@@ -237,7 +235,7 @@ int Index::_search_refine_internal_ids(
           std::vector<std::vector<uint64_t>> candidates(1);
           candidates[0].swap(keys);
           AILEGO_DEFER([&] { candidates[0].swap(keys); });
-          thread_local SearchResult result;
+          SearchResult result;
           ret = reference->_refine_dense_candidates(vector_data, search_param,
                                                     candidates, &result);
           if (ret == 0) {

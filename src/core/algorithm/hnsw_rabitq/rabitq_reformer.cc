@@ -132,7 +132,7 @@ int RabitqReformer::unload() {
   return this->cleanup();
 }
 
-int RabitqReformer::load(IndexStorage::Pointer storage) {
+int RabitqReformer::load(IndexStorage::Pointer storage) try {
   if (!storage) {
     LOG_ERROR("Invalid storage for load");
     return IndexError_InvalidArgument;
@@ -153,11 +153,13 @@ int RabitqReformer::load(IndexStorage::Pointer storage) {
     return segment->read_error();
   }
   memcpy(static_cast<void *>(&header), block.data(), sizeof(header));
-  impl_->dimension = header.dim;
-  impl_->padded_dim = header.padded_dim;
-  impl_->ex_bits = header.ex_bits;
-  impl_->num_clusters = header.num_clusters;
-  impl_->rotator_type =
+  auto candidate = std::make_unique<Impl>();
+  candidate->metric_type = impl_->metric_type;
+  candidate->dimension = header.dim;
+  candidate->padded_dim = header.padded_dim;
+  candidate->ex_bits = header.ex_bits;
+  candidate->num_clusters = header.num_clusters;
+  candidate->rotator_type =
       static_cast<rabitqlib::RotatorType>(header.rotator_type);
   offset += sizeof(header);
 
@@ -183,19 +185,19 @@ int RabitqReformer::load(IndexStorage::Pointer storage) {
     remaining -= bytes;
   }
   if (header.rotator_size != rotator_bytes) return IndexError_InvalidFormat;
-  int ret = impl_->rotated_centroids.load(storage, RABITQ_CONVERTER_SEG_ID,
-                                          offset, rotated_bytes);
+  int ret = candidate->rotated_centroids.load(storage, RABITQ_CONVERTER_SEG_ID,
+                                              offset, rotated_bytes);
   if (ret != 0) return ret;
   offset += rotated_bytes;
-  ret = impl_->centroids.load(storage, RABITQ_CONVERTER_SEG_ID, offset,
-                              centroid_bytes);
+  ret = candidate->centroids.load(storage, RABITQ_CONVERTER_SEG_ID, offset,
+                                  centroid_bytes);
   if (ret != 0) return ret;
   offset += centroid_bytes;
-  ret = MakeRabitqRotator(impl_->dimension, impl_->rotator_type,
-                          impl_->padded_dim, &impl_->rotator, false);
+  ret = MakeRabitqRotator(candidate->dimension, candidate->rotator_type,
+                          candidate->padded_dim, &candidate->rotator, false);
   if (ret != 0) return ret;
   ret = LoadRabitqRotator(
-      impl_->rotator.get(), [&](size_t pos, void *out, size_t bytes) {
+      candidate->rotator.get(), [&](size_t pos, void *out, size_t bytes) {
         return segment->fetch(offset + pos, out, bytes) == bytes
                    ? 0
                    : segment->read_error();
@@ -203,61 +205,68 @@ int RabitqReformer::load(IndexStorage::Pointer storage) {
   if (ret != 0) return ret;
 
   ailego::MemoryReservation config_memory;
-  config_memory.add_array(impl_->padded_dim, 2048);
-  impl_->query_config = rabitqlib::quant::faster_config(
-      impl_->padded_dim, rabitqlib::SplitSingleQuery<float>::kNumBits);
-  impl_->config =
-      rabitqlib::quant::faster_config(impl_->padded_dim, impl_->ex_bits + 1);
+  config_memory.add_array(candidate->padded_dim, 2048);
+  candidate->query_config = rabitqlib::quant::faster_config(
+      candidate->padded_dim, rabitqlib::SplitSingleQuery<float>::kNumBits);
+  candidate->config = rabitqlib::quant::faster_config(candidate->padded_dim,
+                                                      candidate->ex_bits + 1);
 
-  impl_->size_bin_data =
-      rabitqlib::BinDataMap<float>::data_bytes(impl_->padded_dim);
-  impl_->size_ex_data = rabitqlib::ExDataMap<float>::data_bytes(
-      impl_->padded_dim, impl_->ex_bits);
+  candidate->size_bin_data =
+      rabitqlib::BinDataMap<float>::data_bytes(candidate->padded_dim);
+  candidate->size_ex_data = rabitqlib::ExDataMap<float>::data_bytes(
+      candidate->padded_dim, candidate->ex_bits);
 
   // mmap keeps the original SIMD batch seeker; pageable tables use bounded
   // rows.
   IndexMeta centroid_meta;
   centroid_meta.set_data_type(IndexMeta::DataType::DT_FP32);
-  centroid_meta.set_dimension(static_cast<uint32_t>(impl_->dimension));
+  centroid_meta.set_dimension(static_cast<uint32_t>(candidate->dimension));
   // Note:
   // 1. spherical kmeans is used for InnerProduct and Cosine, so centroids are
   // normalized.
   // 2. for Cosine metric, `transform_to_entity` input is normalized, need to
   // use InnerProduct metric as Cosine metric requires extra dimension which is
   // unsuitable for centroids.
-  centroid_meta.set_metric(impl_->metric_type == rabitqlib::METRIC_L2
+  centroid_meta.set_metric(candidate->metric_type == rabitqlib::METRIC_L2
                                ? "SquaredEuclidean"
                                : "InnerProduct",
                            0, ailego::Params());
 
-  impl_->centroid_seeker.reset();
-  impl_->centroid_features.reset();
-  if (impl_->centroids.data()) {
-    impl_->centroid_features = std::make_shared<CoherentIndexFeatures>();
-    impl_->centroid_features->mount(centroid_meta, impl_->centroids.data(),
-                                    impl_->centroids.size());
-    impl_->centroid_seeker = std::make_shared<LinearSeeker>();
-    ret = impl_->centroid_seeker->init(centroid_meta);
-    if (ret == 0) ret = impl_->centroid_seeker->mount(impl_->centroid_features);
+  if (candidate->centroids.data()) {
+    candidate->centroid_features = std::make_shared<CoherentIndexFeatures>();
+    candidate->centroid_features->mount(centroid_meta,
+                                        candidate->centroids.data(),
+                                        candidate->centroids.size());
+    candidate->centroid_seeker = std::make_shared<LinearSeeker>();
+    ret = candidate->centroid_seeker->init(centroid_meta);
+    if (ret == 0)
+      ret = candidate->centroid_seeker->mount(candidate->centroid_features);
     if (ret != 0) return ret;
   }
-  impl_->centroid_metric =
+  candidate->centroid_metric =
       IndexFactory::CreateMetric(centroid_meta.metric_name());
-  if (!impl_->centroid_metric) return IndexError_Unsupported;
-  ret = impl_->centroid_metric->init(centroid_meta,
-                                     centroid_meta.metric_params());
+  if (!candidate->centroid_metric) return IndexError_Unsupported;
+  ret = candidate->centroid_metric->init(centroid_meta,
+                                         centroid_meta.metric_params());
   if (ret != 0) return ret;
-  impl_->centroid_distance = impl_->centroid_metric->distance_matrix(1, 1);
-  if (!impl_->centroid_distance) return IndexError_Unsupported;
+  candidate->centroid_distance =
+      candidate->centroid_metric->distance_matrix(1, 1);
+  if (!candidate->centroid_distance) return IndexError_Unsupported;
 
   LOG_INFO(
       "Rabitq reformer load done. dimension=%zu, padded_dim=%zu, "
       "ex_bits=%zu, num_clusters=%zu, size_bin_data=%zu, size_ex_data=%zu "
       "rotator_type=%d",
-      impl_->dimension, impl_->padded_dim, impl_->ex_bits, impl_->num_clusters,
-      impl_->size_bin_data, impl_->size_ex_data, (int)impl_->rotator_type);
-  impl_->loaded = true;
+      candidate->dimension, candidate->padded_dim, candidate->ex_bits,
+      candidate->num_clusters, candidate->size_bin_data,
+      candidate->size_ex_data, (int)candidate->rotator_type);
+  candidate->loaded = true;
+  impl_ = std::move(candidate);
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+} catch (const std::runtime_error &) {
+  return IndexError_ReadData;
 }
 
 int RabitqReformer::convert(const void *record, const IndexQueryMeta &rmeta,

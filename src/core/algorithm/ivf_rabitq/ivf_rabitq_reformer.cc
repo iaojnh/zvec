@@ -212,89 +212,90 @@ int IvfRabitqReformer::load(IndexStorage::Pointer storage) try {
   if (ret != 0) {
     return ret;
   }
-  impl_->dimension = header.dim;
-  impl_->padded_dim = header.padded_dim;
-  impl_->ex_bits = header.ex_bits;
-  impl_->num_clusters = header.num_clusters;
-  impl_->rotator_type =
+  auto candidate = std::make_unique<Impl>();
+  candidate->metric_type = impl_->metric_type;
+  candidate->dimension = header.dim;
+  candidate->padded_dim = header.padded_dim;
+  candidate->ex_bits = header.ex_bits;
+  candidate->num_clusters = header.num_clusters;
+  candidate->rotator_type =
       static_cast<rabitqlib::RotatorType>(header.rotator_type);
   offset += sizeof(header);
 
-  ret = impl_->converter_data.load(storage, RABITQ_CONVERTER_SEG_ID, 0,
-                                   segment->data_size());
+  ret = candidate->converter_data.load(storage, RABITQ_CONVERTER_SEG_ID, 0,
+                                       segment->data_size());
   if (ret != 0) return ret;
-  ret = impl_->rotated_centroids.load(storage, RABITQ_CONVERTER_SEG_ID, offset,
-                                      layout.rotated_centroids_size);
+  ret = candidate->rotated_centroids.load(
+      storage, RABITQ_CONVERTER_SEG_ID, offset, layout.rotated_centroids_size);
   if (ret != 0) return ret;
   offset += layout.rotated_centroids_size;
-  ret = impl_->centroids.load(storage, RABITQ_CONVERTER_SEG_ID, offset,
-                              layout.centroids_size);
+  ret = candidate->centroids.load(storage, RABITQ_CONVERTER_SEG_ID, offset,
+                                  layout.centroids_size);
   if (ret != 0) return ret;
   offset += layout.centroids_size;
 
-  ret = MakeRabitqRotator(impl_->dimension, impl_->rotator_type,
-                          impl_->padded_dim, &impl_->rotator, false);
+  ret = MakeRabitqRotator(candidate->dimension, candidate->rotator_type,
+                          candidate->padded_dim, &candidate->rotator, false);
   if (ret != 0) return ret;
   ret = LoadRabitqRotator(
-      impl_->rotator.get(), [&](size_t pos, void *out, size_t bytes) {
+      candidate->rotator.get(), [&](size_t pos, void *out, size_t bytes) {
         return segment->fetch(offset + pos, out, bytes) == bytes
                    ? 0
-                   : IndexError_ReadData;
+                   : segment->read_error();
       });
   if (ret != 0) return ret;
   offset += layout.rotator_size;
 
-  impl_->build_config_ready.store(false);
-
   // Initialize LinearSeeker for SIMD-optimized centroid search
   IndexMeta centroid_meta;
   centroid_meta.set_data_type(IndexMeta::DataType::DT_FP32);
-  centroid_meta.set_dimension(static_cast<uint32_t>(impl_->dimension));
+  centroid_meta.set_dimension(static_cast<uint32_t>(candidate->dimension));
   // Cosine maps to IP internally; use InnerProduct for centroid search
   // since input vectors are already normalized by CosineNormalizeConverter
-  centroid_meta.set_metric(impl_->metric_type == rabitqlib::METRIC_L2
+  centroid_meta.set_metric(candidate->metric_type == rabitqlib::METRIC_L2
                                ? "SquaredEuclidean"
                                : "InnerProduct",
                            0, ailego::Params());
 
-  impl_->centroid_features.reset();
-  impl_->centroid_seeker.reset();
-  if (impl_->centroids.data()) {
-    impl_->centroid_features = std::make_shared<CoherentIndexFeatures>();
-    impl_->centroid_features->mount(centroid_meta, impl_->centroids.data(),
-                                    impl_->centroids.size());
-    impl_->centroid_seeker = std::make_shared<LinearSeeker>();
-    ret = impl_->centroid_seeker->init(centroid_meta);
+  if (candidate->centroids.data()) {
+    candidate->centroid_features = std::make_shared<CoherentIndexFeatures>();
+    candidate->centroid_features->mount(centroid_meta,
+                                        candidate->centroids.data(),
+                                        candidate->centroids.size());
+    candidate->centroid_seeker = std::make_shared<LinearSeeker>();
+    ret = candidate->centroid_seeker->init(centroid_meta);
     if (ret != 0) return ret;
-    ret = impl_->centroid_seeker->mount(impl_->centroid_features);
+    ret = candidate->centroid_seeker->mount(candidate->centroid_features);
     if (ret != 0) return ret;
   }
-  impl_->centroid_metric =
+  candidate->centroid_metric =
       IndexFactory::CreateMetric(centroid_meta.metric_name());
-  if (!impl_->centroid_metric) {
+  if (!candidate->centroid_metric) {
     LOG_ERROR("Failed to create centroid metric %s",
               centroid_meta.metric_name().c_str());
     return IndexError_Unsupported;
   }
-  ret = impl_->centroid_metric->init(centroid_meta,
-                                     centroid_meta.metric_params());
+  ret = candidate->centroid_metric->init(centroid_meta,
+                                         centroid_meta.metric_params());
   if (ret != 0) {
     LOG_ERROR("Failed to init centroid metric, ret=%d", ret);
     return ret;
   }
-  impl_->centroid_distance_func = impl_->centroid_metric->distance_matrix(1, 1);
-  if (!impl_->centroid_distance_func) {
+  candidate->centroid_distance_func =
+      candidate->centroid_metric->distance_matrix(1, 1);
+  if (!candidate->centroid_distance_func) {
     LOG_ERROR("Failed to get centroid distance function");
     return IndexError_Unsupported;
   }
 
-  impl_->is_loaded = true;
+  candidate->is_loaded = true;
 
   LOG_INFO(
       "IvfRabitqReformer loaded: dimension=%zu, padded_dim=%zu, "
       "ex_bits=%zu, num_clusters=%zu, rotator_type=%d",
-      impl_->dimension, impl_->padded_dim, impl_->ex_bits, impl_->num_clusters,
-      static_cast<int>(impl_->rotator_type));
+      candidate->dimension, candidate->padded_dim, candidate->ex_bits,
+      candidate->num_clusters, static_cast<int>(candidate->rotator_type));
+  impl_ = std::move(candidate);
   return 0;
 } catch (const std::bad_alloc &) {
   return IndexError_NoMemory;

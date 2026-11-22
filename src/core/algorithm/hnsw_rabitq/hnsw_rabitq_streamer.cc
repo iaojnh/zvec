@@ -296,25 +296,26 @@ int HnswRabitqStreamer::open(IndexStorage::Pointer stg) try {
     return IndexError_NoReady;
   }
 
-  // try to load reformer
-  if (reformer_ == nullptr) {
-    reformer_ = std::make_shared<RabitqReformer>();
+  if (!stg) return IndexError_InvalidArgument;
+  auto reformer = reformer_;
+  if (!reformer) {
+    reformer = std::make_shared<RabitqReformer>();
     ailego::Params reformer_params;
     reformer_params.set(PARAM_RABITQ_METRIC_NAME, meta_.metric_name());
-    int ret = reformer_->init(reformer_params);
+    int ret = reformer->init(reformer_params);
     if (ret != 0) {
       LOG_ERROR("Failed to initialize RabitqReformer: %d", ret);
       return ret;
     }
 
-    ret = reformer_->load(stg);
+    ret = reformer->load(stg);
     if (ret != 0) {
       LOG_ERROR("Failed to load reformer, ret=%d", ret);
       return ret;
     }
   } else {
     if (!stg->has(RABITQ_CONVERTER_SEG_ID)) {
-      int ret = reformer_->dump(stg);
+      int ret = reformer->dump(stg);
       if (ret != 0) {
         LOG_ERROR("Failed to dump reformer, ret=%d", ret);
         return ret;
@@ -329,11 +330,11 @@ int HnswRabitqStreamer::open(IndexStorage::Pointer stg) try {
   }
 
   // Verify ex_bits consistency to avoid quantized data layout mismatch
-  if (reformer_->ex_bits() != entity_.ex_bits()) {
+  if (reformer->ex_bits() != entity_.ex_bits()) {
     LOG_ERROR(
         "ex_bits mismatch between reformer(%zu) and entity(%zu). "
         "Reformer and entity must use the same total_bits configuration",
-        reformer_->ex_bits(), (size_t)entity_.ex_bits());
+        reformer->ex_bits(), (size_t)entity_.ex_bits());
     return IndexError_Mismatch;
   }
 
@@ -415,11 +416,13 @@ int HnswRabitqStreamer::open(IndexStorage::Pointer stg) try {
     search_batch_distance_ = query_metric->batch_distance();
   }
 
-  state_ = STATE_OPENED;
-  magic_ = IndexContext::GenerateMagic();
+  auto query = std::make_unique<HnswRabitqQueryAlgorithm>(
+      entity_, reformer->num_clusters(), reformer->rabitq_metric_type());
 
-  query_alg_ = HnswRabitqQueryAlgorithm::UPointer(new HnswRabitqQueryAlgorithm(
-      entity_, reformer_->num_clusters(), reformer_->rabitq_metric_type()));
+  reformer_ = std::move(reformer);
+  query_alg_ = std::move(query);
+  magic_ = IndexContext::GenerateMagic();
+  state_ = STATE_OPENED;
 
   return 0;
 } catch (const GraphStorageError &error) {
