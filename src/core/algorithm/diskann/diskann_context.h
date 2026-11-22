@@ -61,9 +61,10 @@ class DiskAnnContext : public IndexContext,
   ~DiskAnnContext() override;
 
   //! Create a lightweight context for reading vectors by id.
-  static Pointer create_fetch_context(const IndexMeta &meta,
-                                      const IndexMetric::Pointer &measure,
-                                      const DiskAnnEntity::Pointer &entity);
+  static int create_fetch_context(const IndexMeta &meta,
+                                  const IndexMetric::Pointer &measure,
+                                  const DiskAnnEntity::Pointer &entity,
+                                  IndexContext::Pointer *context);
 
  public:
   //! Init

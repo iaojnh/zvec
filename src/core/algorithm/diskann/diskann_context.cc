@@ -30,20 +30,19 @@ DiskAnnContext::DiskAnnContext(const IndexMeta &meta,
       dc_(entity.get(), meta, measure, data_quantizer),
       entity_{entity} {}
 
-DiskAnnContext::Pointer DiskAnnContext::create_fetch_context(
-    const IndexMeta &meta, const IndexMetric::Pointer &measure,
-    const DiskAnnEntity::Pointer &entity) {
-  if (!measure || !entity) {
-    return nullptr;
-  }
-
-  Pointer context(new (std::nothrow) DiskAnnContext(meta, measure, entity));
-  if (!context ||
-      context->init(kFetchContext, entity->max_degree(), entity->pq_chunk_num(),
-                    meta.element_size()) != 0) {
-    return nullptr;
-  }
-  return context;
+int DiskAnnContext::create_fetch_context(const IndexMeta &meta,
+                                         const IndexMetric::Pointer &measure,
+                                         const DiskAnnEntity::Pointer &entity,
+                                         IndexContext::Pointer *context) try {
+  if (!measure || !entity) return IndexError_InvalidArgument;
+  auto candidate = std::make_unique<DiskAnnContext>(meta, measure, entity);
+  const int ret = candidate->init(kFetchContext, entity->max_degree(),
+                                  entity->pq_chunk_num(), meta.element_size());
+  if (ret != 0) return ret;
+  *context = std::move(candidate);
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int DiskAnnContext::resize_fetch_sector_buffer(

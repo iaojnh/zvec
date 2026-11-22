@@ -606,17 +606,17 @@ int Index::open(const std::string &file_path,
   }
   if (is_open_) return core::IndexError_NoReady;
   bool opened = false;
-  bool created_file = false;
+  ailego::File::Identity created_file;
   AILEGO_DEFER([&] {
     if (!opened) {
       contexts_->clear();
       if (reformer_) reformer_->unload();
       if (streamer_) streamer_->cleanup();
       if (storage_) storage_->close();
-      if (created_file) {
+      if (created_file.valid) {
         streamer_.reset();
         storage_.reset();
-        if (!ailego::File::Delete(file_path)) {
+        if (!ailego::File::DeleteIfSame(file_path, created_file)) {
           LOG_ERROR("Failed to remove incomplete index file %s",
                     file_path.c_str());
         }

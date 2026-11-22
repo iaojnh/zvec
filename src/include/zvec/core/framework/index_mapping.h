@@ -115,6 +115,10 @@ class IndexMapping {
   //! Create a new index file without replacing an existing path.
   int create_exclusive(const std::string &path, size_t segs_size);
 
+  ailego::File::Identity file_identity() const {
+    return file_.identity();
+  }
+
   //! Close the index
   void close();
 

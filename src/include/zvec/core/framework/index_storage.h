@@ -40,7 +40,7 @@ class IndexStorage : public IndexModule {
     bool create_if_missing{false};
     bool read_only{true};
     // Set only after this open exclusively creates and opens a new file.
-    bool *created_file{nullptr};
+    ailego::File::Identity *created_file{nullptr};
   };
 
   struct MemoryBlock {
@@ -817,7 +817,7 @@ class IndexStorage : public IndexModule {
   //! Open with independent creation and access permissions. Implementations
   //! that have not opted in return Unsupported instead of ignoring access.
   int open(const std::string &path, const OpenOptions &options) {
-    if (options.created_file) *options.created_file = false;
+    if (options.created_file) *options.created_file = {};
     if (options.create_if_missing && options.read_only) {
       return IndexError_InvalidArgument;
     }

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <map>
 #include <string>
@@ -24,6 +25,7 @@
 #include "db/common/global_resource.h"
 #include "db/common/rocksdb_context.h"
 #include "db/common/write_buffer_reservation.h"
+#include "db/index/common/id_map.h"
 #include "db/index/common/version_manager.h"
 #include "db/index/storage/parquet_memory_pool.h"
 #include "db/index/storage/wal/wal_file.h"
@@ -99,7 +101,7 @@ class CollectionWriteBudgetTest : public testing::Test {
 
 TEST_F(CollectionWriteBudgetTest, FailedMmapCreateCanRetryAtTheSamePath) {
   auto &pool = ailego::MemoryLimitPool::get_instance();
-  const auto collection_path = path("failed_create") + "/child/";
+  const auto collection_path = path("failed_create") + "/child/./";
   const CollectionOptions options{false, true, kMiB};
   {
     ASSERT_GT(pool.available(), 64u << 10);
@@ -111,6 +113,7 @@ TEST_F(CollectionWriteBudgetTest, FailedMmapCreateCanRetryAtTheSamePath) {
     ASSERT_FALSE(rejected.has_value());
     EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, rejected.error().code());
     EXPECT_FALSE(std::filesystem::exists(collection_path));
+    EXPECT_FALSE(std::filesystem::exists(path("failed_create") + "/child"));
   }
   auto created = Collection::CreateAndOpen(collection_path, schema(), options);
   ASSERT_TRUE(created.has_value()) << created.error().message();
@@ -118,6 +121,73 @@ TEST_F(CollectionWriteBudgetTest, FailedMmapCreateCanRetryAtTheSamePath) {
   auto reopened = Collection::Open(collection_path, options);
   ASSERT_TRUE(reopened.has_value()) << reopened.error().message();
   EXPECT_TRUE(reopened.value()->close().ok());
+}
+
+TEST_F(CollectionWriteBudgetTest, LegacyUpsertReplayIgnoresAnAheadIdMap) {
+  const CollectionOptions options{false, true, kMiB};
+  for (const bool sealed : {false, true}) {
+    SCOPED_TRACE(sealed);
+    const auto collection_path = path(sealed ? "sealed" : "writing");
+    {
+      auto created = Collection::CreateAndOpen(collection_path, schema(), options);
+      ASSERT_TRUE(created.has_value()) << created.error().message();
+      auto previous = docs("pk", "committed");
+      auto inserted = created.value()->insert(previous);
+      ASSERT_TRUE(inserted.has_value() && inserted->front().ok());
+      ASSERT_TRUE(created.value()->flush().ok());
+      if (sealed) {
+        auto iterator = created.value()->create_iterator({});
+        ASSERT_TRUE(iterator.has_value()) << iterator.error().message();
+      }
+      ASSERT_TRUE(created.value()->close().ok());
+    }
+    const auto recovered_version = VersionManager::Recovery(collection_path);
+    ASSERT_TRUE(recovered_version.has_value());
+    const auto version = recovered_version.value()->get_current_version();
+    ASSERT_EQ(sealed, !version.persisted_segment_metas().empty());
+    const auto writing = version.writing_segment_meta();
+    ASSERT_TRUE(writing->writing_forward_block().has_value());
+    const auto block = writing->writing_forward_block().value();
+    {
+      IDMap future_map("write_budget");
+      const auto id_path = FileHelper::MakeFilePath(
+          collection_path, FileID::ID_FILE, version.id_map_path_suffix());
+      ASSERT_TRUE(future_map.open(id_path, false, false).ok());
+      ASSERT_TRUE(future_map.upsert("pk", block.min_doc_id() + 1).ok());
+      ASSERT_TRUE(future_map.close().ok());
+    }
+    {
+      WalFilePtr wal;
+      WalOptions wal_options;
+      wal_options.create_new = true;
+      const auto wal_path =
+          FileHelper::MakeWalPath(collection_path, writing->id(), block.id());
+      ASSERT_EQ(0, WalFile::CreateAndOpen(wal_path, wal_options, &wal));
+      for (const auto *payload : {"intermediate", "latest"}) {
+        auto doc = docs("pk", payload).front();
+        doc.set_operator(Operator::UPSERT);
+        const auto bytes = doc.serialize();
+        ASSERT_EQ(0, wal->append(std::string_view(
+                         reinterpret_cast<const char *>(bytes.data()),
+                         bytes.size())));
+      }
+      ASSERT_EQ(0, wal->close());
+    }
+    auto recovered = Collection::Open(collection_path, options);
+    ASSERT_TRUE(recovered.has_value()) << recovered.error().message();
+    const auto fetched = recovered.value()->fetch({"pk"});
+    ASSERT_TRUE(fetched.has_value()) << fetched.error().message();
+    ASSERT_NE(nullptr, fetched->at("pk"));
+    EXPECT_EQ("latest", fetched->at("pk")->get<std::string>("payload"));
+    SearchQuery query;
+    query.topk_ = 10;
+    query.filter_ = "payload != 'missing'";
+    const auto matches = recovered.value()->query(query);
+    ASSERT_TRUE(matches.has_value()) << matches.error().message();
+    ASSERT_EQ(1u, matches->size());
+    EXPECT_EQ("latest", matches->front()->get<std::string>("payload"));
+    EXPECT_TRUE(recovered.value()->close().ok());
+  }
 }
 
 TEST_F(CollectionWriteBudgetTest, RejectsBeforeWalReplayAndCanRetry) {
@@ -389,8 +459,10 @@ class RejectSstCreation : public rocksdb::EnvWrapper {
 TEST_F(CollectionWriteBudgetTest, RocksWriteStatusReflectsCommittedMutation) {
   RejectSstCreation env;
   RocksdbContext ctx;
+  RocksdbContext healthy;
   ctx.create_opts_.env = &env;
   ASSERT_TRUE(ctx.create(path("rocks_flush_failure")).ok());
+  ASSERT_TRUE(healthy.create(path("rocks_healthy_writer")).ok());
   auto manager = ctx.create_opts_.write_buffer_manager;
   const size_t original_limit = manager->buffer_size();
   AILEGO_DEFER([&] { manager->SetBufferSize(original_limit); });
@@ -406,6 +478,18 @@ TEST_F(CollectionWriteBudgetTest, RocksWriteStatusReflectsCommittedMutation) {
   EXPECT_EQ(value, actual);
   EXPECT_TRUE(write.ok()) << write.ToString();
   EXPECT_FALSE(ctx.flush().ok());
+
+  auto next = std::async(std::launch::async,
+                         [&] { return healthy.put("next", "healthy"); });
+  const auto completion = next.wait_for(std::chrono::seconds(5));
+  if (completion != std::future_status::ready) {
+    // Unblock a regressed shared stall so the assertion can be reported.
+    manager->SetBufferSize(original_limit);
+  }
+  EXPECT_EQ(std::future_status::ready, completion);
+  const auto result = next.get();
+  EXPECT_TRUE(result.ok()) << result.ToString();
+  EXPECT_TRUE(healthy.close().ok());
 }
 
 TEST_F(CollectionWriteBudgetTest, EmptyRocksColumnFamiliesDoNotStallWriters) {

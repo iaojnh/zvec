@@ -60,7 +60,8 @@ class Segment {
                           const IDMap::Ptr &id_map,
                           const DeleteStore::Ptr &delete_store,
                           const VersionManager::Ptr &version_manager,
-                          const SegmentOptions &options);
+                          const SegmentOptions &options,
+                          const std::vector<Ptr> &older_segments = {});
 
   virtual SegmentID id() const = 0;
 

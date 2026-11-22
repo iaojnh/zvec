@@ -205,7 +205,7 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
             static_cast<size_t>(
                 calculate_rocksdb_write_buffer_budget(rocksdb_memory_capacity)),
             rocksdb_block_cache,
-            /*allow_stall=*/true);
+            /*allow_stall=*/false);
     // From here failures can leave a configured pool, native reservations or
     // an RSS reclaimer behind. Keep all later access failed rather than
     // mistaking that partial DB state for an independently configured pool.

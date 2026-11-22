@@ -63,9 +63,8 @@ rocksdb::Status RocksdbContext::finish_write(rocksdb::Status status) {
   // A single atomic batch can exceed WBM's threshold. RocksDB 8.1 schedules
   // pressure flushes only on the *next* write to that DB. With shared WBM,
   // the next write may instead target IDMap/scalar/FTS in another DB, which
-  // cannot flush this one's memtables and can stall indefinitely. Flush the
-  // producing DB now, without an intervening stats/metadata Put. All its CFs
-  // participate, including cross-CF batches. Keep allow_stall and the budget.
+  // cannot flush this one's memtables. Drain the producing DB synchronously
+  // at the pressure boundary, including all CFs of a cross-CF batch.
   std::lock_guard<std::mutex> lock(mutex_);
   rocksdb::FlushOptions options;
   options.wait = true;
@@ -422,10 +421,11 @@ std::shared_ptr<void> RocksdbContext::prepare_options(
 
   // Memtables from every DB and column family share the same limit. The write
   // buffer manager charges their arenas to the shared cache, so block pages
-  // are evicted as writes grow and writes stall if flushing cannot keep up.
+  // are evicted as writes grow. The producer drains its own writes under
+  // pressure. A failed producer must not block independent RocksDBs.
   create_opts_.write_buffer_manager =
       GlobalResource::Instance().rocksdb_write_buffer_manager();
-  // A manual flush must be able to make progress while writes are stalled.
+  // A manual flush must be able to make progress through local write stalls.
   flush_opts_.allow_write_stall = true;
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
   // malloc can retain freed MemTable blocks around unrelated live objects.

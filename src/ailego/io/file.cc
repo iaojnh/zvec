@@ -69,6 +69,28 @@ void FinishMappedPages(size_t bytes, bool materialized) {
 
 #if !defined(_WIN64) && !defined(_WIN32)
 
+File::Identity File::Identify(NativeHandle handle) {
+  struct stat st {};
+  if (::fstat(handle, &st) != 0) return {};
+  return {static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino),
+          true};
+}
+
+File::Identity File::IdentifyPath(const std::string &path) {
+  struct stat st {};
+  if (::lstat(path.c_str(), &st) != 0) return {};
+  return {static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino),
+          true};
+}
+
+bool File::DeleteIfSame(const std::string &path, const Identity &identity) {
+  if (!identity.valid) return false;
+  const auto current = IdentifyPath(path);
+  if (!current.valid) return errno == ENOENT;
+  if (!(current == identity)) return true;
+  return ::unlink(path.c_str()) == 0 || errno == ENOENT;
+}
+
 static inline int OpenSafely(const char *path, int flags) {
   // Set close-on-exec atomically with open: a later fcntl can race with a
   // concurrent process launch and leave the child holding collection locks.
@@ -528,6 +550,51 @@ bool File::create_exclusive(const char *path) {
   read_only_ = false;
   native_handle_ = file_handle;
   return true;
+}
+
+File::Identity File::Identify(NativeHandle handle) {
+  BY_HANDLE_FILE_INFORMATION info{};
+  if (!::GetFileInformationByHandle(handle, &info)) return {};
+  const uint64_t index =
+      (static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+  return {info.dwVolumeSerialNumber, index, true};
+}
+
+File::Identity File::IdentifyPath(const std::string &path) {
+  const auto wpath = FileHelper::Utf8ToWide(path);
+  if (!Utf8PathOk(path.c_str(), wpath)) return {};
+  const HANDLE handle = ::CreateFileW(
+      wpath.c_str(), FILE_READ_ATTRIBUTES,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+      nullptr);
+  if (handle == INVALID_HANDLE_VALUE) return {};
+  const auto identity = Identify(handle);
+  ::CloseHandle(handle);
+  return identity;
+}
+
+bool File::DeleteIfSame(const std::string &path, const Identity &identity) {
+  if (!identity.valid) return false;
+  const auto wpath = FileHelper::Utf8ToWide(path);
+  if (!Utf8PathOk(path.c_str(), wpath)) return false;
+  const HANDLE handle = ::CreateFileW(
+      wpath.c_str(), DELETE | FILE_READ_ATTRIBUTES,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    const auto error = ::GetLastError();
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+  }
+  const auto current = Identify(handle);
+  bool ok = current.valid;
+  if (current == identity) {
+    FILE_DISPOSITION_INFO disposition{TRUE};
+    ok = ::SetFileInformationByHandle(handle, FileDispositionInfo, &disposition,
+                                      sizeof(disposition));
+  }
+  ::CloseHandle(handle);
+  return ok;
 }
 
 //! Open a local file

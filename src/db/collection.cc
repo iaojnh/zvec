@@ -2839,7 +2839,9 @@ Status CollectionImpl::recovery() {
   // recover writing segment
   auto writing_segment =
       Segment::Open(path_, *schema_, *v.writing_segment_meta(), id_map_,
-                    delete_store_, version_manager_, seg_options);
+                    delete_store_, version_manager_, seg_options,
+                    replays_wal ? segment_manager_->get_segments()
+                                : std::vector<Segment::Ptr>{});
   if (!writing_segment) {
     return writing_segment.error();
   }
@@ -3005,9 +3007,11 @@ Status CollectionImpl::create() {
 
   namespace fs = std::filesystem;
   auto owned_path = ailego::FileHelper::PathFromUtf8(path_);
-  while (owned_path.has_relative_path() && !owned_path.has_filename()) {
+  while (owned_path.has_relative_path() &&
+         (!owned_path.has_filename() || owned_path.filename() == ".")) {
     owned_path = owned_path.parent_path();
   }
+  const auto owned_path_utf8 = ailego::FileHelper::PathToUtf8(owned_path);
   std::error_code error;
   const auto parent = owned_path.parent_path();
   if (!parent.empty()) fs::create_directories(parent, error);
@@ -3017,13 +3021,15 @@ Status CollectionImpl::create() {
     return Status::InvalidArgument("create collection path failed: ", path_,
                                    ", error: ", error.message());
   }
+  const auto identity = ailego::File::IdentifyPath(owned_path_utf8);
   bool created = false;
   AILEGO_DEFER([&] {
     if (!created) {
       closed_ = true;
       segment_manager_.reset();
       release_write_resources();
-      if (!ailego::FileHelper::RemoveDirectory(path_.c_str())) {
+      if (ailego::File::IdentifyPath(owned_path_utf8) == identity &&
+          !ailego::FileHelper::RemoveDirectory(owned_path_utf8.c_str())) {
         LOG_ERROR("Failed to remove incomplete collection %s", path_.c_str());
       }
     }

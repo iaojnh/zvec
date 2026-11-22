@@ -490,7 +490,8 @@ const void *DiskAnnStreamer::get_vector_by_id(uint32_t /*id*/) const {
 }
 
 int DiskAnnStreamer::get_vector_by_id(const uint32_t id,
-                                      IndexStorage::MemoryBlock &block) const {
+                                      IndexStorage::MemoryBlock &block) const
+    try {
   if (state_ != STATE_LOADED) {
     LOG_ERROR("Open DiskAnnStreamer before fetching vectors");
     return IndexError_NoReady;
@@ -503,12 +504,10 @@ int DiskAnnStreamer::get_vector_by_id(const uint32_t id,
   std::lock_guard<std::mutex> lock(fetch_mutex_);
   if (!fetch_ctx_) {
     const DiskAnnEntity::Pointer fetch_entity = entity_.clone();
-    fetch_ctx_ =
-        DiskAnnContext::create_fetch_context(meta_, measure_, fetch_entity);
-    if (!fetch_ctx_) {
-      LOG_ERROR("Failed to create fetch context for get_vector_by_id");
-      return IndexError_Runtime;
-    }
+    if (!fetch_entity) return IndexError_NoMemory;
+    const int ret = DiskAnnContext::create_fetch_context(
+        meta_, measure_, fetch_entity, &fetch_ctx_);
+    if (ret != 0) return ret;
   }
 
   int ret = diskann_indexer_->get_vector(id, fetch_ctx_, fetch_vector_buffer_);
@@ -517,17 +516,14 @@ int DiskAnnStreamer::get_vector_by_id(const uint32_t id,
     return ret;
   }
 
-  try {
-    auto owned =
-        IndexStorage::MemoryBlock::AllocateOwned(fetch_vector_buffer_.size());
-    std::memcpy(owned.data_, fetch_vector_buffer_.data(),
-                fetch_vector_buffer_.size());
-    block = std::move(owned);
-    return 0;
-  } catch (const std::bad_alloc &) {
-    LOG_ERROR("Insufficient memory for fetched vector buffer");
-    return IndexError_NoMemory;
-  }
+  auto owned =
+      IndexStorage::MemoryBlock::AllocateOwned(fetch_vector_buffer_.size());
+  std::memcpy(owned.data_, fetch_vector_buffer_.data(),
+              fetch_vector_buffer_.size());
+  block = std::move(owned);
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 IndexSearcher::Provider::Pointer DiskAnnStreamer::create_provider() const {

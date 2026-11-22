@@ -172,12 +172,12 @@ class MMapFileStorage : public IndexStorage {
   int open_with_options(const std::string &path,
                         const OpenOptions &options) override {
     if (options.read_only) return IndexError_Unsupported;
-    bool created_file = false;
+    ailego::File::Identity created_file;
     bool opened = false;
     AILEGO_DEFER([&] {
-      if (created_file && !opened) {
+      if (created_file.valid && !opened) {
         close_index();
-        if (!ailego::File::Delete(path)) {
+        if (!ailego::File::DeleteIfSame(path, created_file)) {
           LOG_ERROR("Failed to remove incomplete index file %s", path.c_str());
         }
       }
@@ -194,6 +194,11 @@ class MMapFileStorage : public IndexStorage {
       }
     }
     const int ret = mapping_.open(path, copy_on_write_, force_flush_);
+    if (ret == 0 && created_file.valid &&
+        !(mapping_.file_identity() == created_file)) {
+      LOG_ERROR("Index file was replaced during creation %s", path.c_str());
+      return IndexError_OpenFile;
+    }
     opened = ret == 0;
     if (opened && options.created_file) *options.created_file = created_file;
     return ret;
@@ -270,12 +275,13 @@ class MMapFileStorage : public IndexStorage {
   }
 
   //! Initialize index file
-  int init_index(const std::string &path, bool *created_file) {
+  int init_index(const std::string &path,
+                 ailego::File::Identity *created_file) {
     int error_code = mapping_.create_exclusive(path, segment_meta_capacity_);
     if (error_code != 0) {
       return error_code;
     }
-    *created_file = true;
+    *created_file = mapping_.file_identity();
 
     // Add index version
     error_code = this->init_version_segment();

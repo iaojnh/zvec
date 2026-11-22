@@ -65,21 +65,11 @@ inline bool AlignBufferSize(size_t size, size_t *aligned_size,
   return true;
 }
 
-bool SameFile(int first, int second) {
+ailego::File::Identity FileIdentity(int fd) {
 #if defined(_MSC_VER)
-  const auto first_handle = reinterpret_cast<HANDLE>(_get_osfhandle(first));
-  const auto second_handle = reinterpret_cast<HANDLE>(_get_osfhandle(second));
-  BY_HANDLE_FILE_INFORMATION a{}, b{};
-  return GetFileInformationByHandle(first_handle, &a) &&
-         GetFileInformationByHandle(second_handle, &b) &&
-         a.dwVolumeSerialNumber == b.dwVolumeSerialNumber &&
-         a.nFileIndexHigh == b.nFileIndexHigh &&
-         a.nFileIndexLow == b.nFileIndexLow;
+  return ailego::File::Identify(reinterpret_cast<HANDLE>(_get_osfhandle(fd)));
 #else
-  struct stat a {
-  }, b{};
-  return ::fstat(first, &a) == 0 && ::fstat(second, &b) == 0 &&
-         a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+  return ailego::File::Identify(fd);
 #endif
 }
 
@@ -1327,12 +1317,12 @@ class BufferStorage : public IndexStorage {
     // parsing it, and keep the current directory until admission succeeds.
     int ret = flush_index_locked();
     if (ret != 0) return ret;
-    bool created_file = false;
+    ailego::File::Identity created_file;
     bool published = false;
     AILEGO_DEFER([&] {
-      if (created_file && !published) {
+      if (created_file.valid && !published) {
         candidate.close_index(/*force=*/true);
-        if (!ailego::File::Delete(path)) {
+        if (!ailego::File::DeleteIfSame(path, created_file)) {
           LOG_ERROR("Failed to remove incomplete index file %s", path.c_str());
         }
       }
@@ -1367,8 +1357,9 @@ class BufferStorage : public IndexStorage {
 
  private:
   bool can_preserve_handles(const BufferStorage &candidate) const {
-    if (!buffer_pool_ || !SameFile(buffer_pool_->file_descriptor(),
-                                   candidate.buffer_pool_->file_descriptor()))
+    if (!buffer_pool_ ||
+        !(FileIdentity(buffer_pool_->file_descriptor()) ==
+          FileIdentity(candidate.buffer_pool_->file_descriptor())))
       return false;
 
     for (const auto &previous : segments_) {
@@ -1415,25 +1406,29 @@ class BufferStorage : public IndexStorage {
   }
 
   int open_unpublished(const std::string &path, const OpenOptions &options,
-                       bool *created_file) {
+                       ailego::File::Identity *created_file) {
     const bool writable = !options.read_only;
     if (!ailego::File::IsExist(path) && options.create_if_missing) {
       size_t last_slash = path.rfind('/');
       if (last_slash != std::string::npos) {
         ailego::File::MakePath(path.substr(0, last_slash));
       }
-      int error_code = this->init_index(path);
+      int error_code = this->init_index(path, created_file);
       if (error_code != 0) {
         LOG_ERROR("init_index failed for %s, errno=%d", path.c_str(),
                   error_code);
         return error_code;
       }
-      *created_file = true;
     }
 
     try {
       auto candidate_pool =
           std::make_shared<ailego::VecBufferPool>(path, writable);
+      if (created_file->valid &&
+          !(FileIdentity(candidate_pool->file_descriptor()) == *created_file)) {
+        LOG_ERROR("Index file was replaced during creation %s", path.c_str());
+        return IndexError_OpenFile;
+      }
       auto candidate_handle =
           std::make_shared<ailego::VecBufferPoolHandle>(candidate_pool);
       auto generation = std::allocate_shared<DirectoryGeneration>(
@@ -1766,7 +1761,8 @@ class BufferStorage : public IndexStorage {
   }
 
   //! Create an index compatible with the mmap storage format.
-  int init_index(const std::string &path) {
+  int init_index(const std::string &path,
+                 ailego::File::Identity *created_file) {
     IndexMapping mapping;
     int ret = mapping.create_exclusive(path, segment_meta_capacity_);
     if (ret != 0) {
@@ -1775,11 +1771,8 @@ class BufferStorage : public IndexStorage {
           path.c_str(), ret);
       return ret;
     }
-    bool initialized = false;
-    AILEGO_DEFER([&] {
-      mapping.close();
-      if (!initialized) ailego::File::Delete(path);
-    });
+    *created_file = mapping.file_identity();
+    AILEGO_DEFER([&] { mapping.close(); });
     ret = this->init_version_segment(mapping);
     if (ret != 0) {
       LOG_ERROR(
@@ -1789,7 +1782,6 @@ class BufferStorage : public IndexStorage {
     }
     mapping.refresh(0);
     ret = mapping.flush();
-    initialized = ret == 0;
     if (ret != 0) {
       LOG_ERROR(
           "BufferStorage failed to flush new index file: path[%s], errno[%d]",

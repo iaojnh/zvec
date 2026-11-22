@@ -1358,7 +1358,11 @@ TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
                 index->search(VectorData{DenseVector{values.data()}},
                               query_param, &result));
       EXPECT_TRUE(result.doc_list_.empty());
+      VectorDataBuffer fetched;
+      EXPECT_EQ(zvec::core::IndexError_NoMemory, index->fetch(7, &fetched));
     }
+    VectorDataBuffer fetched;
+    EXPECT_EQ(0, index->fetch(7, &fetched));
     for (size_t i = 0; i < baseline.size(); ++i) {
       ASSERT_NO_FATAL_FAILURE(query(index, i, &baseline[i]));
     }
@@ -5219,6 +5223,8 @@ TEST(IndexInterface, FailedCreationDiscardsOnlyTheNewIndex) {
    public:
     using FlatIndex::init;
     bool refuse{true};
+    std::string replacement;
+    std::string index_path;
 
    protected:
     int prepare_streamer_open(const StorageOptions &) override {
@@ -5226,7 +5232,12 @@ TEST(IndexInterface, FailedCreationDiscardsOnlyTheNewIndex) {
       constexpr char meta_segment[] = "flat.linear_meta";
       if (storage_->has(meta_segment)) return zvec::core::IndexError_NoMemory;
       const int ret = storage_->append(meta_segment, 4096);
-      return ret == 0 ? zvec::core::IndexError_NoMemory : ret;
+      if (ret != 0) return ret;
+      if (!replacement.empty() &&
+          !zvec::ailego::File::Rename(replacement, index_path)) {
+        return zvec::core::IndexError_Runtime;
+      }
+      return zvec::core::IndexError_NoMemory;
     }
   };
 
@@ -5262,6 +5273,25 @@ TEST(IndexInterface, FailedCreationDiscardsOnlyTheNewIndex) {
     index.refuse = false;
     ASSERT_EQ(0, index.open(path, {type, false}));
     EXPECT_EQ(0, index.close());
+#if !defined(_WIN32)
+    // An atomic replacement can occur while POSIX file descriptors are live.
+    ASSERT_TRUE(zvec::ailego::File::Delete(path));
+    index.index_path = path;
+    index.replacement = path + ".replacement";
+    auto remove_replacement = zvec::ailego::ScopeGuard::Make(
+        [&] { zvec::test_util::RemoveTestFiles(index.replacement); });
+    {
+      std::ofstream replacement(index.replacement);
+      replacement << "replacement";
+      ASSERT_TRUE(replacement.good());
+    }
+    index.refuse = true;
+    EXPECT_EQ(zvec::core::IndexError_NoMemory, index.open(path, {type, true}));
+    std::ifstream replacement(path);
+    std::string content;
+    replacement >> content;
+    EXPECT_EQ("replacement", content);
+#endif
   }
 }
 

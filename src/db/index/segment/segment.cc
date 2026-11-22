@@ -322,7 +322,8 @@ class SegmentImpl : public Segment,
   Status drop_column(const std::string &column_name) override;
 
  public:
-  Status Open(const SegmentOptions &options);
+  Status Open(const SegmentOptions &options,
+              const std::vector<Segment::Ptr> &older_segments);
   Status create(const SegmentOptions &options, uint64_t min_doc_id);
 
  private:
@@ -399,7 +400,9 @@ class SegmentImpl : public Segment,
                          std::optional<uint64_t> previous_doc_id);
   Status internal_delete(const Doc &doc);
 
-  Status recover();
+  Status recover(const std::vector<Segment::Ptr> &older_segments);
+  Result<std::optional<uint64_t>> find_persisted_doc_id(
+      std::string_view pk) const;
   Status open_wal_file();
   Status append_wal(const Doc &doc);
   Status update_version(const SegmentMeta::Ptr &meta,
@@ -621,7 +624,8 @@ Result<bool> SegmentImpl::SegmentIndexFilter::is_filtered_checked(
   return delete_store_ && delete_store_->is_deleted(*result);
 }
 
-Status SegmentImpl::Open(const SegmentOptions &options) {
+Status SegmentImpl::Open(const SegmentOptions &options,
+                         const std::vector<Segment::Ptr> &older_segments) {
   options_ = options;
   options_.enable_mmap_ = version_manager_->get_current_version().enable_mmap();
 
@@ -660,7 +664,7 @@ Status SegmentImpl::Open(const SegmentOptions &options) {
     block_id_allocator_ = max_block_id + 1;
 
     // recover writing block
-    s = recover();
+    s = recover(older_segments);
     CHECK_RETURN_STATUS(s);
   } else {
     // Update block_id_allocator_
@@ -1252,9 +1256,19 @@ Status SegmentImpl::upsert(Doc &doc) {
   auto prepared = prepare_forward_write(doc);
   if (!prepared) return prepared.error();
 
-  // append WAL
-  auto s = append_wal(doc);
-  CHECK_RETURN_STATUS(s);
+  // Record the mutation we resolved before writing. RocksDB may flush the
+  // new ID before the collection manifest advances, so replay must not need
+  // that mutable mapping to identify the row an upsert replaced.
+  {
+    const auto caller_doc_id = doc.doc_id();
+    AILEGO_DEFER([&] {
+      doc.set_operator(Operator::UPSERT);
+      doc.set_doc_id(caller_doc_id);
+    });
+    doc.set_operator(*found ? Operator::UPDATE : Operator::INSERT);
+    if (*found) doc.set_doc_id(old_id);
+    CHECK_RETURN_STATUS(append_wal(doc));
+  }
 
   // Keep the lookup from before the WAL append. A second disk read could
   // fail after the update has already been recorded.
@@ -5490,7 +5504,56 @@ Status SegmentImpl::init_memory_components() {
   return Status::OK();
 }
 
-Status SegmentImpl::recover() try {
+Result<std::optional<uint64_t>> SegmentImpl::find_persisted_doc_id(
+    std::string_view pk) const {
+  // The cached block lookup is rebuilt after replay, so use the loaded
+  // manifest's forward blocks directly here.
+  const auto &blocks = segment_meta_->persisted_blocks();
+  auto store = persist_stores_.rbegin();
+  for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
+    const auto &block = *it;
+    if (block.type() != BlockType::SCALAR) continue;
+    const auto &forward = *store++;
+    if (!block.contain_column(USER_ID) ||
+        !block.contain_column(GLOBAL_DOC_ID)) {
+      continue;
+    }
+    auto reader = forward->scan({USER_ID, GLOBAL_DOC_ID});
+    if (!reader) {
+      return tl::make_unexpected(
+          Status::InternalError("Failed to open persisted WAL lookup"));
+    }
+    for (;;) {
+      RecordBatchPtr batch;
+      const auto status = reader->ReadNext(&batch);
+      if (!status.ok()) {
+        return tl::make_unexpected(Status(status.IsOutOfMemory()
+                                              ? StatusCode::RESOURCE_EXHAUSTED
+                                              : StatusCode::INTERNAL_ERROR,
+                                          status.ToString()));
+      }
+      if (!batch) break;
+      const auto keys = std::dynamic_pointer_cast<arrow::StringArray>(
+          batch->GetColumnByName(USER_ID));
+      const auto ids = std::dynamic_pointer_cast<arrow::UInt64Array>(
+          batch->GetColumnByName(GLOBAL_DOC_ID));
+      if (!keys || !ids) {
+        return tl::make_unexpected(
+            Status::InternalError("Invalid persisted WAL lookup columns"));
+      }
+      for (int64_t j = 0; j < batch->num_rows(); ++j) {
+        if (!keys->IsNull(j) && keys->GetView(j) == pk && !ids->IsNull(j) &&
+            !delete_store_->is_deleted(ids->Value(j))) {
+          return std::optional<uint64_t>(ids->Value(j));
+        }
+      }
+    }
+  }
+  return std::optional<uint64_t>{};
+}
+
+Status SegmentImpl::recover(
+    const std::vector<Segment::Ptr> &older_segments) try {
   // recover mem block meta
   auto &mem_block = segment_meta_->writing_forward_block().value();
   doc_id_allocator_.store(mem_block.min_doc_id());
@@ -5601,11 +5664,29 @@ Status SegmentImpl::recover() try {
       case Operator::UPSERT: {
         uint64_t old_id;
         const auto found = id_map_->lookup(doc->pk_ref(), &old_id);
-        status = found
-                     ? internal_upsert(*doc, admission, std::move(prepared),
-                                       *found ? std::optional<uint64_t>(old_id)
-                                              : std::nullopt)
-                     : found.error();
+        if (!found) return found.error();
+        std::optional<uint64_t> previous;
+        if (*found && old_id < doc_id_allocator_.load()) {
+          previous = old_id;
+        } else {
+          // Older UPSERT records did not store the prior ID. A flushed IDMap
+          // can already name this or a later WAL row, or contain a later
+          // deletion. Only committed forward rows can identify the old ID.
+          auto persisted = find_persisted_doc_id(doc->pk_ref());
+          if (!persisted) return persisted.error();
+          previous = *persisted;
+          for (auto it = older_segments.rbegin();
+               !previous && it != older_segments.rend(); ++it) {
+            const auto *older = dynamic_cast<const SegmentImpl *>(it->get());
+            if (!older)
+              return Status::InternalError("Unsupported WAL lookup segment");
+            persisted = older->find_persisted_doc_id(doc->pk_ref());
+            if (!persisted) return persisted.error();
+            previous = *persisted;
+          }
+        }
+        status =
+            internal_upsert(*doc, admission, std::move(prepared), previous);
         break;
       }
       case Operator::DELETE: {
@@ -5636,11 +5717,6 @@ Status SegmentImpl::recover() try {
 
     recovered_doc_count[static_cast<size_t>(doc->get_operator())]++;
   }
-
-  const auto added_docs = recovered_doc_count[0] +  // INSERT
-                          recovered_doc_count[1] +  // UPSERT
-                          recovered_doc_count[2];   // UPDATE
-  mem_block.max_doc_id_ += added_docs;
 
   ret = recover_wal_file->close();
   if (ret != 0) {
@@ -5907,7 +5983,8 @@ Result<Segment::Ptr> Segment::Open(const std::string &path,
                                    const IDMap::Ptr &id_map,
                                    const DeleteStore::Ptr &delete_store,
                                    const VersionManager::Ptr &version_manager,
-                                   const SegmentOptions &options) {
+                                   const SegmentOptions &options,
+                                   const std::vector<Ptr> &older_segments) {
   auto segment = std::shared_ptr<SegmentImpl>(new SegmentImpl(
       path, schema, segment_meta, id_map, delete_store, version_manager));
 
@@ -5918,7 +5995,7 @@ Result<Segment::Ptr> Segment::Open(const std::string &path,
         "Segment open failed: segment path not found [", segment_path, "]"));
   }
 
-  auto s = segment->Open(options);
+  auto s = segment->Open(options, older_segments);
   CHECK_RETURN_STATUS_EXPECTED(s);
 
   return segment;

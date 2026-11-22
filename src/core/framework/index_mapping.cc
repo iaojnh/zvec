@@ -137,25 +137,29 @@ int IndexMapping::create_exclusive(const std::string &path,
 int IndexMapping::create_impl(const std::string &path, size_t seg_meta_capacity,
                               bool exclusive) try {
   close();
-  bool created = false;
+  ailego::File::Identity created;
   bool initialized = false;
   AILEGO_DEFER([&] {
     if (initialized) return;
     close();
-    if (exclusive && created) ailego::File::Delete(path);
+    if (exclusive && created.valid &&
+        !ailego::File::DeleteIfSame(path, created)) {
+      LOG_ERROR("Failed to remove incomplete index mapping %s", path.c_str());
+    }
   });
   path_ = path;
   seg_meta_capacity_ = seg_meta_capacity;
   current_header_start_offset_ = 0;
 
   // write() & copying to mmap() will auto extend the file size
-  created = exclusive ? file_.create_exclusive(path.c_str())
-                      : file_.create(path.c_str(), 0);
-  if (!created) {
+  const bool opened = exclusive ? file_.create_exclusive(path.c_str())
+                                : file_.create(path.c_str(), 0);
+  if (!opened) {
     LOG_ERROR("Failed to create file %s, %s", path.c_str(),
               ailego::FileHelper::GetLastErrorString().c_str());
     return IndexError_CreateFile;
   }
+  if (exclusive) created = file_identity();
   huge_page_ = ishugetlbfs(path);
   const int ret =
       huge_page_ ? init_hugepage_meta_section() : init_meta_section();

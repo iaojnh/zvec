@@ -124,12 +124,12 @@ class DiskAnnIndexProvider : public IndexProvider {
     try {
       auto &vector_buffer = thread_result_buffer(result_buffer_owner_);
       std::lock_guard<std::mutex> lock(fetch_mutex_);
-      if (!fetch_context_) {
-        fetch_context_ =
-            DiskAnnContext::create_fetch_context(meta_, measure_, entity_);
+      if (!fetch_context_ &&
+          DiskAnnContext::create_fetch_context(meta_, measure_, entity_,
+                                               &fetch_context_) != 0) {
+        return nullptr;
       }
-      if (!fetch_context_ ||
-          indexer_->get_vector(id, fetch_context_, vector_buffer) != 0) {
+      if (indexer_->get_vector(id, fetch_context_, vector_buffer) != 0) {
         return nullptr;
       }
       return vector_buffer.data();
@@ -193,12 +193,9 @@ class DiskAnnIndexProvider : public IndexProvider {
         // Context setup owns aligned I/O scratch space and platform resources;
         // iterators that are only inspected should not pay that cost.
         if (!context_) {
-          context_ =
-              DiskAnnContext::create_fetch_context(meta_, measure_, entity_);
-        }
-        if (!context_) {
-          status_ = IndexError_NoMemory;
-          return nullptr;
+          status_ = DiskAnnContext::create_fetch_context(meta_, measure_,
+                                                         entity_, &context_);
+          if (status_ != 0) return nullptr;
         }
         status_ = indexer_->get_vector(cur_id_, context_, vector_buffer_);
         if (status_ != 0) {
