@@ -11,11 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include <algorithm>
+#include <limits>
 #include <ailego/utility/memory_helper.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/ailego/utility/file_helper.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
+#include <zvec/core/framework/index_parsing_input.h>
 #include <zvec/core/framework/index_unpacker.h>
 #include "utility_params.h"
 
@@ -42,13 +46,8 @@ class FileReadStorage : public IndexStorage {
           padding_size_(segment.padding_size()),
           region_size_(segment.data_size() + segment.padding_size()),
           data_crc_(segment.data_crc()),
-          enable_direct_io_(container.enable_direct_io_),
           alone_file_handle_(container.alone_file_handle_),
-          file_ptr_(file_ptr) {
-      if (alone_file_handle_) {
-        file_path_ = container.file_path_;
-      }
-    }
+          file_ptr_(file_ptr) {}
 
     //! Constructor
     Segment(const Segment &rhs, const std::shared_ptr<ailego::File> &file_ptr)
@@ -57,8 +56,8 @@ class FileReadStorage : public IndexStorage {
           padding_size_(rhs.padding_size_),
           region_size_(rhs.region_size_),
           data_crc_(rhs.data_crc_),
-          file_ptr_(file_ptr),
-          file_path_(rhs.file_path_) {}
+          alone_file_handle_(rhs.alone_file_handle_),
+          file_ptr_(file_ptr) {}
 
     //! Destructor
     ~Segment() override = default;
@@ -89,51 +88,71 @@ class FileReadStorage : public IndexStorage {
 
     //! Fetch data from segment (with own buffer)
     size_t fetch(size_t offset, void *buf, size_t len) const override {
-      if (ailego_unlikely(offset + len > region_size_)) {
-        if (offset > region_size_) {
-          offset = region_size_;
-        }
-        len = region_size_ - offset;
-      }
+      thread_read_error() = IndexError_ReadData;
+      if (offset >= region_size_) return 0;
+      len = std::min(len, region_size_ - offset);
       return file_ptr_->read(data_offset_ + offset, buf, len);
+    }
+
+    int read_error() const override {
+      return thread_read_error();
     }
 
     //! Read data from segment
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {
-      if (ailego_unlikely(offset + len > region_size_)) {
-        if (offset > region_size_) {
-          offset = region_size_;
-        }
-        len = region_size_ - offset;
-      }
+      thread_read_error() = IndexError_ReadData;
       data.reset();
-      if (len == 0) {
+      if (offset >= region_size_) return 0;
+      len = std::min(len, region_size_ - offset);
+      if (len == 0) return 0;
+      try {
+        data = MemoryBlock::AllocateOwned(len);
+      } catch (const std::bad_alloc &) {
+        thread_read_error() = IndexError_NoMemory;
         return 0;
       }
-      void *buffer = ailego_malloc(len);
-      if (buffer == nullptr) {
-        return 0;
+      const size_t got = file_ptr_->read(data_offset_ + offset,
+                                         const_cast<void *>(data.data()), len);
+      if (got) {
+        data.scratch_size_ = got;
+      } else {
+        data.reset();
       }
-      data = MemoryBlock::MakeOwned(buffer, len);
-      return file_ptr_->read(data_offset_ + offset, buffer, len);
+      return got;
     }
 
     //! Read data from segment
     bool read(SegmentData *iovec, size_t count) override {
-      size_t total = 0u;
-      for (auto *it = iovec, *end = iovec + count; it != end; ++it) {
-        ailego_false_if_false(it->offset + it->length <= region_size_);
-        total += it->length;
+      thread_read_error() = IndexError_ReadData;
+      if (!iovec || !count) return false;
+      size_t total = 0;
+      for (size_t i = 0; i < count; ++i) {
+        const auto &item = iovec[i];
+        if (item.offset > region_size_ ||
+            item.length > region_size_ - item.offset ||
+            item.length > std::numeric_limits<size_t>::max() - total) {
+          return false;
+        }
+        total += item.length;
       }
-      ailego_false_if_false(total != 0);
+      if (total == 0) return false;
 
-      buffer_.reserve(total);
-      uint8_t *buf = buffer_.data();
-      for (auto *it = iovec, *end = iovec + count; it != end; ++it) {
-        ailego_false_if_false(file_ptr_->read(data_offset_ + it->offset, buf,
-                                              it->length) == it->length);
-        it->data = buf;
-        buf += it->length;
+      try {
+        if (total > buffer_.size())
+          buffer_.resize(total, AILEGO_CACHE_LINE_SIZE);
+      } catch (const std::bad_alloc &) {
+        thread_read_error() = IndexError_NoMemory;
+        return false;
+      }
+      auto *buf = static_cast<char *>(buffer_.data());
+      for (size_t i = 0; i < count; ++i) {
+        auto &item = iovec[i];
+        if (file_ptr_->read(data_offset_ + item.offset, buf, item.length) !=
+            item.length) {
+          return false;
+        }
+        item.data = buf;
+        buf += item.length;
       }
       return true;
     }
@@ -159,9 +178,7 @@ class FileReadStorage : public IndexStorage {
     //! Clone the segment
     template <typename T>
     inline IndexStorage::Segment::Pointer clone_segment() {
-      auto file_ptr = alone_file_handle_ ? FileReadStorage::OpenFile(
-                                               file_path_, enable_direct_io_)
-                                         : file_ptr_;
+      auto file_ptr = ReadHandle(file_ptr_, alone_file_handle_);
       if (file_ptr) {
         return std::make_shared<typename T::Segment>(
             *(static_cast<typename T::Segment *>(this)), file_ptr);
@@ -170,16 +187,19 @@ class FileReadStorage : public IndexStorage {
     }
 
    protected:
+    static int &thread_read_error() {
+      static thread_local int error = IndexError_ReadData;
+      return error;
+    }
+
     size_t data_offset_{0u};
     size_t data_size_{0u};
     size_t padding_size_{0u};
     size_t region_size_{0u};
     uint32_t data_crc_{0u};
-    bool enable_direct_io_{false};
     bool alone_file_handle_{false};
-    std::vector<uint8_t> buffer_{};
+    ailego::BudgetedAlignedBuffer buffer_{};
     std::shared_ptr<ailego::File> file_ptr_{};
-    std::string file_path_{};
   };
 
   /*! MMapFile Storage Segment
@@ -191,46 +211,49 @@ class FileReadStorage : public IndexStorage {
     MMapSegment(const FileReadStorage &container,
                 const IndexUnpacker::SegmentMeta &segment,
                 const std::shared_ptr<ailego::File> &file_ptr, size_t offset,
-                const void *data, std::function<void()> &&cb)
+                const void *data = nullptr, std::function<void()> cb = {})
         : Segment(container, segment, file_ptr, offset),
           data_(static_cast<const char *>(data)),
           cleanup_(std::move(cb)) {
-      ailego_assert_with(data_, "Null Pointer");
+      ailego_assert_with(data_ || !region_size_, "Missing segment mapping");
     }
 
     ~MMapSegment() override {
-      cleanup_();
+      if (cleanup_) cleanup_();
     }
 
     //! Fetch data from segment (with own buffer)
     size_t fetch(size_t offset, void *buf, size_t len) const override {
-      if (ailego_unlikely(offset + len > region_size_)) {
-        if (offset > region_size_) {
-          offset = region_size_;
-        }
-        len = region_size_ - offset;
-      }
+      if (offset >= region_size_ || len == 0) return 0;
+      len = std::min(len, region_size_ - offset);
       memcpy(buf, data_ + offset, len);
       return len;
     }
 
+    int read_error() const override {
+      return IndexError_ReadData;
+    }
+
     //! Read data from segment
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {
-      if (ailego_unlikely(offset + len > region_size_)) {
-        if (offset > region_size_) {
-          offset = region_size_;
-        }
-        len = region_size_ - offset;
+      if (offset >= region_size_ || len == 0) {
+        data.reset();
+        return 0;
       }
-      data.reset((void *)(data_ + offset));
+      len = std::min(len, region_size_ - offset);
+      data = MemoryBlock::MakeMappedView(const_cast<char *>(data_ + offset),
+                                         shared_from_this());
       return len;
     }
 
     //! Read data from segment
     bool read(SegmentData *iovec, size_t count) override {
+      if (count == 0) return true;
+      if (!iovec) return false;
       for (auto *it = iovec, *end = iovec + count; it != end; ++it) {
-        ailego_false_if_false(it->offset + it->length <= region_size_);
-        it->data = data_ + it->offset;
+        if (it->offset > region_size_ || it->length > region_size_ - it->offset)
+          return false;
+        it->data = data_ ? data_ + it->offset : nullptr;
       }
       return true;
     }
@@ -298,41 +321,66 @@ class FileReadStorage : public IndexStorage {
   }
 
   //! Load a index file into container
-  int open(const std::string &path, bool) override {
+  int open(const std::string &path, bool) override try {
+    std::string candidate_path = path;
     auto file_ptr = FileReadStorage::OpenFile(path, enable_direct_io_);
     if (!file_ptr) {
       return IndexError_OpenFile;
     }
 
-    index_offset_ =
-        (header_offset_ >= 0 ? 0 : file_ptr->size()) + header_offset_;
-    size_t end_offset =
-        (footer_offset_ > 0 ? 0 : file_ptr->size()) + footer_offset_;
-    size_t size = end_offset > index_offset_ ? end_offset - index_offset_ : 0;
-    auto read_data = [this, &file_ptr, end_offset](
-                         size_t offset, const void **data, size_t len) {
-      buffer_.reserve(len);
-      *data = buffer_.data();
-      size_t off = index_offset_ + offset;
-      if (off + len > end_offset) {
-        if (off > end_offset) {
-          off = end_offset;
-        }
-        len = end_offset - off;
+    const size_t file_size = file_ptr->size();
+    const auto resolve = [file_size](int64_t offset, bool from_end,
+                                     size_t &out) {
+      if (offset > 0 || (offset == 0 && !from_end)) {
+        if (static_cast<uint64_t>(offset) > file_size) return false;
+        out = static_cast<size_t>(offset);
+      } else {
+        const uint64_t distance = offset == 0 ? 0 : uint64_t(-(offset + 1)) + 1;
+        if (distance > file_size) return false;
+        out = file_size - static_cast<size_t>(distance);
       }
-      return file_ptr->read(off, (void *)*data, len);
+      return true;
+    };
+    size_t candidate_offset = 0, end_offset = 0;
+    if (!resolve(header_offset_, false, candidate_offset) ||
+        !resolve(footer_offset_, true, end_offset) ||
+        candidate_offset >= end_offset)
+      return IndexError_InvalidArgument;
+    const size_t size = end_offset - candidate_offset;
+    IndexParsingInput scratch;
+    int read_error = 0;
+    auto read_data = [&file_ptr, &scratch, &read_error, candidate_offset, size](
+                         size_t offset, const void **data, size_t len,
+                         bool retry = false) {
+      read_error = 0;
+      if (offset > size || len > size - offset) return size_t{0};
+      if (!scratch.prepare(len, retry)) {
+        read_error = IndexError_NoMemory;
+        return size_t{0};
+      }
+      *data = scratch.data();
+      const size_t got =
+          file_ptr->read(candidate_offset + offset, scratch.data(), len);
+      if (got != len) read_error = IndexError_ReadData;
+      return got;
     };
 
     IndexUnpacker unpacker;
-    if (!unpacker.unpack(read_data, size, checksum_validation_)) {
+    if (!unpacker.unpack(read_data, size, checksum_validation_,
+                         /*report_errors=*/false, /*retry_private=*/true)) {
+      if (read_error != 0) return read_error;
       LOG_ERROR("Failed to unpack file: %s", path.c_str());
       return IndexError_UnpackIndex;
     }
-    segments_ = std::move(*unpacker.mutable_segments());
+    // All allocations/validation finish before replacing published state.
+    segments_.swap(*unpacker.mutable_segments());
     magic_ = unpacker.magic();
-    file_path_ = path;
-    file_ptr_ = alone_file_handle_ ? nullptr : file_ptr;
+    index_offset_ = candidate_offset;
+    file_path_.swap(candidate_path);
+    file_ptr_ = std::move(file_ptr);
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
   }
 
   int close() override {
@@ -351,20 +399,7 @@ class FileReadStorage : public IndexStorage {
   //! Retrieve all segments
   std::map<std::string, IndexStorage::Segment::Pointer> get_all()
       const override {
-    std::map<std::string, IndexStorage::Segment::Pointer> result;
-    auto file_ptr =
-        alone_file_handle_ && !file_path_.empty()
-            ? FileReadStorage::OpenFile(file_path_, enable_direct_io_)
-            : file_ptr_;
-    if (file_ptr) {
-      for (const auto &it : segments_) {
-        result.emplace(it.first,
-                       std::make_shared<FileReadStorage::Segment>(
-                           *(static_cast<const FileReadStorage *>(this)),
-                           it.second, file_ptr, index_offset_));
-      }
-    }
-    return result;
+    return get_all_segments<FileReadStorage>();
   }
 
   //! Test if it a segment exists
@@ -379,6 +414,10 @@ class FileReadStorage : public IndexStorage {
 
   //! Retrieve file ptr if has
   std::shared_ptr<ailego::File> file() const override {
+#if defined(_WIN32) || defined(_WIN64)
+    // Windows DiskANN requires exclusive control over all buffered handles.
+    if (alone_file_handle_) return nullptr;
+#endif
     return file_ptr_;
   }
 
@@ -387,6 +426,15 @@ class FileReadStorage : public IndexStorage {
   }
 
  protected:
+  // Derive readers from the file that supplied the segment directory. Its
+  // pathname may already name the next index generation.
+  static std::shared_ptr<ailego::File> ReadHandle(
+      const std::shared_ptr<ailego::File> &source, bool independent) {
+    if (!source || !independent) return source;
+    auto file = std::make_shared<ailego::File>();
+    return file->duplicate(*source) ? file : nullptr;
+  }
+
   //! Open a index file
   static inline std::shared_ptr<ailego::File> OpenFile(const std::string &path,
                                                        bool direct_io) {
@@ -412,10 +460,7 @@ class FileReadStorage : public IndexStorage {
     if (it == segments_.end()) {
       return IndexStorage::Segment::Pointer();
     }
-    auto file_ptr =
-        alone_file_handle_ && !file_path_.empty()
-            ? FileReadStorage::OpenFile(file_path_, enable_direct_io_)
-            : file_ptr_;
+    auto file_ptr = ReadHandle(file_ptr_, alone_file_handle_);
     if (!file_ptr) {
       return IndexStorage::Segment::Pointer();
     }
@@ -432,18 +477,20 @@ class FileReadStorage : public IndexStorage {
       return IndexStorage::Segment::Pointer();
     }
     const auto &segment = it->second;
-    auto file_ptr =
-        alone_file_handle_ && !file_path_.empty()
-            ? FileReadStorage::OpenFile(file_path_, enable_direct_io_)
-            : file_ptr_;
+    auto file_ptr = ReadHandle(file_ptr_, alone_file_handle_);
     if (!file_ptr) {
       return IndexStorage::Segment::Pointer();
     }
 
+    size_t size = segment.data_size() + segment.padding_size();
+    if (!size) {
+      // An empty extent has a directory entry but no bytes to map.
+      return std::make_shared<typename T::MMapSegment>(
+          *(static_cast<const T *>(this)), segment, file_ptr, index_offset_);
+    }
     int opt = memory_locked_ ? ailego::File::MMAP_LOCKED : 0;
     opt |= memory_warmup_ ? ailego::File::MMAP_WARMUP : 0;
     opt |= memory_shared_ ? ailego::File::MMAP_SHARED : 0;
-    size_t size = segment.data_size() + segment.padding_size();
     size_t segment_offset = index_offset_ + segment.data_offset();
     size_t offset = segment_offset / ailego::MemoryHelper::PageSize() *
                     ailego::MemoryHelper::PageSize();
@@ -456,10 +503,13 @@ class FileReadStorage : public IndexStorage {
                 file_path_.c_str(), offset, size);
       return IndexStorage::Segment::Pointer();
     }
-    return std::make_shared<typename T::MMapSegment>(
+    auto unmap = [size](void *addr) { ailego::File::MemoryUnmap(addr, size); };
+    std::unique_ptr<void, decltype(unmap)> mapping(data, unmap);
+    auto result = std::make_shared<typename T::MMapSegment>(
         *(static_cast<const T *>(this)), segment, file_ptr, index_offset_,
-        static_cast<char *>(data) + bias,
-        [=]() { ailego::File::MemoryUnmap(data, size); });
+        static_cast<char *>(data) + bias, [=] { unmap(data); });
+    mapping.release();
+    return result;
   }
 
   //! Retrieve all segments
@@ -467,10 +517,7 @@ class FileReadStorage : public IndexStorage {
   inline std::map<std::string, IndexStorage::Segment::Pointer>
   get_all_segments() const {
     std::map<std::string, IndexStorage::Segment::Pointer> result;
-    auto file_ptr =
-        alone_file_handle_ && !file_path_.empty()
-            ? FileReadStorage::OpenFile(file_path_, enable_direct_io_)
-            : file_ptr_;
+    auto file_ptr = ReadHandle(file_ptr_, alone_file_handle_);
     if (file_ptr) {
       for (const auto &it : segments_) {
         result.emplace(it.first, std::make_shared<typename T::Segment>(
@@ -492,8 +539,7 @@ class FileReadStorage : public IndexStorage {
   int64_t header_offset_{0};
   int64_t footer_offset_{0};
   size_t index_offset_{0};
-  std::vector<uint8_t> buffer_{};
-  std::map<std::string, IndexUnpacker::SegmentMeta> segments_{};
+  IndexUnpacker::SegmentMap segments_{};
   std::shared_ptr<ailego::File> file_ptr_{nullptr};
   std::string file_path_{};
 };

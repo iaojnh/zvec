@@ -74,12 +74,10 @@ int Index::search_internal_ids(const VectorData &vector_data,
     return 0;
   }
 
-  if (!is_trained_ && train() != 0) {
-    LOG_ERROR("Failed to train index");
-    return core::IndexError_Runtime;
-  }
-  auto &context = acquire_context();
-  if (!context) return core::IndexError_Runtime;
+  const int train_status = ensure_trained_for_query();
+  if (train_status != 0) return train_status;
+  auto [context, context_status] = acquire_query_context();
+  if (context_status != 0) return context_status;
 
   int ret = _prepare_for_search(vector_data, search_param, context);
   std::string transformed_query;
@@ -150,12 +148,12 @@ int Index::_search_refine_internal_ids(
   const auto *flat =
       dynamic_cast<const core::FlatStreamer<32> *>(reference->streamer_.get());
   if (!flat) return core::IndexError_NotImplemented;
-  if ((!is_trained_ && train() != 0) ||
-      (!reference->is_trained_ && reference->train() != 0)) {
-    return core::IndexError_Runtime;
-  }
-  auto &context = acquire_context();
-  if (!context) return core::IndexError_Runtime;
+  int train_status = ensure_trained_for_query();
+  if (train_status != 0) return train_status;
+  train_status = reference->ensure_trained_for_query();
+  if (train_status != 0) return train_status;
+  auto [context, context_status] = acquire_query_context();
+  if (context_status != 0) return context_status;
   int ret = _prepare_for_search(vector_data, search_param, context);
   if (ret != 0) {
     context->reset();
@@ -184,10 +182,10 @@ int Index::_search_refine_internal_ids(
         _execute_dense_search(query, query_meta, search_param, context, &keys);
   }
   if (ret == 0) {
-    auto &reference_context = reference->acquire_context();
-    if (!reference_context) {
-      ret = core::IndexError_Runtime;
-    } else {
+    auto [reference_context, reference_status] =
+        reference->acquire_query_context();
+    ret = reference_status;
+    if (ret == 0) {
       // Pooled Flat contexts may have served a different query/index. The
       // radius is applied to coarse candidates, not the reference metric.
       reference_context->set_fetch_vector(false);

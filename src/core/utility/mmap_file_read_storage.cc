@@ -11,10 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/io/mmap_file.h>
 #include <zvec/ailego/utility/file_helper.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_format.h>
+#include <zvec/core/framework/index_parsing_input.h>
 #include <zvec/core/framework/index_unpacker.h>
 #include "utility_params.h"
 
@@ -74,32 +76,32 @@ class MMapFileReadStorage : public IndexStorage {
 
     //! Fetch data from segment (with own buffer)
     size_t fetch(size_t offset, void *buf, size_t len) const override {
-      if (ailego_unlikely(offset + len > region_size_)) {
-        if (offset > region_size_) {
-          offset = region_size_;
-        }
-        len = region_size_ - offset;
-      }
+      if (offset >= region_size_ || len == 0) return 0;
+      len = std::min(len, region_size_ - offset);
       memcpy(buf, data_ptr_ + offset, len);
       return len;
     }
 
     //! Read data from segment
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {
-      if (ailego_unlikely(offset + len > region_size_)) {
-        if (offset > region_size_) {
-          offset = region_size_;
-        }
-        len = region_size_ - offset;
+      if (offset >= region_size_ || len == 0) {
+        data.reset();
+        return 0;
       }
-      data.reset((void *)(data_ptr_ + offset));
+      len = std::min(len, region_size_ - offset);
+      data = MemoryBlock::MakeMappedView(
+          const_cast<uint8_t *>(data_ptr_ + offset), file_ptr_);
       return len;
     }
 
     //! Read data from segment
     bool read(SegmentData *iovec, size_t count) override {
+      if (count == 0) return true;
+      if (!iovec) return false;
       for (auto *end = iovec + count; iovec != end; ++iovec) {
-        ailego_false_if_false(iovec->offset + iovec->length <= region_size_);
+        if (iovec->offset > region_size_ ||
+            iovec->length > region_size_ - iovec->offset)
+          return false;
         iovec->data = data_ptr_ + iovec->offset;
       }
       return true;
@@ -174,63 +176,94 @@ class MMapFileReadStorage : public IndexStorage {
   }
 
   //! Load a index file into container
-  int open(const std::string &path, bool) override {
-    file_path_ = path;
-    file_ptr_ = std::make_shared<ailego::MMapFile>();
-    if (!file_ptr_) {
-      LOG_ERROR("Failed to create mmap file object, %s",
-                ailego::FileHelper::GetLastErrorString().c_str());
-      return IndexError_NoMemory;
-    }
+  int open(const std::string &path, bool) override try {
+    std::string candidate_path = path;
+    auto mapping = std::make_shared<ailego::MMapFile>();
 
-    if (!file_ptr_->open(path.c_str(), true, memory_shared_)) {
+    ailego::File file;
+    if (!file.open(path, true, false) ||
+        !mapping->open(file, true, memory_shared_)) {
       LOG_ERROR("Failed to open file %s, %s", path.c_str(),
                 ailego::FileHelper::GetLastErrorString().c_str());
       return IndexError_OpenFile;
     }
 
-    index_offset_ =
-        (header_offset_ >= 0 ? 0 : file_ptr_->size()) + header_offset_;
-    size_t end_offset =
-        (footer_offset_ > 0 ? 0 : file_ptr_->size()) + footer_offset_;
-    size_t size = end_offset > index_offset_ ? end_offset - index_offset_ : 0;
-    if (memory_locked_ && !file_ptr_->lock()) {
-      LOG_WARN("Failed to lock pages with size %zu, %s", file_ptr_->size(),
+    const size_t file_size = mapping->size();
+    const auto resolve = [file_size](int64_t offset, bool from_end,
+                                     size_t &out) {
+      if (offset > 0 || (offset == 0 && !from_end)) {
+        if (static_cast<uint64_t>(offset) > file_size) return false;
+        out = static_cast<size_t>(offset);
+      } else {
+        const uint64_t distance = offset == 0 ? 0 : uint64_t(-(offset + 1)) + 1;
+        if (distance > file_size) return false;
+        out = file_size - static_cast<size_t>(distance);
+      }
+      return true;
+    };
+    size_t index_offset = 0, end_offset = 0;
+    if (!resolve(header_offset_, false, index_offset) ||
+        !resolve(footer_offset_, true, end_offset) ||
+        index_offset >= end_offset)
+      return IndexError_InvalidArgument;
+    const size_t size = end_offset - index_offset;
+    if (memory_locked_ && !mapping->lock()) {
+      LOG_WARN("Failed to lock pages with size %zu, %s", mapping->size(),
                ailego::FileHelper::GetLastErrorString().c_str());
     }
     if (memory_warmup_ && !checksum_validation_) {
       ailego::File::MemoryWarmup(
-          static_cast<char *>(file_ptr_->region()) + index_offset_, size);
+          static_cast<char *>(mapping->region()) + index_offset, size);
     }
 
-    auto read_data = [this, end_offset](size_t offset, const void **data,
-                                        size_t len) {
-      size_t off = offset + index_offset_;
-      if (off + len > end_offset) {
-        if (off > end_offset) {
-          off = end_offset;
+    IndexParsingInput checksum_scratch;
+    int read_error = 0;
+    auto read_data = [this, &file, &mapping, &checksum_scratch, &read_error,
+                      index_offset, size](size_t offset, const void **data,
+                                          size_t len, bool retry = false) {
+      read_error = 0;
+      if (offset > size) return size_t{0};
+      const size_t off = index_offset + offset;
+      len = std::min(len, size - offset);
+      if (checksum_validation_) {
+        // Validate through positioned reads so a full checksum does not
+        // fault the entire file mapping into the process working set.
+        if (!checksum_scratch.prepare(len, retry)) {
+          read_error = IndexError_NoMemory;
+          return size_t{0};
         }
-        len = end_offset - off;
+        *data = checksum_scratch.data();
+        const size_t got = file.read(off, checksum_scratch.data(), len);
+        if (got != len) read_error = IndexError_ReadData;
+        return got;
       }
-      *data = (uint8_t *)file_ptr_->region() + off;
+      if (retry) {
+        read_error = IndexError_NoMemory;
+        return size_t{0};
+      }
+      *data = static_cast<const uint8_t *>(mapping->region()) + off;
       return len;
     };
 
     IndexUnpacker unpacker;
-    if (!unpacker.unpack(read_data, size, checksum_validation_)) {
+    if (!unpacker.unpack(read_data, size, checksum_validation_,
+                         /*report_errors=*/false, /*retry_private=*/true)) {
+      if (read_error != 0) return read_error;
       LOG_ERROR("Failed to unpack file: %s", path.c_str());
       return IndexError_UnpackIndex;
     }
+    file_path_.swap(candidate_path);
+    file_ptr_ = std::move(mapping);
+    index_offset_ = index_offset;
     segments_ = std::move(*unpacker.mutable_segments());
     magic_ = unpacker.magic();
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
   }
 
   int close() override {
-    if (file_ptr_) {
-      file_ptr_->close();
-    }
-    file_ptr_ = nullptr;
+    file_ptr_.reset();
     segments_.clear();
     return 0;
   }
@@ -284,7 +317,7 @@ class MMapFileReadStorage : public IndexStorage {
   size_t index_offset_{0};
   uint32_t magic_{0};
   std::string file_path_;
-  std::map<std::string, IndexUnpacker::SegmentMeta> segments_{};
+  IndexUnpacker::SegmentMap segments_{};
   std::shared_ptr<ailego::MMapFile> file_ptr_{nullptr};
 };
 

@@ -21,12 +21,14 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <future>
 #include <limits>
 #include <new>
+#include <numeric>
 #include <random>
 #include <string>
 #include <thread>
@@ -34,9 +36,27 @@
 #include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/buffer/external_cache.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
+#include <zvec/ailego/io/file.h>
 #include "pool_payload_budget.h"
+
+#if defined(_MSC_VER)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#else
+#include <sys/mman.h>
+#endif
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <unistd.h>
+#endif
 
 namespace zvec::ailego {
 struct QueueResidentSampleTestPeer {
@@ -77,6 +97,30 @@ struct QueueResidentSampleTestPeer {
 
 using namespace zvec::ailego;
 
+namespace zvec::ailego {
+
+// Model clean-only reclaim's transition before it checks for a concurrent
+// rewrite, without sleeps or changing production thread scheduling.
+struct VectorPageTableTestPeer {
+  static PageWriteStatus extend_after_commit(
+      VectorPageTable &table, size_t entries,
+      const std::function<bool()> &commit) {
+    return table.extend_after_commit(entries, commit);
+  }
+
+  static bool begin_clean_reclaim(VectorPageTable &table, block_id_t id) {
+    int released = 0;
+    return table.entry_at(id).ref_count.compare_exchange_strong(
+        released, VectorPageTable::kEvictingRefCount);
+  }
+
+  static void abort_clean_reclaim(VectorPageTable &table, block_id_t id) {
+    table.entry_at(id).ref_count.store(0, std::memory_order_release);
+  }
+};
+
+}  // namespace zvec::ailego
+
 namespace {
 
 // Create a backing file of `num_pages` pages, page p filled with byte (p &
@@ -105,33 +149,43 @@ void ExpectPageContent(const char *buf, size_t page_id) {
   ASSERT_EQ(buf[ps - 1], expected) << "page " << page_id << " tail mismatch";
 }
 
+
 class BufferPoolTest : public ::testing::Test {
  protected:
   void SetUp() override {
     // Stop the previous test's reclaimer even when the next test uses the
     // same budget. Bounded recycling can leave stale queue entries behind.
-    ASSERT_EQ(0, ::zvec::ailego::PoolPayloadBudget::get_instance().init(0));
+    ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(0));
     auto &queue = BlockEvictionQueue::get_instance();
     BlockEvictionQueue::BlockType stale;
     while (queue.evict_single_block(stale)) {
     }
+    queue.cleanup_dead_entries(std::numeric_limits<size_t>::max());
   }
 
   void init_pool(size_t capacity_pages) {
-    ASSERT_EQ(0, ::zvec::ailego::PoolPayloadBudget::get_instance().init(
-                     capacity_pages * kVectorPageSize));
+    ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(
+                     capacity_pages * kVectorPageSize +
+                     slab_headers_for_pages(capacity_pages)));
   }
-  void init_page_pool(size_t capacity_pages) {
-    // The requested data pages and their slab header share the native cap.
-    init_pool(capacity_pages + (capacity_pages ? 1 : 0));
+  static size_t slab_headers_for_pages(size_t capacity_pages) {
+    const size_t pages_per_slab =
+        PoolPayloadBudget::slab_size() / kVectorPageSize - 1;
+    return ((capacity_pages + pages_per_slab - 1) / pages_per_slab) *
+           kVectorPageSize;
   }
   void init_vec_pool(size_t capacity_pages, size_t file_pages,
-                     bool writable = false) {
-    ASSERT_EQ(0, ::zvec::ailego::PoolPayloadBudget::get_instance().init(
+                     bool writable = false, size_t workspace_metadata = 0) {
+    size_t metadata =
+        VecBufferPool::metadata_bytes_for_page_count(file_pages, writable);
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (writable && current_io_backend_type() == IOBackendType::kIoUring)
+      metadata += VecBufferPool::kWritebackBatchPages * kVectorPageSize;
+#endif
+    ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(
                      capacity_pages * kVectorPageSize +
-                     (capacity_pages ? kVectorPageSize : 0) +
-                     VecBufferPool::metadata_bytes_for_page_count(file_pages,
-                                                                  writable)));
+                     slab_headers_for_pages(capacity_pages) + metadata +
+                     workspace_metadata));
   }
   void init_background_vec_pool(size_t capacity_pages, size_t file_pages) {
     ASSERT_TRUE(QueueResidentSampleTestPeer::init_background_pool(
@@ -139,9 +193,9 @@ class BufferPoolTest : public ::testing::Test {
         VecBufferPool::metadata_bytes_for_page_count(file_pages, false)));
   }
   void init_table_pool(size_t capacity_pages, size_t entry_num) {
-    ASSERT_EQ(0, ::zvec::ailego::PoolPayloadBudget::get_instance().init(
+    ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(
                      capacity_pages * kVectorPageSize +
-                     (capacity_pages ? kVectorPageSize : 0) +
+                     slab_headers_for_pages(capacity_pages) +
                      VectorPageTable::metadata_bytes_for_entries(entry_num)));
   }
   void TearDown() override {
@@ -154,6 +208,74 @@ class BufferPoolTest : public ::testing::Test {
   }
   std::vector<std::string> files_;
 };
+
+TEST_F(BufferPoolTest, OptionalReadScratchYieldsToPinnedBudget) {
+  constexpr size_t kFilePages = 1033;
+  const size_t page = kVectorPageSize;
+  init_vec_pool(16, kFilePages, false, 16 * page);
+  QueueResidentSampleTestPeer::stop_background();
+  auto &budget = MemoryLimitPool::get_instance();
+  auto pool = std::make_shared<VecBufferPool>(new_file(kFilePages), false);
+  ASSERT_EQ(0, pool->init());
+  VecBufferPoolHandle handle(pool);
+  std::array<block_id_t, 8> ids{0, 1, 2, 3, 4, 5, 6, 7};
+  std::array<char *, 8> pins{};
+  ASSERT_TRUE(handle.acquire_pages(ids.data(), ids.size(), pins.data()));
+  auto release =
+      ScopeGuard::Make([&] { handle.release_pages(ids.data(), ids.size()); });
+
+  // Small real heap allocations consume the remaining native quota without
+  // leaving a reclaimable cache owner or a synthetic accounting-only charge.
+  std::array<BudgetedAlignedBuffer, 32> pressure;
+  for (auto &buffer : pressure) {
+    const size_t bytes = std::min(budget.available(), size_t{128} << 10);
+    buffer.resize(bytes, AILEGO_CACHE_LINE_SIZE);
+    if (bytes) std::memset(buffer.data(), 'p', bytes);
+  }
+  ASSERT_EQ(0u, budget.available());
+  std::vector<char> output(kFilePages * page + page);
+  auto *aligned = reinterpret_cast<char *>(
+      (reinterpret_cast<uintptr_t>(output.data()) + page - 1) & ~(page - 1));
+  struct Read {
+    size_t offset, length, bias;
+  };
+  const Read reads[] = {
+      {8 * page + 1, 4 * page, 1},
+      {8 * page, 4 * page, 0},
+      {9 * page - 3, 9, 1},
+      // Cross the 1024-page bulk-run boundary and finish at EOF.
+      {8 * page + 1, (kFilePages - 8) * page - 1, 1},
+      {kFilePages * page - 3, 3, 1},
+      {kFilePages * page, 0, 0},
+  };
+  const auto before = budget.stats();
+  for (const auto &read : reads) {
+    SCOPED_TRACE(::testing::Message() << read.offset << ':' << read.length);
+    const auto started = std::chrono::steady_clock::now();
+    bool allocation_failed = true;
+    ASSERT_TRUE(handle.read_range(read.offset, read.length, aligned + read.bias,
+                                  allocation_failed));
+    EXPECT_FALSE(allocation_failed);
+    if (read.offset == reads[0].offset && read.length == reads[0].length)
+      RecordProperty("cold_read_ms",
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - started)
+                         .count());
+    // Check before the larger cases so the unfixed implementation fails on
+    // the first 4-page reproduction instead of waiting for a whole file scan.
+    ASSERT_EQ(before.capacity_waits, budget.stats().capacity_waits);
+    for (size_t i = 0; i < read.length; ++i)
+      ASSERT_EQ(static_cast<char>(((read.offset + i) / page) & 0xff),
+                aligned[read.bias + i]);
+  }
+  EXPECT_FALSE(handle.read_range(kFilePages * page + 1, 1, aligned));
+  pool->warmup();
+  pool->prefetch_pages(8, 4, VecBufferPool::kLowPriority);
+  EXPECT_EQ(before.capacity_waits, budget.stats().capacity_waits);
+  for (size_t i = 0; i < pins.size(); ++i) ExpectPageContent(pins[i], ids[i]);
+  for (size_t i = 8; i < kFilePages; ++i)
+    EXPECT_FALSE(pool->is_page_resident(i));
+}
 
 struct SizedCachePayload {
   std::shared_ptr<std::vector<char>> data;
@@ -366,28 +488,36 @@ TEST_F(BufferPoolTest, BulkReadDoesNotAdmitFirstTouchScanUnderPressure) {
   // path while the pool is under pressure.
   char *pinned = pool.acquire_buffer(/*block_id=*/0, 10);
   ASSERT_NE(nullptr, pinned);
+  auto release_pin = ScopeGuard::Make(
+      [&pool] { pool.page_table_.release_block(/*block_id=*/0); });
 
-  std::vector<char> data(4 * kVectorPageSize);
-  ASSERT_TRUE(handle.read_range(kVectorPageSize, data.size(), data.data()));
+  // This test supplies its own destination: align it for Linux O_DIRECT so
+  // reading does not require a second, budgeted page while the only cache
+  // page is pinned. Scope guards also release both resources on ASSERT exit.
+  const size_t bytes = 4 * kVectorPageSize;
+  char *data = static_cast<char *>(File::MemoryMap(bytes, 0));
+  ASSERT_NE(nullptr, data);
+  auto unmap = ScopeGuard::Make([&] { File::MemoryUnmap(data, bytes); });
+  ASSERT_TRUE(handle.read_range(kVectorPageSize, bytes, data));
   for (size_t page = 1; page < kFilePages; ++page) {
-    ExpectPageContent(data.data() + (page - 1) * kVectorPageSize, page);
+    ExpectPageContent(data + (page - 1) * kVectorPageSize, page);
     EXPECT_FALSE(pool.is_page_resident(page));
   }
 
   const auto stats = pool.stats();
   EXPECT_EQ(4u, stats.admission_rejected);
-  pool.page_table_.release_block(/*block_id=*/0);
 }
 
 TEST_F(BufferPoolTest, WritableBypassPreservesDirtyPagesWithoutAdmission) {
-  init_vec_pool(/*capacity_pages=*/1, /*file_pages=*/2, /*writable=*/true);
+  init_vec_pool(/*capacity_pages=*/2, /*file_pages=*/2, /*writable=*/true,
+                sizeof(MemoryLimitPool::WorkspaceBuffer));
   VecBufferPool pool(new_file(/*num_pages=*/2), /*writable=*/true);
   ASSERT_EQ(0, pool.init());
   char *page = pool.acquire_buffer(0, 0);
   ASSERT_NE(nullptr, page);
 
-  // Pin the only page so it cannot be written back or replaced. The second
-  // page must be read from disk without discarding the first page's new bytes.
+  // Pin the dirty page and leave one page for admitted O_DIRECT scratch. The
+  // second page must bypass admission without losing the first page's bytes.
   const std::string changed(64, 'X');
   EXPECT_EQ(0, pool.write_range(kVectorPageSize - changed.size(),
                                 changed.size(), changed.data()));
@@ -413,9 +543,8 @@ TEST_F(BufferPoolTest, WritableBypassJoinsConcurrentLoadBeforeReading) {
   ASSERT_EQ(VectorPageTable::LoadClaimResult::kClaimed,
             pool.page_table_.try_claim_block_load(0));
   char *page = nullptr;
-  ASSERT_TRUE(
-      ::zvec::ailego::PoolPayloadBudget::get_instance().try_acquire_buffer(
-          kVectorPageSize, page));
+  ASSERT_TRUE(PoolPayloadBudget::get_instance().try_acquire_buffer(
+      kVectorPageSize, page));
   std::memset(page, 'Y', kVectorPageSize);
 
   std::atomic<bool> started{false};
@@ -451,14 +580,16 @@ TEST_F(BufferPoolTest, ShortReadDoesNotEvictHotPageOnFirstTouch) {
 
     const size_t reserve = memory_pool.page_admission_reserve();
     ASSERT_EQ(MemoryLimitPool::get_instance().capacity() / 16, reserve);
-    ASSERT_LT(memory_pool.used() + kVectorPageSize, kCapacity - reserve);
-    charged_metadata =
-        kCapacity - reserve - memory_pool.used() - 2 * kVectorPageSize;
-    ASSERT_TRUE(memory_pool.try_charge_metadata(charged_metadata));
-
     char *hot = pool.acquire_buffer(/*block_id=*/0, 10);
     ASSERT_NE(nullptr, hot);
-    pool.page_table_.release_block(/*block_id=*/0);
+    auto release_pin = ScopeGuard::Make(
+        [&] { pool.page_table_.release_block(/*block_id=*/0); });
+    // Isolate foreground first-touch admission from background reclamation.
+    // Use the actual shared quota, including retained allocator metadata.
+    auto &native = MemoryLimitPool::get_instance();
+    ASSERT_GE(native.available(), reserve);
+    charged_metadata = native.available() - reserve;
+    ASSERT_TRUE(memory_pool.try_charge_metadata(charged_metadata));
 
     std::vector<char> data(2 * kVectorPageSize);
     ASSERT_TRUE(handle.read_range(kVectorPageSize, data.size(), data.data()));
@@ -523,11 +654,7 @@ TEST_F(BufferPoolTest, ResidentOnlyAcquirePreservesTransitionStates) {
   pool.page_table_.release_block(/*block_id=*/0);
 }
 
-// ---------------------------------------------------------------------------
-// 1. Data stays correct when the working set far exceeds pool capacity, which
-//    forces the CLOCK evictor to run repeatedly. Also asserts the observability
-//    counters get populated (hits, misses, evictions).
-// ---------------------------------------------------------------------------
+// Reads remain correct across a working set larger than the cache.
 TEST_F(BufferPoolTest, DataCorrectUnderEviction) {
   const size_t num_pages = 64;
   init_vec_pool(/*capacity_pages=*/16,
@@ -575,6 +702,10 @@ TEST_F(BufferPoolTest, PinnedEvictionBecomesReclaimableAfterRelease) {
   handle.release_one(page_id);
   EXPECT_TRUE(pool.page_table_.evict_block(page_id));
   EXPECT_FALSE(pool.page_table_.is_loaded(page_id));
+  page = handle.get_single_page(0, 1, page_id);
+  ASSERT_NE(nullptr, page);
+  ExpectPageContent(page, 0);
+  handle.release_one(page_id);
 }
 
 // A stale eviction item must not become valid again when a later page table
@@ -586,9 +717,8 @@ TEST_F(BufferPoolTest, StaleOwnerGenerationIsDead) {
   ASSERT_TRUE(table.init(/*entry_num=*/1));
 
   char *buffer = nullptr;
-  ASSERT_TRUE(
-      ::zvec::ailego::PoolPayloadBudget::get_instance().try_acquire_buffer(
-          kVectorPageSize, buffer));
+  ASSERT_TRUE(PoolPayloadBudget::get_instance().try_acquire_buffer(
+      kVectorPageSize, buffer));
   ASSERT_EQ(table.set_block_acquired(/*block_id=*/0, buffer, /*offset=*/0),
             buffer);
   table.release_block(/*block_id=*/0);
@@ -619,9 +749,8 @@ TEST_F(BufferPoolTest, ConcurrentInstallPublishesOneResidentBuffer) {
   std::array<char *, kThreadCount> input{};
   std::array<char *, kThreadCount> result{};
   for (char *&buffer : input) {
-    ASSERT_TRUE(
-        ::zvec::ailego::PoolPayloadBudget::get_instance().try_acquire_buffer(
-            kVectorPageSize, buffer));
+    ASSERT_TRUE(PoolPayloadBudget::get_instance().try_acquire_buffer(
+        kVectorPageSize, buffer));
     ASSERT_NE(nullptr, buffer);
   }
 
@@ -652,12 +781,10 @@ TEST_F(BufferPoolTest, ConcurrentInstallPublishesOneResidentBuffer) {
     EXPECT_EQ(result[0], buffer);
     table.release_block(/*block_id=*/0);
   }
-  EXPECT_EQ(
-      kVectorPageSize,
-      ::zvec::ailego::PoolPayloadBudget::get_instance().stats().page_used);
+  EXPECT_EQ(kVectorPageSize,
+            PoolPayloadBudget::get_instance().stats().page_used);
   EXPECT_TRUE(table.force_evict_block(/*block_id=*/0));
-  EXPECT_EQ(
-      0u, ::zvec::ailego::PoolPayloadBudget::get_instance().stats().page_used);
+  EXPECT_EQ(0u, PoolPayloadBudget::get_instance().stats().page_used);
 }
 
 TEST_F(BufferPoolTest, PageLoadClaimCoalescesConcurrentWaiters) {
@@ -699,9 +826,8 @@ TEST_F(BufferPoolTest, PageLoadClaimCoalescesConcurrentWaiters) {
     std::this_thread::yield();
   }
   char *buffer = nullptr;
-  ASSERT_TRUE(
-      ::zvec::ailego::PoolPayloadBudget::get_instance().try_acquire_buffer(
-          kVectorPageSize, buffer));
+  ASSERT_TRUE(PoolPayloadBudget::get_instance().try_acquire_buffer(
+      kVectorPageSize, buffer));
   std::memset(buffer, 0x5a, kVectorPageSize);
   ASSERT_EQ(buffer, table.publish_claimed_block(/*block_id=*/0, buffer,
                                                 /*file_offset=*/0));
@@ -726,8 +852,7 @@ TEST_F(BufferPoolTest, PageLoadClaimCoalescesConcurrentWaiters) {
   }
   EXPECT_FALSE(table.has_residency_activity(/*block_id=*/0));
   EXPECT_FALSE(table.is_loaded(/*block_id=*/0));
-  EXPECT_EQ(
-      0u, ::zvec::ailego::PoolPayloadBudget::get_instance().stats().page_used);
+  EXPECT_EQ(0u, PoolPayloadBudget::get_instance().stats().page_used);
 }
 
 TEST_F(BufferPoolTest, FailedPageLoadClaimCanBeRetried) {
@@ -743,9 +868,8 @@ TEST_F(BufferPoolTest, FailedPageLoadClaimCanBeRetried) {
             table.try_claim_block_load(/*block_id=*/0));
 
   char *buffer = nullptr;
-  ASSERT_TRUE(
-      ::zvec::ailego::PoolPayloadBudget::get_instance().try_acquire_buffer(
-          kVectorPageSize, buffer));
+  ASSERT_TRUE(PoolPayloadBudget::get_instance().try_acquire_buffer(
+      kVectorPageSize, buffer));
   ASSERT_EQ(buffer, table.publish_claimed_block(/*block_id=*/0, buffer,
                                                 /*file_offset=*/0));
   table.release_block(/*block_id=*/0);
@@ -759,9 +883,8 @@ TEST_F(BufferPoolTest, DirtyFlushFailureKeepsPageResident) {
   ASSERT_TRUE(table.init(/*entry_num=*/1));
 
   char *buffer = nullptr;
-  ASSERT_TRUE(
-      ::zvec::ailego::PoolPayloadBudget::get_instance().try_acquire_buffer(
-          kVectorPageSize, buffer));
+  ASSERT_TRUE(PoolPayloadBudget::get_instance().try_acquire_buffer(
+      kVectorPageSize, buffer));
   ASSERT_EQ(table.set_block_acquired(/*block_id=*/0, buffer, /*offset=*/0),
             buffer);
   table.mark_dirty(/*block_id=*/0);
@@ -776,9 +899,8 @@ TEST_F(BufferPoolTest, DirtyFlushFailureKeepsPageResident) {
   EXPECT_EQ(1u, flush_attempts);
   EXPECT_TRUE(table.is_loaded(/*block_id=*/0));
   EXPECT_TRUE(table.is_block_dirty(/*block_id=*/0));
-  EXPECT_EQ(
-      kVectorPageSize,
-      ::zvec::ailego::PoolPayloadBudget::get_instance().stats().page_used);
+  EXPECT_EQ(kVectorPageSize,
+            PoolPayloadBudget::get_instance().stats().page_used);
 
   table.set_flush_callback([&](block_id_t, char *, size_t, size_t) {
     ++flush_attempts;
@@ -789,6 +911,80 @@ TEST_F(BufferPoolTest, DirtyFlushFailureKeepsPageResident) {
   EXPECT_FALSE(table.is_loaded(/*block_id=*/0));
   EXPECT_FALSE(table.is_block_dirty(/*block_id=*/0));
 }
+
+TEST_F(BufferPoolTest, ExplicitFlushRetriesFailedSynchronousEviction) {
+  init_vec_pool(/*capacity_pages=*/16, /*file_pages=*/1, /*writable=*/true);
+  QueueResidentSampleTestPeer::stop_background();
+  const std::string file = new_file(1);
+  std::promise<void> eviction_entered;
+  std::promise<void> resume_eviction;
+  std::promise<void> flush_entered;
+  auto entered = eviction_entered.get_future();
+  auto resume = resume_eviction.get_future();
+  auto flushing = flush_entered.get_future();
+  std::atomic<bool> first_flush{true};
+  VecBufferPool pool(file, /*writable=*/true);
+  ASSERT_EQ(0, pool.init());
+  pool.stop_writeback();
+
+  const char replacement = 'x';
+  ASSERT_EQ(0, pool.write_range(0, 1, &replacement));
+  pool.page_table_.set_flush_callback([&](block_id_t, char *, size_t, size_t) {
+    if (first_flush.exchange(false)) {
+      eviction_entered.set_value();
+      resume.wait();
+    }
+    return -1;
+  });
+  std::future<bool> eviction;
+  std::future<int> flush;
+  bool resumed = false;
+  auto resume_if_needed = ScopeGuard::Make([&] {
+    if (!resumed) resume_eviction.set_value();
+  });
+  eviction = std::async(std::launch::async,
+                        [&] { return pool.page_table_.evict_block(0); });
+  ASSERT_EQ(std::future_status::ready,
+            entered.wait_for(std::chrono::seconds(5)));
+
+  flush = std::async(std::launch::async, [&] {
+    flush_entered.set_value();
+    return pool.flush_all();
+  });
+  ASSERT_EQ(std::future_status::ready,
+            flushing.wait_for(std::chrono::seconds(5)));
+  const auto before_eviction_finishes =
+      flush.wait_for(std::chrono::milliseconds(100));
+  resume_eviction.set_value();
+  resumed = true;
+  EXPECT_EQ(std::future_status::timeout, before_eviction_finishes);
+  EXPECT_FALSE(eviction.get());
+  EXPECT_EQ(0, flush.get());
+  EXPECT_FALSE(pool.page_table_.is_block_dirty(0));
+
+  FILE *input = std::fopen(file.c_str(), "rb");
+  ASSERT_NE(nullptr, input);
+  EXPECT_EQ(replacement, std::fgetc(input));
+  std::fclose(input);
+}
+
+#if defined(__linux__) && !defined(__ANDROID__)
+TEST_F(BufferPoolTest, OptionalWritebackRingLeavesRoomForData) {
+  if (current_io_backend_type() != IOBackendType::kIoUring) {
+    GTEST_SKIP() << "io_uring unavailable";
+  }
+  const size_t fixed = VecBufferPool::metadata_bytes_for_page_count(1, true);
+  const size_t optional = VecBufferPool::kWritebackBatchPages * kVectorPageSize;
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(fixed + optional));
+  const std::string path = new_file(1);
+  VecBufferPool pool(path, true);
+  ASSERT_EQ(0, pool.init());
+  EXPECT_EQ(0u, pool.stats().writeback_io_staging_bytes);
+  const char marker = 'w';
+  EXPECT_EQ(0, pool.write_range(0, 1, &marker));
+  EXPECT_EQ(0, pool.flush_all());
+}
+#endif
 
 TEST_F(BufferPoolTest, ConcurrentWritablePressureUsesBackgroundWriteback) {
   constexpr size_t kFilePages = 64;
@@ -846,7 +1042,7 @@ TEST_F(BufferPoolTest, ConcurrentWritablePressureUsesBackgroundWriteback) {
     EXPECT_EQ(0u, final_stats.writeback_pending);
     EXPECT_GT(final_stats.evict, 0u);
 #if defined(__linux__)
-    if (current_io_backend_type() == IOBackendType::kIoUring) {
+    if (final_stats.writeback_io_staging_bytes) {
       EXPECT_GT(final_stats.writeback_aio_batches, 0u);
       EXPECT_GT(final_stats.writeback_aio_pages, 0u);
       EXPECT_EQ(0u, final_stats.writeback_aio_fallbacks);
@@ -889,9 +1085,8 @@ TEST_F(BufferPoolTest, RecoversDirtyPageAfterQueueRegistrationFailure) {
   });
 
   char *buffer = nullptr;
-  ASSERT_TRUE(
-      ::zvec::ailego::PoolPayloadBudget::get_instance().try_acquire_buffer(
-          kVectorPageSize, buffer));
+  ASSERT_TRUE(PoolPayloadBudget::get_instance().try_acquire_buffer(
+      kVectorPageSize, buffer));
   ASSERT_EQ(table.set_block_acquired(/*block_id=*/0, buffer, /*offset=*/0),
             buffer);
   table.mark_dirty(/*block_id=*/0);
@@ -913,15 +1108,16 @@ TEST_F(BufferPoolTest, RecoversDirtyPageAfterQueueRegistrationFailure) {
   EXPECT_EQ(1u, queue.batch_recycle(1));
   EXPECT_EQ(2u, flush_attempts);
   EXPECT_FALSE(table.is_loaded(/*block_id=*/0));
-  EXPECT_EQ(
-      0u, ::zvec::ailego::PoolPayloadBudget::get_instance().stats().page_used);
+  EXPECT_EQ(0u, PoolPayloadBudget::get_instance().stats().page_used);
 }
 
 TEST_F(BufferPoolTest, DestructionWaitsForInFlightEvictionBeforeFreeingPages) {
-  init_vec_pool(/*capacity_pages=*/512, /*file_pages=*/1);
+  init_vec_pool(/*capacity_pages=*/512, /*file_pages=*/1, /*writable=*/true);
   QueueResidentSampleTestPeer::stop_background();
-  auto pool = std::make_unique<VecBufferPool>(new_file(1));
+  auto pool = std::make_unique<VecBufferPool>(new_file(1), /*writable=*/true);
   ASSERT_EQ(0, pool->init());
+  // Exercise a synchronous flush inside eviction, with its owner still held.
+  pool->page_table_.set_writeback_callback({});
   const block_id_t page_id = 0;
   char *page = nullptr;
   ASSERT_TRUE(pool->acquire_pages(&page_id, 1, &page));
@@ -978,22 +1174,21 @@ TEST_F(BufferPoolTest, MetadataIsCountedAndReleasedWithPool) {
   {
     VecBufferPool pool(file, /*writable=*/false);
     ASSERT_EQ(pool.init(), 0);
-    const auto stats =
-        ::zvec::ailego::PoolPayloadBudget::get_instance().stats();
+    const auto stats = PoolPayloadBudget::get_instance().stats();
     EXPECT_EQ(expected_metadata, stats.metadata_used);
     EXPECT_EQ(expected_metadata, stats.used);
     EXPECT_EQ(0u, stats.page_used);
   }
 
-  const auto stats = ::zvec::ailego::PoolPayloadBudget::get_instance().stats();
+  const auto stats = PoolPayloadBudget::get_instance().stats();
   EXPECT_EQ(0u, stats.metadata_used);
   EXPECT_EQ(0u, stats.used);
 }
 
 TEST_F(BufferPoolTest, FixedMetadataStaysCompactAndReadOnlyAvoidsPageLocks) {
   constexpr size_t kOneSegmentPages = 16UL * 1024UL;
-  const size_t page_table_bytes =
-      VectorPageTable::metadata_bytes_for_entries(kOneSegmentPages);
+  const size_t page_table_bytes = VectorPageTable::metadata_bytes_for_entries(
+      kOneSegmentPages, false, true);
   const size_t read_only_bytes =
       VecBufferPool::metadata_bytes_for_page_count(kOneSegmentPages);
   const size_t writable_bytes = VecBufferPool::metadata_bytes_for_page_count(
@@ -1001,43 +1196,77 @@ TEST_F(BufferPoolTest, FixedMetadataStaysCompactAndReadOnlyAvoidsPageLocks) {
 
   EXPECT_EQ(page_table_bytes, read_only_bytes);
   EXPECT_LT(read_only_bytes, 1UL * 1024UL * 1024UL);
-  size_t expected_writable_bytes =
-      VecBufferPool::kMutexBucketCount * sizeof(std::shared_mutex) +
+  const size_t expected_writable_bytes =
+      BudgetedMappedBuffer::mapping_size(VecBufferPool::kMutexBucketCount *
+                                         sizeof(std::shared_mutex)) +
       VecBufferPool::kWritebackBatchPages * kVectorPageSize;
-#if defined(__linux__)
-  if (current_io_backend_type() == IOBackendType::kIoUring) {
-    expected_writable_bytes +=
-        VecBufferPool::kWritebackBatchPages * kVectorPageSize;
-  }
-#endif
-  EXPECT_EQ(expected_writable_bytes, writable_bytes - read_only_bytes);
+  EXPECT_EQ(expected_writable_bytes +
+                VectorPageTable::metadata_bytes_for_entries(kOneSegmentPages),
+            writable_bytes);
 
   init_vec_pool(/*capacity_pages=*/1, /*file_pages=*/1);
   std::string file = new_file(/*num_pages=*/1);
   VecBufferPool pool(file, /*writable=*/false);
   ASSERT_EQ(pool.init(), 0);
   const auto stats = pool.stats();
-  EXPECT_EQ(VectorPageTable::metadata_bytes_for_entries(1),
+  EXPECT_EQ(VectorPageTable::metadata_bytes_for_entries(1, false, true),
             stats.page_table_metadata_bytes);
   EXPECT_EQ(0u, stats.page_lock_metadata_bytes);
+}
+
+TEST_F(BufferPoolTest, ReadOnlyMetadataReloadKeepsOneLoadedLinkAcrossSegments) {
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(16UL << 20));
+  constexpr size_t count = 16384 + 3;
+  VectorPageTable table;
+  ASSERT_TRUE(table.init(count, false, true));
+  EXPECT_FALSE(table.extend(count + 1));
+  EXPECT_FALSE(table.init(count, false, false));
+  const size_t cold = table.metadata_bytes();
+  EXPECT_LT(cold, VectorPageTable::metadata_bytes_for_entries(count, false));
+  size_t flushes = 0;
+  table.set_flush_callback([&](block_id_t, char *, size_t, size_t) {
+    ++flushes;
+    return 0;
+  });
+  const block_id_t ids[]{0, 16383, 16384, count - 1};
+  for (size_t pass = 0; pass < 4; ++pass) {
+    for (auto id : ids) {
+      char *buffer = nullptr;
+      ASSERT_TRUE(MemoryLimitPool::get_instance().try_acquire_buffer(
+          kVectorPageSize, buffer));
+      std::memset(buffer, static_cast<int>(id & 255), kVectorPageSize);
+      ASSERT_EQ(buffer,
+                table.set_block_acquired(id, buffer, id * kVectorPageSize));
+      EXPECT_TRUE(table.is_ever_loaded(id));
+      table.mark_dirty(id);
+      EXPECT_FALSE(table.is_block_dirty(id));
+      EXPECT_FALSE(table.try_mark_writeback_pending(id));
+      EXPECT_EQ(0, table.flush_block(id));
+      table.release_block(id);
+    }
+    const auto residents = table.resident_pages_by_priority();
+    EXPECT_EQ(4u,
+              std::accumulate(residents.begin(), residents.end(), size_t{0}));
+    table.force_evict_all_loaded();
+    for (auto id : ids) EXPECT_FALSE(table.is_loaded(id));
+    EXPECT_FALSE(table.is_ever_loaded(1));
+  }
+  EXPECT_EQ(0u, flushes);
 }
 
 TEST_F(BufferPoolTest, EmptyPageTableChargesDirectoryOnFirstExtend) {
   const size_t first_segment_bytes =
       VectorPageTable::metadata_bytes_for_entries(1);
-  ASSERT_EQ(0, ::zvec::ailego::PoolPayloadBudget::get_instance().init(
-                   first_segment_bytes));
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(first_segment_bytes));
 
   VectorPageTable table;
   ASSERT_TRUE(table.init(/*entry_num=*/0));
-  EXPECT_EQ(0u,
-            ::zvec::ailego::PoolPayloadBudget::get_instance().metadata_used());
+  EXPECT_EQ(0u, PoolPayloadBudget::get_instance().metadata_used());
   ASSERT_TRUE(table.extend(/*new_entry_num=*/1));
   EXPECT_EQ(first_segment_bytes,
-            ::zvec::ailego::PoolPayloadBudget::get_instance().metadata_used());
+            PoolPayloadBudget::get_instance().metadata_used());
   ASSERT_TRUE(table.rollback_extend(/*old_entry_num=*/0));
-  EXPECT_EQ(0u,
-            ::zvec::ailego::PoolPayloadBudget::get_instance().metadata_used());
+  EXPECT_EQ(0u, PoolPayloadBudget::get_instance().metadata_used());
 }
 
 TEST_F(BufferPoolTest, WritablePoolReportsPageLockMetadata) {
@@ -1047,15 +1276,15 @@ TEST_F(BufferPoolTest, WritablePoolReportsPageLockMetadata) {
   ASSERT_EQ(pool.init(), 0);
 
   const auto stats = pool.stats();
-  EXPECT_EQ(VecBufferPool::kMutexBucketCount * sizeof(std::shared_mutex),
+  EXPECT_EQ(BudgetedMappedBuffer::mapping_size(
+                VecBufferPool::kMutexBucketCount * sizeof(std::shared_mutex)),
             stats.page_lock_metadata_bytes);
   EXPECT_EQ(VecBufferPool::kWritebackBatchPages * kVectorPageSize,
             stats.writeback_staging_bytes);
   EXPECT_EQ(VecBufferPool::metadata_bytes_for_page_count(
                 /*page_count=*/1, /*writable=*/true),
             stats.page_table_metadata_bytes + stats.page_lock_metadata_bytes +
-                stats.writeback_staging_bytes +
-                stats.writeback_io_staging_bytes);
+                stats.writeback_staging_bytes);
 }
 
 TEST_F(BufferPoolTest, FailedPageTableExtendLeavesStateUnchanged) {
@@ -1064,12 +1293,72 @@ TEST_F(BufferPoolTest, FailedPageTableExtendLeavesStateUnchanged) {
   VectorPageTable table;
   ASSERT_TRUE(table.init(/*entry_num=*/1));
   const size_t metadata_before =
-      ::zvec::ailego::PoolPayloadBudget::get_instance().metadata_used();
+      PoolPayloadBudget::get_instance().metadata_used();
 
   EXPECT_FALSE(table.extend(kSecondSegmentEntry));
   EXPECT_EQ(1u, table.entry_num());
-  EXPECT_EQ(metadata_before,
-            ::zvec::ailego::PoolPayloadBudget::get_instance().metadata_used());
+  EXPECT_EQ(metadata_before, PoolPayloadBudget::get_instance().metadata_used());
+}
+
+TEST_F(BufferPoolTest, FailedFileGrowthDoesNotPublishTableEntries) {
+  constexpr size_t kSecondSegmentEntry = 16UL * 1024UL + 1;
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(16UL << 20));
+  VectorPageTable table;
+  ASSERT_TRUE(table.init(1));
+
+  const size_t initial_metadata =
+      PoolPayloadBudget::get_instance().metadata_used();
+  size_t attempts = 0;
+  const auto extend = [&](bool resized) {
+    return VectorPageTableTestPeer::extend_after_commit(
+        table, kSecondSegmentEntry, [&] {
+          ++attempts;
+          EXPECT_EQ(1u, table.entry_num());
+          EXPECT_FALSE(table.is_loaded(0));
+          return resized;
+        });
+  };
+  EXPECT_EQ(PageWriteStatus::kError, extend(false));
+  EXPECT_EQ(1u, table.entry_num());
+  EXPECT_EQ(initial_metadata,
+            PoolPayloadBudget::get_instance().metadata_used());
+
+  EXPECT_EQ(PageWriteStatus::kOk, extend(true));
+  EXPECT_EQ(2u, attempts);
+  EXPECT_EQ(kSecondSegmentEntry, table.entry_num());
+  EXPECT_FALSE(table.is_loaded(kSecondSegmentEntry - 1));
+}
+
+TEST_F(BufferPoolTest, ConcurrentExtendsPublishReadableFileSize) {
+  constexpr size_t pages = 64;
+  init_vec_pool(4, pages, true);
+  VecBufferPool pool(new_file(1), true);
+  ASSERT_EQ(0, pool.init());
+  std::atomic<unsigned> ready{0};
+  std::atomic<bool> ok{true};
+  auto grow = [&](size_t first) {
+    ready.fetch_add(1);
+    while (ready.load() != 2) std::this_thread::yield();
+    for (size_t i = first; i <= pages; i += 2) {
+      if (!pool.extend_file(i * kVectorPageSize)) {
+        ok.store(false);
+        break;
+      }
+      char byte;
+      const size_t extent = pool.file_size();
+      if (extent < i * kVectorPageSize ||
+          pool.get_meta(extent - 1, 1, &byte) != 0) {
+        ok.store(false);
+        break;
+      }
+    }
+  };
+  std::thread odd(grow, 3);
+  grow(2);
+  odd.join();
+  EXPECT_TRUE(ok.load());
+  EXPECT_EQ(pages * kVectorPageSize, pool.file_size());
+  EXPECT_EQ(pages, pool.page_table_.entry_num());
 }
 
 TEST_F(BufferPoolTest, FailedFileExtendDoesNotGrowBackingFile) {
@@ -1081,7 +1370,8 @@ TEST_F(BufferPoolTest, FailedFileExtendDoesNotGrowBackingFile) {
   ASSERT_EQ(pool.init(), 0);
   const size_t old_size = pool.file_size();
   const size_t old_entries = pool.page_table_.entry_num();
-  EXPECT_FALSE(pool.extend_file(kSecondSegmentEntry * kVectorPageSize));
+  EXPECT_EQ(PageWriteStatus::kNoMemory,
+            pool.extend_file_status(kSecondSegmentEntry * kVectorPageSize));
   EXPECT_EQ(old_size, pool.file_size());
   EXPECT_EQ(old_entries, pool.page_table_.entry_num());
 
@@ -1093,8 +1383,8 @@ TEST_F(BufferPoolTest, FailedFileExtendDoesNotGrowBackingFile) {
 }
 
 TEST_F(BufferPoolTest, ExternalReservationSharesThePageBudget) {
-  auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
-  init_page_pool(/*capacity_pages=*/4);
+  auto &memory_pool = PoolPayloadBudget::get_instance();
+  init_pool(/*capacity_pages=*/4);
 
   ASSERT_TRUE(memory_pool.try_charge_external(3 * kVectorPageSize));
   EXPECT_EQ(3 * kVectorPageSize, memory_pool.used());
@@ -1116,7 +1406,7 @@ TEST_F(BufferPoolTest, ExternalReservationSharesThePageBudget) {
 }
 
 TEST_F(BufferPoolTest, PageAdmissionLeavesRoomForExternalCache) {
-  auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
+  auto &memory_pool = PoolPayloadBudget::get_instance();
   constexpr size_t kCapacity = 512UL * 1024UL * 1024UL;
   ASSERT_EQ(0, memory_pool.init(kCapacity));
   const size_t reserve = memory_pool.page_admission_reserve();
@@ -1134,7 +1424,7 @@ TEST_F(BufferPoolTest, PageAdmissionLeavesRoomForExternalCache) {
 }
 
 TEST_F(BufferPoolTest, ReadOnlyMissEvictsAtPageAdmissionLimit) {
-  auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
+  auto &memory_pool = PoolPayloadBudget::get_instance();
   constexpr size_t kCapacity = 256UL * 1024UL * 1024UL;
   ASSERT_EQ(0, memory_pool.init(kCapacity));
   const size_t reserve = memory_pool.page_admission_reserve();
@@ -1174,7 +1464,7 @@ TEST_F(BufferPoolTest, ReadOnlyMissEvictsAtPageAdmissionLimit) {
 }
 
 TEST_F(BufferPoolTest, TinyBufferDoesNotPoisonThePageFreeList) {
-  auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
+  auto &memory_pool = PoolPayloadBudget::get_instance();
   ASSERT_EQ(0, memory_pool.init(3 * kVectorPageSize + 123));
 
   char *tiny = nullptr;
@@ -1191,7 +1481,7 @@ TEST_F(BufferPoolTest, TinyBufferDoesNotPoisonThePageFreeList) {
 }
 
 TEST_F(BufferPoolTest, RejectsReinitializationWhileMemoryIsActive) {
-  auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
+  auto &memory_pool = PoolPayloadBudget::get_instance();
   init_pool(/*capacity_pages=*/4);
   const size_t original_capacity = memory_pool.capacity();
 
@@ -1210,7 +1500,7 @@ TEST_F(BufferPoolTest, RejectsReinitializationWhileMemoryIsActive) {
 
 TEST_F(BufferPoolTest, ExternalCacheRejectsOversizedEntryAndReleasesOnDestroy) {
   auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
-  init_pool(/*capacity_pages=*/2);
+  ASSERT_EQ(0, memory_pool.init(2 * kVectorPageSize));
 
   {
     SizedExternalCache cache;
@@ -1417,7 +1707,7 @@ TEST_F(BufferPoolTest, DistinctExternalCacheLoadsRespectInflightLimit) {
 }
 
 TEST_F(BufferPoolTest, WaitingExternalLoadRechecksCapacityBeforeLoading) {
-  init_pool(/*capacity_pages=*/1);
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(kVectorPageSize));
   auto state = std::make_shared<BlockingLoadState>();
   BlockingExternalCache cache(BlockingLoader{state},
                               /*max_concurrent_loads=*/1);
@@ -1488,7 +1778,28 @@ TEST_F(BufferPoolTest, BatchRecycleBoundsStaleQueueScanning) {
   }
 
   EXPECT_EQ(0u, queue.batch_recycle(1));
-  EXPECT_EQ(20u, owner.dead_checks);
+  // A one-item reclaim has 20 attempts split across the occupied tiers.
+  constexpr size_t kAttempts = 20;
+  EXPECT_EQ(kAttempts, owner.dead_checks);
+  EXPECT_EQ(64u - kAttempts, queue.stats().approximate_queue_sizes[0]);
+  while (queue.evict_single_block(discarded)) {
+  }
+  owner.dead_checks = 0;
+  for (size_t priority = 0; priority < BlockEvictionQueue::kQueueCount;
+       ++priority) {
+    for (size_t i = 0; i < 64; ++i) {
+      stale.owner_key = priority * 64 + i;
+      ASSERT_TRUE(queue.add_single_block(stale, static_cast<int>(priority)));
+    }
+  }
+  EXPECT_EQ(0u, queue.batch_recycle(1));
+  constexpr size_t kPerTierAttempts =
+      kAttempts / BlockEvictionQueue::kQueueCount;
+  EXPECT_EQ(kPerTierAttempts * BlockEvictionQueue::kQueueCount,
+            owner.dead_checks);
+  for (auto remaining : queue.stats().approximate_queue_sizes) {
+    EXPECT_EQ(64u - kPerTierAttempts, remaining);
+  }
 
   queue.set_invalid(&owner);
   while (queue.evict_single_block(discarded)) {
@@ -1565,8 +1876,8 @@ TEST_F(BufferPoolTest, ExternalCacheUsesExplicitHotEvictionPriority) {
 
 TEST_F(BufferPoolTest, ExternalReservationTrimsRetainedPageBuffers) {
   constexpr size_t kCapacityPages = 4;
-  auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
-  init_page_pool(kCapacityPages);
+  auto &memory_pool = PoolPayloadBudget::get_instance();
+  init_pool(kCapacityPages);
 
   std::vector<char *> pages;
   for (size_t i = 0; i < kCapacityPages; ++i) {
@@ -1578,7 +1889,7 @@ TEST_F(BufferPoolTest, ExternalReservationTrimsRetainedPageBuffers) {
     memory_pool.release_buffer(page, kVectorPageSize);
   }
 
-  MemoryLimitPool::PoolStats cached = memory_pool.stats();
+  PoolPayloadBudget::PoolStats cached = memory_pool.stats();
   EXPECT_EQ(0u, cached.used);
   EXPECT_EQ(kCapacityPages * kVectorPageSize, cached.committed);
   EXPECT_EQ(kCapacityPages, cached.free_buffers);
@@ -1587,7 +1898,7 @@ TEST_F(BufferPoolTest, ExternalReservationTrimsRetainedPageBuffers) {
 
   ASSERT_TRUE(
       memory_pool.try_charge_external(kCapacityPages * kVectorPageSize));
-  MemoryLimitPool::PoolStats charged = memory_pool.stats();
+  PoolPayloadBudget::PoolStats charged = memory_pool.stats();
   EXPECT_EQ(kCapacityPages * kVectorPageSize, charged.used);
   EXPECT_EQ(kCapacityPages * kVectorPageSize, charged.committed);
   EXPECT_EQ(0u, charged.page_used);
@@ -1619,7 +1930,7 @@ TEST_F(BufferPoolTest, ExternalReservationTrimsRetainedPageBuffers) {
 TEST_F(BufferPoolTest, LargeExternalReservationReclaimsMultipleBatches) {
   constexpr size_t kCapacityPages = 512;
   constexpr size_t kExternalPages = 400;
-  auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
+  auto &memory_pool = PoolPayloadBudget::get_instance();
   init_vec_pool(kCapacityPages, /*file_pages=*/kCapacityPages);
   std::string file = new_file(kCapacityPages);
 
@@ -1731,8 +2042,7 @@ TEST_F(BufferPoolTest, ReusedReadOnlyPagePromotesAfterPressure) {
             handle.get_single_page(0, kVectorPageSize, pinned_page_id));
   auto release_pin = ScopeGuard::Make(
       [&handle, pinned_page_id] { handle.release_one(pinned_page_id); });
-  ASSERT_TRUE(
-      ::zvec::ailego::PoolPayloadBudget::get_instance().under_cache_pressure());
+  ASSERT_TRUE(PoolPayloadBudget::get_instance().under_cache_pressure());
 
   // Reuse promotion is sampled under pressure. Any run of 16 hits contains a
   // policy sample regardless of the thread-local cursor's starting phase.
@@ -1756,9 +2066,8 @@ TEST_F(BufferPoolTest, ProtectedPageAgesThroughProbationBeforeEviction) {
   ASSERT_TRUE(table.init(/*entry_num=*/1));
 
   char *buffer = nullptr;
-  ASSERT_TRUE(
-      ::zvec::ailego::PoolPayloadBudget::get_instance().try_acquire_buffer(
-          kVectorPageSize, buffer));
+  ASSERT_TRUE(PoolPayloadBudget::get_instance().try_acquire_buffer(
+      kVectorPageSize, buffer));
   ASSERT_EQ(buffer,
             table.set_block_acquired(/*block_id=*/0, buffer, /*offset=*/0));
   table.release_block(/*block_id=*/0);
@@ -1792,9 +2101,8 @@ TEST_F(BufferPoolTest, EvictedHotPageGetsProtectedGhostAdmission) {
   ASSERT_TRUE(table.init(/*entry_num=*/1));
 
   char *buffer = nullptr;
-  ASSERT_TRUE(
-      ::zvec::ailego::PoolPayloadBudget::get_instance().try_acquire_buffer(
-          kVectorPageSize, buffer));
+  ASSERT_TRUE(PoolPayloadBudget::get_instance().try_acquire_buffer(
+      kVectorPageSize, buffer));
   ASSERT_EQ(buffer,
             table.set_block_acquired(/*block_id=*/0, buffer, /*offset=*/0));
   table.release_block(/*block_id=*/0);
@@ -1807,9 +2115,8 @@ TEST_F(BufferPoolTest, EvictedHotPageGetsProtectedGhostAdmission) {
   ASSERT_EQ(1u, table.stats().ghost_hot_marks);
 
   char *reloaded = nullptr;
-  ASSERT_TRUE(
-      ::zvec::ailego::PoolPayloadBudget::get_instance().try_acquire_buffer(
-          kVectorPageSize, reloaded));
+  ASSERT_TRUE(PoolPayloadBudget::get_instance().try_acquire_buffer(
+      kVectorPageSize, reloaded));
   ASSERT_EQ(reloaded, table.set_block_acquired(/*block_id=*/0, reloaded,
                                                /*offset=*/0));
   EXPECT_EQ(VectorPageTable::kNormalPriority,
@@ -1827,9 +2134,8 @@ TEST_F(BufferPoolTest, UnusedGhostAdmissionDoesNotRenewItself) {
 
   auto load_page = [&table] {
     char *buffer = nullptr;
-    EXPECT_TRUE(
-        ::zvec::ailego::PoolPayloadBudget::get_instance().try_acquire_buffer(
-            kVectorPageSize, buffer));
+    EXPECT_TRUE(PoolPayloadBudget::get_instance().try_acquire_buffer(
+        kVectorPageSize, buffer));
     if (buffer == nullptr) return false;
     char *installed =
         table.set_block_acquired(/*block_id=*/0, buffer, /*offset=*/0);
@@ -1870,9 +2176,8 @@ TEST_F(BufferPoolTest, ReusedGhostAdmissionRenewsHotHistory) {
 
   auto load_page = [&table] {
     char *buffer = nullptr;
-    EXPECT_TRUE(
-        ::zvec::ailego::PoolPayloadBudget::get_instance().try_acquire_buffer(
-            kVectorPageSize, buffer));
+    EXPECT_TRUE(PoolPayloadBudget::get_instance().try_acquire_buffer(
+        kVectorPageSize, buffer));
     if (buffer == nullptr) return false;
     char *installed =
         table.set_block_acquired(/*block_id=*/0, buffer, /*offset=*/0);
@@ -2091,11 +2396,14 @@ TEST_F(BufferPoolTest, BatchAcquireScatteredPagesWithDuplicates) {
 TEST_F(BufferPoolTest, ConcurrentBatchLoadsPopulateEachPageOnce) {
   static constexpr size_t kPageCount = 128;
   constexpr size_t kThreadCount = 8;
-  init_vec_pool(/*capacity_pages=*/512, /*file_pages=*/kPageCount);
   std::string file = new_file(kPageCount);
+  // SetUp leaves a zero-capacity pool. Producers can reuse old queue blocks
+  // there, but allocating a new producer must wait for a real warmup budget.
+  init_vec_pool(/*capacity_pages=*/4096, /*file_pages=*/kPageCount);
+  ASSERT_FALSE(HasFatalFailure());
 
   VecBufferPool pool(file, /*writable=*/false);
-  ASSERT_EQ(pool.init(), 0);
+  // The handle only references the pool; workers wait until init completes.
   auto handle = pool.get_handle();
   std::array<block_id_t, kPageCount> page_ids{};
   for (size_t i = 0; i < kPageCount; ++i) {
@@ -2103,41 +2411,70 @@ TEST_F(BufferPoolTest, ConcurrentBatchLoadsPopulateEachPageOnce) {
   }
 
   std::atomic<size_t> ready{0};
+  std::atomic<size_t> warmed{0};
   std::atomic<bool> start{false};
+  std::atomic<bool> cancelled{false};
   std::atomic<size_t> succeeded{0};
+  std::atomic<size_t> loaded{0};
   std::array<std::thread, kThreadCount> workers;
+  auto join_workers = ScopeGuard::Make([&] {
+    cancelled.store(true, std::memory_order_release);
+    start.store(true, std::memory_order_release);
+    for (auto &worker : workers)
+      if (worker.joinable()) worker.join();
+  });
   for (auto &worker : workers) {
     worker = std::thread([&] {
       std::array<char *, kPageCount> pages{};
+      bool producer_ready = true;
+      auto &queue = BlockEvictionQueue::get_instance();
+      for (size_t i = 0; i < BlockEvictionQueue::kQueueCount; ++i)
+        producer_ready =
+            queue.add_single_block({}, static_cast<int>(i)) && producer_ready;
+      if (producer_ready) warmed.fetch_add(1, std::memory_order_release);
       ready.fetch_add(1, std::memory_order_release);
       while (!start.load(std::memory_order_acquire)) {
         std::this_thread::yield();
       }
-      if (!handle.acquire_pages(page_ids.data(), page_ids.size(),
-                                pages.data())) {
-        return;
+      if (cancelled.load(std::memory_order_acquire)) return;
+      const bool acquired =
+          handle.acquire_pages(page_ids.data(), page_ids.size(), pages.data());
+      if (acquired) {
+        bool valid = true;
+        for (size_t i = 0; i < kPageCount; ++i) {
+          valid = valid && pages[i] != nullptr &&
+                  pages[i][0] == static_cast<char>(i & 0xff);
+        }
+        if (valid) succeeded.fetch_add(1, std::memory_order_release);
       }
-      bool valid = true;
-      for (size_t i = 0; i < kPageCount; ++i) {
-        valid = valid && pages[i] != nullptr &&
-                pages[i][0] == static_cast<char>(i & 0xff);
+      loaded.fetch_add(1, std::memory_order_release);
+      // Keep the shared pages pinned until every caller has finished loading.
+      // Eviction after an early release is valid, but not a single-flight bug.
+      while (loaded.load(std::memory_order_acquire) != kThreadCount) {
+        std::this_thread::yield();
       }
-      if (valid) {
-        succeeded.fetch_add(1, std::memory_order_release);
-      }
-      handle.release_pages(page_ids.data(), page_ids.size());
+      if (acquired) handle.release_pages(page_ids.data(), page_ids.size());
     });
   }
   while (ready.load(std::memory_order_acquire) != kThreadCount) {
     std::this_thread::yield();
   }
+  ASSERT_EQ(kThreadCount, warmed.load(std::memory_order_acquire));
+  // Include all live producers in the queue baseline before assigning the
+  // payload allowance. Otherwise lazy producer registration can evict the
+  // first batch between population and pinning, which is valid cache pressure.
+  init_vec_pool(/*capacity_pages=*/4096, /*file_pages=*/kPageCount);
+  ASSERT_FALSE(HasFatalFailure());
+  ASSERT_EQ(pool.init(), 0);
   start.store(true, std::memory_order_release);
   for (auto &worker : workers) {
     worker.join();
   }
 
   EXPECT_EQ(kThreadCount, succeeded.load(std::memory_order_acquire));
-  EXPECT_EQ(kPageCount, pool.stats().miss);
+  const auto stats = pool.stats();
+  EXPECT_EQ(kPageCount, stats.miss);
+  EXPECT_EQ(0u, stats.evict);
 }
 
 TEST_F(BufferPoolTest, BatchMissesRemainProbationUntilLaterReuse) {
@@ -2166,8 +2503,7 @@ TEST_F(BufferPoolTest, BatchMissesRemainProbationUntilLaterReuse) {
   // later sampled reuse promotion.
   auto release_pin = ScopeGuard::Make(
       [&handle, &page_ids] { handle.release_pages(page_ids, 1); });
-  ASSERT_TRUE(
-      ::zvec::ailego::PoolPayloadBudget::get_instance().under_cache_pressure());
+  ASSERT_TRUE(PoolPayloadBudget::get_instance().under_cache_pressure());
   EXPECT_EQ(VecBufferPool::kLowPriority, pool.page_table_.eviction_priority(1));
 
   for (size_t i = 0; i < 16; ++i) {
@@ -2193,6 +2529,31 @@ TEST_F(BufferPoolTest, BatchAcquireRollsBackPinsOnInvalidPage) {
   EXPECT_EQ(pages[1], nullptr);
   EXPECT_TRUE(pool.page_table_.is_released(1));
 }
+
+#if defined(__APPLE__)
+TEST_F(BufferPoolTest, DarwinBypassRetriesShortBatchWithCrossPageRange) {
+  init_vec_pool(/*capacity_pages=*/16, /*file_pages=*/4);
+  const std::string file = new_file(/*num_pages=*/4);
+  VecBufferPool pool(file, /*writable=*/false);
+  ASSERT_EQ(0, pool.init());
+  std::array<char, 71> short_read{}, cross_page{};
+  cross_page.fill('X');
+  const VecBufferPool::ReadRange ranges[] = {
+      {3 * kVectorPageSize, short_read.size(), short_read.data()},
+      {kVectorPageSize - 17, cross_page.size(), cross_page.data()}};
+  ASSERT_EQ(0, ::truncate(file.c_str(), 3 * kVectorPageSize));
+  EXPECT_FALSE(pool.read_ranges_bypass(ranges, 2));
+  EXPECT_EQ(std::string(cross_page.size(), 'X'),
+            std::string(cross_page.data(), cross_page.size()));
+  ASSERT_EQ(0, ::truncate(file.c_str(), 4 * kVectorPageSize));
+  ASSERT_TRUE(pool.read_ranges_bypass(ranges, 2));
+  EXPECT_EQ(std::string(short_read.size(), '\0'),
+            std::string(short_read.data(), short_read.size()));
+  EXPECT_EQ(std::string(17, '\0') + std::string(cross_page.size() - 17, '\1'),
+            std::string(cross_page.data(), cross_page.size()));
+}
+
+#endif
 
 // ---------------------------------------------------------------------------
 // 2. Re-touching a small hot set under memory pressure should trigger the CLOCK
@@ -2275,7 +2636,7 @@ TEST_F(BufferPoolTest, BackgroundReclaimsToLowWatermark) {
         handle.read_range(p * kVectorPageSize, kVectorPageSize, buf.data()));
   }
 
-  auto &mp = ::zvec::ailego::PoolPayloadBudget::get_instance();
+  auto &mp = PoolPayloadBudget::get_instance();
   const size_t low = cap_pages * kVectorPageSize / 4 * 3;  // 75% page budget
   // Poll up to ~2s for the background thread to reclaim down to the low mark.
   for (int i = 0; i < 200 && mp.stats().page_used > low + kVectorPageSize;
@@ -2370,7 +2731,7 @@ TEST_F(BufferPoolTest, BackgroundBacksOffWhenAllPagesArePinned) {
     ASSERT_NE(nullptr, pinned[page]);
   }
 
-  auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
+  auto &memory_pool = PoolPayloadBudget::get_instance();
   const uint64_t sleeps_before = memory_pool.stats().bg_no_progress_sleeps;
   for (int i = 0;
        i < 200 && memory_pool.stats().bg_no_progress_sleeps == sleeps_before;
@@ -2428,12 +2789,12 @@ TEST_F(BufferPoolTest, ConcurrentRandomReads) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Sharded MemoryLimitPool: allocate/free correctness and stats accounting.
+// 5. Sharded PoolPayloadBudget: allocate/free correctness and stats accounting.
 // ---------------------------------------------------------------------------
 TEST_F(BufferPoolTest, ShardedPoolAllocFreeAccounting) {
   const size_t cap_pages = 32;
-  init_page_pool(cap_pages);
-  auto &mp = ::zvec::ailego::PoolPayloadBudget::get_instance();
+  init_pool(cap_pages);
+  auto &mp = PoolPayloadBudget::get_instance();
 
   std::vector<char *> bufs;
   // Acquire up to capacity.
@@ -2454,18 +2815,18 @@ TEST_F(BufferPoolTest, ShardedPoolAllocFreeAccounting) {
   EXPECT_EQ(mp.committed(), cap_pages * kVectorPageSize);
 
   // Re-acquire should now be served from shard free-lists (no new slab carve).
-  MemoryLimitPool::PoolStats before = mp.stats();
+  PoolPayloadBudget::PoolStats before = mp.stats();
   char *b = nullptr;
   ASSERT_TRUE(mp.try_acquire_buffer(kVectorPageSize, b));
-  MemoryLimitPool::PoolStats after = mp.stats();
+  PoolPayloadBudget::PoolStats after = mp.stats();
   EXPECT_GT(after.alloc_from_freelist, before.alloc_from_freelist);
   mp.release_buffer(b, kVectorPageSize);
 }
 
 TEST_F(BufferPoolTest, SlabBaseIsFourMiBAlignedAndPagesAreDirectIoAligned) {
   constexpr size_t kPages = 8;
-  init_page_pool(kPages);
-  auto &mp = ::zvec::ailego::PoolPayloadBudget::get_instance();
+  init_pool(kPages);
+  auto &mp = PoolPayloadBudget::get_instance();
 
   std::vector<char *> pages;
   uintptr_t slab_base = 0;
@@ -2474,11 +2835,11 @@ TEST_F(BufferPoolTest, SlabBaseIsFourMiBAlignedAndPagesAreDirectIoAligned) {
     ASSERT_TRUE(mp.try_acquire_buffer(kVectorPageSize, page));
     ASSERT_NE(nullptr, page);
     const uintptr_t address = reinterpret_cast<uintptr_t>(page);
-    EXPECT_EQ(0u, address % MemoryLimitPool::page_buffer_size());
+    EXPECT_EQ(0u, address % PoolPayloadBudget::page_buffer_size());
     const uintptr_t current_slab =
-        address & ~(MemoryLimitPool::slab_alignment() - 1);
-    EXPECT_EQ(0u, current_slab % MemoryLimitPool::slab_alignment());
-    EXPECT_GE(address - current_slab, MemoryLimitPool::page_buffer_size());
+        address & ~(PoolPayloadBudget::slab_alignment() - 1);
+    EXPECT_EQ(0u, current_slab % PoolPayloadBudget::slab_alignment());
+    EXPECT_GE(address - current_slab, PoolPayloadBudget::page_buffer_size());
     if (slab_base == 0) {
       slab_base = current_slab;
     } else {
@@ -2489,8 +2850,8 @@ TEST_F(BufferPoolTest, SlabBaseIsFourMiBAlignedAndPagesAreDirectIoAligned) {
 
   const auto allocated = mp.stats();
   EXPECT_EQ(1u, allocated.slab_count);
-  EXPECT_GE(allocated.slab_mapped_bytes, MemoryLimitPool::slab_size());
-  EXPECT_EQ(MemoryLimitPool::page_buffer_size(), allocated.slab_header_bytes);
+  EXPECT_GE(allocated.slab_mapped_bytes, PoolPayloadBudget::slab_size());
+  EXPECT_EQ(PoolPayloadBudget::page_buffer_size(), allocated.slab_header_bytes);
   for (char *page : pages) {
     mp.release_buffer(page, kVectorPageSize);
   }
@@ -2498,7 +2859,7 @@ TEST_F(BufferPoolTest, SlabBaseIsFourMiBAlignedAndPagesAreDirectIoAligned) {
 
 TEST_F(BufferPoolTest, ReinitializationReleasesSlabMappings) {
   init_pool(/*capacity_pages=*/4);
-  auto &mp = ::zvec::ailego::PoolPayloadBudget::get_instance();
+  auto &mp = PoolPayloadBudget::get_instance();
 
   char *page = nullptr;
   ASSERT_TRUE(mp.try_acquire_buffer(kVectorPageSize, page));
@@ -2513,4 +2874,86 @@ TEST_F(BufferPoolTest, ReinitializationReleasesSlabMappings) {
   EXPECT_EQ(0u, reinitialized.slab_count);
   EXPECT_EQ(0u, reinitialized.slab_mapped_bytes);
   EXPECT_EQ(0u, reinitialized.slab_header_bytes);
+}
+
+TEST_F(BufferPoolTest, CrossPageWriteAdmissionFailurePreservesAllBytes) {
+  constexpr size_t pages = 2;
+  init_vec_pool(/*capacity_pages=*/4, /*file_pages=*/pages, /*writable=*/true);
+  VecBufferPool pool(new_file(pages), true);
+  ASSERT_EQ(0, pool.init());
+  auto &budget = MemoryLimitPool::get_instance();
+  char *first = pool.acquire_buffer(0, 0);
+  ASSERT_NE(nullptr, first);
+  auto restore_pressure = ScopeGuard::Make([&] {
+    budget.set_memory_pressure(ProcessRssBudget::PressureLevel::kNormal);
+  });
+  budget.set_memory_pressure(ProcessRssBudget::PressureLevel::kCritical);
+  std::array<char, 32> value;
+  value.fill('X');
+  const VecBufferWriteFragment writes[] = {
+      {kVectorPageSize - 16, value.size(), value.data()}};
+  EXPECT_NE(0, pool.write_fragments(writes, 1));
+  EXPECT_EQ(0, first[kVectorPageSize - 1]);
+  // Refuse growth directly, without testing the mandatory-read retry timer.
+  budget.set_memory_pressure(ProcessRssBudget::PressureLevel::kNormal);
+  std::array<char, 16> old_second;
+  ASSERT_TRUE(pool.read_range_bypass(kVectorPageSize, old_second.size(),
+                                     old_second.data()));
+  EXPECT_EQ(1, old_second[0]);
+  ASSERT_EQ(0, pool.write_fragments(writes, 1));
+  EXPECT_EQ('X', first[kVectorPageSize - 1]);
+  pool.page_table_.release_block(0);
+  std::array<char, 32> actual;
+  ASSERT_TRUE(pool.read_range_bypass(kVectorPageSize - 16, actual.size(),
+                                     actual.data()));
+  EXPECT_EQ(value, actual);
+}
+
+TEST_F(BufferPoolTest, AbortedCleanReclaimKeepsDirtyPageInEvictionQueue) {
+  init_table_pool(/*capacity_pages=*/16, /*entry_num=*/1);
+  auto &queue = BlockEvictionQueue::get_instance();
+  BlockEvictionQueue::BlockType stale;
+  while (queue.evict_single_block(stale)) {
+  }
+
+  size_t persisted = 0;
+  VectorPageTable table;
+  ASSERT_TRUE(table.init(/*entry_num=*/1));
+  char *buffer = nullptr;
+  ASSERT_TRUE(PoolPayloadBudget::get_instance().try_acquire_buffer(
+      kVectorPageSize, buffer));
+  std::memset(buffer, 0x5a, kVectorPageSize);
+  ASSERT_EQ(buffer, table.set_block_acquired(0, buffer, 0));
+  table.mark_dirty(0);
+  table.release_block(0);
+  table.set_flush_callback(
+      [&](block_id_t id, char *data, size_t size, size_t offset) {
+        EXPECT_EQ(0u, id);
+        EXPECT_EQ(0u, offset);
+        EXPECT_EQ(kVectorPageSize, size);
+        EXPECT_EQ(0x5a, static_cast<unsigned char>(data[0]));
+        EXPECT_EQ(0x5a, static_cast<unsigned char>(data[size - 1]));
+        ++persisted;
+        return 0;
+      });
+
+  ASSERT_TRUE(VectorPageTableTestPeer::begin_clean_reclaim(table, 0));
+  bool transitioning = true;
+  auto restore = ScopeGuard::Make([&] {
+    if (transitioning) VectorPageTableTestPeer::abort_clean_reclaim(table, 0);
+  });
+  // Foreground reclaim consumes the queue item while writeback owns the
+  // transition. A concurrent rewrite makes clean-only reclaim abandon it.
+  EXPECT_EQ(0u, queue.batch_recycle(1));
+  EXPECT_TRUE(table.is_loaded(0));
+  EXPECT_TRUE(table.is_block_dirty(0));
+  VectorPageTableTestPeer::abort_clean_reclaim(table, 0);
+  transitioning = false;
+
+  // The released page must remain reachable, persist its bytes, and refund
+  // its payload through ordinary reclaim without an explicit force-evict.
+  EXPECT_EQ(1u, queue.batch_recycle(1));
+  EXPECT_EQ(1u, persisted);
+  EXPECT_FALSE(table.is_loaded(0));
+  EXPECT_EQ(0u, PoolPayloadBudget::get_instance().stats().page_used);
 }
