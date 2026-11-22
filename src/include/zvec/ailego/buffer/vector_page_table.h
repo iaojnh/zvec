@@ -147,6 +147,8 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
   void release_block(block_id_t block_id);
 
   bool evict_block(block_id_t block_id) override;
+  CleanReclaim try_reclaim_clean(eviction_key_t key,
+                                 version_t version) override;
 
   void eviction_requeue_failed(eviction_key_t owner_key,
                                version_t version) override {
@@ -446,6 +448,7 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
   static void initialize_segment(Entry *entries,
                                  MetadataEntry *metadata_entries);
   bool do_evict_block(block_id_t block_id, bool force);
+  bool reclaim_clean_block(block_id_t block_id, bool discard_backing);
   static version_t next_owner_version();
 
   // Prevent stale queue entries from targeting a reused owner address.
