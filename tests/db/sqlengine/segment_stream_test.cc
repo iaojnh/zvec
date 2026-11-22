@@ -19,6 +19,7 @@
 #include "db/index/segment/filtering_reader.h"
 #include "db/index/storage/parquet_memory_pool.h"
 #include "db/index/storage/resident_record_batch_reader.h"
+#include "db/sqlengine/planner/ops/fetch_vector_op.h"
 #include "db/sqlengine/planner/segment_node.h"
 #include "../../ailego/buffer/pool_payload_budget.h"
 
@@ -57,6 +58,68 @@ bool expires(const std::weak_ptr<int> &lease) {
   while (!lease.expired() && std::chrono::steady_clock::now() < deadline)
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   return lease.expired();
+}
+
+TEST(SegmentStreamTest, FetchVectorFinishPropagatesOutOfMemory) {
+  class RejectShrinkPool : public arrow::ProxyMemoryPool {
+   public:
+    RejectShrinkPool() : ProxyMemoryPool(arrow::default_memory_pool()) {}
+
+    arrow::Status Reallocate(int64_t old_size, int64_t new_size,
+                             int64_t alignment, uint8_t **ptr) override {
+      if (reject_shrink && new_size > 0 && new_size < old_size) {
+        return arrow::Status::OutOfMemory("injected vector buffer shrink");
+      }
+      return ProxyMemoryPool::Reallocate(old_size, new_size, alignment, ptr);
+    }
+
+    bool reject_shrink = true;
+  };
+
+  class TestIndexer : public CombinedVectorColumnIndexer {
+   public:
+    explicit TestIndexer(bool dense) : dense_(dense) {}
+
+    Result<vector_column_params::VectorDataBuffer> fetch(uint32_t) const override {
+      std::string bytes(128, '\0');
+      if (dense_) {
+        return vector_column_params::VectorDataBuffer{
+            vector_column_params::DenseVectorBuffer(std::move(bytes))};
+      }
+      return vector_column_params::VectorDataBuffer{
+          vector_column_params::SparseVectorBuffer{bytes, bytes}};
+    }
+
+   private:
+    bool dense_;
+  };
+
+  const uint64_t row_ids[] = {0, 1, 2};
+  arrow::UInt64Builder row_builder;
+  ASSERT_TRUE(row_builder.AppendValues(row_ids, 3).ok());
+  auto rows = row_builder.Finish().ValueOrDie();
+  cp::ExecBatch input({rows}, 3);
+  for (bool dense : {true, false}) {
+    SCOPED_TRACE(dense);
+    RejectShrinkPool pool;
+    cp::ExecContext exec_context(&pool);
+    cp::KernelContext kernel_context(&exec_context);
+    FetchVectorOp::Options options(std::make_shared<TestIndexer>(dense), dense);
+    FetchVectorOp::FetchVectorState state(&options);
+    kernel_context.SetState(&state);
+    cp::ExecResult output;
+    auto status = FetchVectorOp::FetchVectorFunction(
+        &kernel_context, cp::ExecSpan(input), &output);
+    EXPECT_TRUE(status.IsOutOfMemory()) << status.ToString();
+    EXPECT_NE(status.message().find("Finish vector builder failed"),
+              std::string::npos);
+    EXPECT_EQ(0, pool.bytes_allocated());
+
+    pool.reject_shrink = false;
+    status = FetchVectorOp::FetchVectorFunction(
+        &kernel_context, cp::ExecSpan(input), &output);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+  }
 }
 
 TEST(SegmentStreamTest, AsyncCancellationReleasesSourceWithOneCpuWorker) {

@@ -32,6 +32,15 @@ namespace zvec {
 // TODO: rename file extension
 class ProximaEngineHelper {
  public:
+  static Status index_status(int code, const char *operation) {
+    if (code == 0) return Status::OK();
+    return Status(code == core::IndexError_NoMemory
+                      ? StatusCode::RESOURCE_EXHAUSTED
+                      : StatusCode::INTERNAL_ERROR,
+                  ailego::StringHelper::Concat(operation, ": ",
+                                               core::IndexError::What(code)));
+  }
+
   class SearchFilter {
    public:
     explicit SearchFilter(const IndexFilter *filter) {
@@ -165,14 +174,7 @@ class ProximaEngineHelper {
       const int error = index->search_internal_ids(vector_data, params,
                                                    output_ids, output_scores);
       if (!search_filter.status().ok()) return search_filter.status();
-      if (error != 0) {
-        return Status(error == core::IndexError_NoMemory
-                          ? StatusCode::RESOURCE_EXHAUSTED
-                          : StatusCode::INTERNAL_ERROR,
-                      std::string("Failed to search vector: ") +
-                          core::IndexError::What(error));
-      }
-      return Status::OK();
+      return index_status(error, "Failed to search vector");
     };
     switch (indexer.field_schema_.index_type()) {
       case IndexType::FLAT:

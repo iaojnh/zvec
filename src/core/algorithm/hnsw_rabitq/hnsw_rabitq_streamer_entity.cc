@@ -254,7 +254,7 @@ int HnswRabitqStreamerEntity::init_chunks(const Chunk::Pointer &header_chunk) {
   size_t size = header_chunk->read(0UL, header_block, header_size());
   if (ailego_unlikely(size != header_size())) {
     LOG_ERROR("Read header chunk failed");
-    return IndexError_ReadData;
+    return header_chunk->read_error();
   }
   *mutable_header() =
       *reinterpret_cast<const HNSWHeader *>(header_block.data());
@@ -338,7 +338,7 @@ int HnswRabitqStreamerEntity::open(IndexStorage::Pointer stg,
     size_t size = p.second->write(0UL, &header(), header_size());
     if (ailego_unlikely(size != header_size())) {
       LOG_ERROR("Write header chunk failed");
-      return IndexError_WriteData;
+      return p.second->write_error();
     }
     return 0;
   }
@@ -530,12 +530,12 @@ int HnswRabitqStreamerEntity::add_vector(level_t level, key_t key,
   size_t size = node_chunk->write(chunk_offset, vec, vector_size());
   if (ailego_unlikely(size != vector_size())) {
     LOG_ERROR("Chunk write vec failed, ret=%zu", size);
-    return IndexError_WriteData;
+    return node_chunk->write_error();
   }
   size = node_chunk->write(chunk_offset + vector_size(), &key, sizeof(key_t));
   if (ailego_unlikely(size != sizeof(key_t))) {
     LOG_ERROR("Chunk write vec failed, ret=%zu", size);
-    return IndexError_WriteData;
+    return node_chunk->write_error();
   }
   //! level 0 neighbors is inited to zero by default
 
@@ -622,7 +622,7 @@ int HnswRabitqStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
                                     sizeof(key_t));
     if (ailego_unlikely(size != sizeof(key_t))) {
       LOG_ERROR("Chunk write key failed, ret=%zu", size);
-      return IndexError_WriteData;
+      return node_chunk->write_error();
     }
 
     chunk_offset += node_size();
@@ -641,13 +641,13 @@ int HnswRabitqStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
   size_t size = node_chunk->write(chunk_offset, vec, vector_size());
   if (ailego_unlikely(size != vector_size())) {
     LOG_ERROR("Chunk write vec failed, ret=%zu", size);
-    return IndexError_WriteData;
+    return node_chunk->write_error();
   }
 
   size = node_chunk->write(chunk_offset + vector_size(), &key, sizeof(key_t));
   if (ailego_unlikely(size != sizeof(key_t))) {
     LOG_ERROR("Chunk write vec failed, ret=%zu", size);
-    return IndexError_WriteData;
+    return node_chunk->write_error();
   }
   //! level 0 neighbors is inited to zero by default
 

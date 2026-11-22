@@ -349,6 +349,10 @@ int HnswSparseSearcher::search_bf_impl(
   }
 
   ctx->clear();
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) ctx->clear();
+  });
   ctx->resize_results(count);
 
   const uint32_t *sparse_indices_tmp = sparse_indices;
@@ -431,6 +435,7 @@ int HnswSparseSearcher::search_bf_impl(
     return IndexError_Runtime;
   }
 
+  complete = true;
   return 0;
 } catch (const GraphStorageError &error) {
   return error.code;
@@ -481,6 +486,10 @@ int HnswSparseSearcher::search_bf_key_batch(
   }
 
   ctx->clear();
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) ctx->clear();
+  });
   ctx->resize_results(count);
 
   const uint32_t *sparse_indices_tmp = sparse_indices;
@@ -561,6 +570,7 @@ int HnswSparseSearcher::search_bf_key_batch(
     return IndexError_Runtime;
   }
 
+  complete = true;
   return 0;
 } catch (const GraphStorageError &error) {
   return error.code;

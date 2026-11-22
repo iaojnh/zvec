@@ -177,25 +177,7 @@ class HnswSparseContext : public IndexContext {
         break;
       }
 
-      node_id_t id = topk_heap_[i].first;
-      if (fetch_vector_) {
-        IndexStorage::MemoryBlock meta_block;
-        CheckGraphStorage(entity_->get_vector_meta(id, meta_block));
-        IndexSparseDocument sparse_doc;
-        IndexStorage::MemoryBlock vec_block;
-        entity_->get_sparse_data(id, vec_block);
-        const void *sparse_data = vec_block.data();
-        if (sparse_data != nullptr) {
-          SparseUtility::ReverseSparseFormat(sparse_data, sparse_doc,
-                                             entity_->sparse_unit_size());
-        }
-
-        results_[idx].emplace_back(entity_->get_key(id), score, id,
-                                   std::move(meta_block),
-                                   std::move(sparse_doc));
-      } else {
-        results_[idx].emplace_back(entity_->get_key(id), score, id);
-      }
+      append_result(topk_heap_[i].first, score, results_[idx]);
     }
 
     return;
@@ -225,30 +207,36 @@ class HnswSparseContext : public IndexContext {
           break;
         }
 
-        node_id_t id = group_topk_list[i]->second[j].first;
-
-        if (fetch_vector_) {
-          IndexStorage::MemoryBlock meta_block;
-          CheckGraphStorage(entity_->get_vector_meta(id, meta_block));
-          IndexSparseDocument sparse_doc;
-          IndexStorage::MemoryBlock vec_block;
-          entity_->get_sparse_data(id, vec_block);
-          const void *sparse_data = vec_block.data();
-          if (sparse_data != nullptr) {
-            SparseUtility::ReverseSparseFormat(sparse_data, sparse_doc,
-                                               entity_->sparse_unit_size());
-          }
-          group_results_[idx][i].mutable_docs()->emplace_back(
-              entity_->get_key(id), score, id, std::move(meta_block),
-              std::move(sparse_doc));
-        } else {
-          group_results_[idx][i].mutable_docs()->emplace_back(
-              entity_->get_key(id), score, id);
-        }
+        append_result(group_topk_list[i]->second[j].first, score,
+                      *group_results_[idx][i].mutable_docs());
       }
     }
   }
 
+ private:
+  void append_result(node_id_t id, dist_t score, IndexDocumentList &results) {
+    const key_t key = entity_->get_key(id);
+    if (!fetch_vector_) {
+      results.emplace_back(key, score, id);
+      return;
+    }
+
+    IndexStorage::MemoryBlock meta_block;
+    CheckGraphStorage(entity_->get_vector_meta(id, meta_block));
+    IndexStorage::MemoryBlock vec_block;
+    int length = 0;
+    CheckGraphStorage(entity_->get_sparse_data_from_vector(meta_block.data(),
+                                                           vec_block, length));
+    IndexSparseDocument sparse_doc;
+    if (const void *sparse_data = vec_block.data()) {
+      SparseUtility::ReverseSparseFormat(sparse_data, sparse_doc,
+                                         entity_->sparse_unit_size());
+    }
+    results.emplace_back(key, score, id, std::move(meta_block),
+                         std::move(sparse_doc));
+  }
+
+ public:
   inline void reset_query(const void *query) {
     dc_.reset_query(query);
     dc_.clear_compare_cnt();
@@ -420,6 +408,7 @@ class HnswSparseContext : public IndexContext {
   }
 
   inline void clear() {
+    group_topk_heaps_.clear();
     dc_.clear();
     if (ailego_unlikely(this->debugging())) {
       stats_get_neighbors_cnt_ = 0u;
@@ -428,6 +417,9 @@ class HnswSparseContext : public IndexContext {
     }
     // do not clear results_ for the next query will need it
     for (auto &it : results_) {
+      it.clear();
+    }
+    for (auto &it : group_results_) {
       it.clear();
     }
   }

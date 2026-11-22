@@ -156,7 +156,7 @@ int FlatSparseStreamerEntity::load_storage(IndexStorage::Pointer storage,
                       sizeof(meta_))) {
     LOG_ERROR("Failed to read meta segment %s",
               PARAM_FLAT_SPARSE_META_SEG_ID.c_str());
-    return IndexError_ReadData;
+    return segment->read_error();
   }
   meta_ = *(reinterpret_cast<const decltype(meta_) *>(data_block.data()));
   index_size += segment->capacity();
@@ -172,7 +172,7 @@ int FlatSparseStreamerEntity::load_storage(IndexStorage::Pointer storage,
                       sizeof(streamer_meta_))) {
     LOG_ERROR("Failed to read streamer meta segment %s",
               PARAM_FLAT_SPARSE_STREAMER_META_SEG_ID.c_str());
-    return IndexError_ReadData;
+    return segment->read_error();
   }
   streamer_meta_ =
       *(reinterpret_cast<const decltype(streamer_meta_) *>(data_block.data()));
@@ -276,7 +276,7 @@ int FlatSparseStreamerEntity::init_storage(IndexStorage::Pointer storage,
   if (segment->write(0, &meta_, sizeof(meta_)) != sizeof(meta_)) {
     LOG_ERROR("Failed to write meta segment %s",
               PARAM_FLAT_SPARSE_META_SEG_ID.c_str());
-    return IndexError_WriteData;
+    return segment->write_error();
   }
 
   *stats_.mutable_index_size() += size;
@@ -299,7 +299,7 @@ int FlatSparseStreamerEntity::init_storage(IndexStorage::Pointer storage,
       sizeof(streamer_meta_)) {
     LOG_ERROR("Failed to write streamer meta segment %s",
               PARAM_FLAT_SPARSE_STREAMER_META_SEG_ID.c_str());
-    return IndexError_WriteData;
+    return segment->write_error();
   }
 
   *stats_.mutable_index_size() += size;
@@ -331,7 +331,7 @@ int FlatSparseStreamerEntity::flush(uint64_t checkpoint) {
   if (segment->write(0, &meta_, sizeof(meta_)) != sizeof(meta_)) {
     LOG_ERROR("Failed to write meta segment %s",
               PARAM_FLAT_SPARSE_META_SEG_ID.c_str());
-    return IndexError_WriteData;
+    return segment->write_error();
   }
 
   // flush streamer meta
@@ -347,7 +347,7 @@ int FlatSparseStreamerEntity::flush(uint64_t checkpoint) {
       sizeof(streamer_meta_)) {
     LOG_ERROR("Failed to write streamer meta segment %s",
               PARAM_FLAT_SPARSE_STREAMER_META_SEG_ID.c_str());
-    return IndexError_WriteData;
+    return segment->write_error();
   }
 
   if (checkpoint != 0) {
@@ -475,7 +475,7 @@ int FlatSparseStreamerEntity::dump_offset_data(IndexDumper *dumper) {
       uint32_t length = 0;
       if (sparse_offset_chunks_[chunk]->fetch(pos, &length, sizeof(length)) !=
           sizeof(length))
-        return IndexError_ReadData;
+        return sparse_offset_chunks_[chunk]->read_error();
       std::memcpy(batch.data() + i * kRecordBytes, &offset, sizeof(offset));
       std::memcpy(batch.data() + i * kRecordBytes + sizeof(offset), &length,
                   sizeof(length));
@@ -952,7 +952,7 @@ int FlatSparseStreamerEntity::read_key(node_id_t node_id, uint64_t *key) const {
                       sizeof(uint64_t))) {
     LOG_ERROR("Read key failed, offset=%u, node_id=%u", offset_chunk_key_offset,
               node_id);
-    return IndexError_ReadData;
+    return sparse_offset_chunks_[offset_chunk_index]->read_error();
   };
 
   return 0;
@@ -979,7 +979,7 @@ int FlatSparseStreamerEntity::get_sparse_vector_ptr_by_id(
   if (ailego_unlikely(read_len != offset_size_per_node())) {
     LOG_ERROR("Read offset info failed, offset=%u, read_len=%zu, expect=%u",
               offset_chunk_offset, read_len, offset_size_per_node());
-    return IndexError_ReadData;
+    return offset_chunk->read_error();
   };
 
   // sparse offset
@@ -1033,7 +1033,7 @@ int FlatSparseStreamerEntity::get_sparse_vector_ptr_by_id(
   if (ailego_unlikely(read_len != offset_size_per_node())) {
     LOG_ERROR("Read offset info failed, offset=%u, read_len=%zu, expect=%u",
               offset_chunk_offset, read_len, offset_size_per_node());
-    return IndexError_ReadData;
+    return offset_chunk->read_error();
   };
 
   // sparse offset
@@ -1047,8 +1047,10 @@ int FlatSparseStreamerEntity::get_sparse_vector_ptr_by_id(
       static_cast<uint32_t>(sparse_offset & 0xFFFFFFFF);
 
   if (sparse_vector_len > 0) {
-    get_sparse_vector_data(sparse_data_chunk_index, sparse_data_chunk_offset,
-                           sparse_vector_len, sparse_vector_block);
+    const int ret = get_sparse_vector_data(
+        sparse_data_chunk_index, sparse_data_chunk_offset, sparse_vector_len,
+        sparse_vector_block);
+    if (ret != 0) return ret;
     if (ailego_unlikely(sparse_vector_block.data() == nullptr)) {
       LOG_ERROR("Get nullptr sparse, offset=%zu, len=%u", (size_t)sparse_offset,
                 sparse_vector_len);
@@ -1109,7 +1111,7 @@ int FlatSparseStreamerEntity::get_sparse_vector_data(
         "read sparse vector data failed: chunk_index=%u, offset=%zu, "
         "length=%u, size=%zu",
         chunk_index, (size_t)offset, length, size);
-    return IndexError_ReadData;
+    return sparse_data_chunks_[chunk_index]->read_error();
   }
   return 0;
 }

@@ -112,6 +112,9 @@ class IndexMapping {
   //! Create a index file
   int create(const std::string &path, size_t segs_size);
 
+  //! Create a new index file without replacing an existing path.
+  int create_exclusive(const std::string &path, size_t segs_size);
+
   //! Close the index
   void close();
 
@@ -187,6 +190,8 @@ class IndexMapping {
   IndexMapping &operator=(const IndexMapping &) = delete;
 
  private:
+  int create_impl(const std::string &path, size_t seg_meta_capacity,
+                  bool exclusive);
   void swap(IndexMapping &rhs) noexcept;
   struct MetaMapping {
     IndexFormat::MetaHeader *header;

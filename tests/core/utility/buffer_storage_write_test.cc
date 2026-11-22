@@ -376,11 +376,12 @@ TEST_F(BufferStorageWriteTest, SameFileReopenKeepsExistingSegmentAndBorrow) {
   ASSERT_EQ(sizeof(value), retained->write(0, value, sizeof(value)));
   retained->update_data_crc(123);
   const auto offset = retained->data_offset();
+  std::weak_ptr<ailego::VecBufferPool> original_pool = storage->vec_buffer_pool();
   IndexStorage::MemoryBlock before_reopen;
   ASSERT_EQ(sizeof(value), retained->read_borrowed_immutable(
                               0, before_reopen, sizeof(value)));
   ASSERT_EQ(IndexStorage::MemoryBlock::MBT_BUFFERPOOL, before_reopen.type_);
-  EXPECT_EQ(nullptr, before_reopen.buffer_pool_handle_owner_);
+  EXPECT_NE(nullptr, before_reopen.buffer_pool_handle_owner_);
 
   ASSERT_EQ(0, storage->open(file_path_, false));
   EXPECT_EQ(offset, retained->data_offset());
@@ -396,9 +397,13 @@ TEST_F(BufferStorageWriteTest, SameFileReopenKeepsExistingSegmentAndBorrow) {
   EXPECT_EQ(IndexStorage::MemoryBlock::MBT_BUFFERPOOL, after_reopen.type_);
   EXPECT_NE(nullptr, after_reopen.buffer_pool_handle_owner_);
   EXPECT_STREQ(value, static_cast<const char *>(after_reopen.data()));
+  EXPECT_FALSE(original_pool.expired());
   before_reopen.reset();
+  EXPECT_TRUE(original_pool.expired());
   after_reopen.reset();
+  std::weak_ptr<ailego::VecBufferPool> reopened_pool = storage->vec_buffer_pool();
   EXPECT_EQ(0, storage->close());
+  EXPECT_TRUE(reopened_pool.expired());
 }
 
 TEST_F(BufferStorageWriteTest, ReplacementInvalidatesRetainedSegment) {
@@ -1539,7 +1544,7 @@ TEST_F(BufferStorageWriteTest, ImmutableReadPinsWritablePageWithoutCopy) {
   ASSERT_EQ(expected.size(), segment->read_borrowed_immutable(offset, borrowed,
                                                               expected.size()));
   EXPECT_EQ(IndexStorage::MemoryBlock::MBT_BUFFERPOOL, borrowed.type_);
-  EXPECT_FALSE(borrowed.buffer_pool_handle_owner_);
+  EXPECT_TRUE(borrowed.buffer_pool_handle_owner_);
 
   borrowed.reset();
   pinned.reset();
@@ -2122,7 +2127,7 @@ TEST_F(BufferStorageWriteTest, CR_MemoryBlockOutlivesReadOnlyStorage) {
   block.reset();
 }
 
-TEST_F(BufferStorageWriteTest, CR_BorrowedReadAvoidsOwningHandle) {
+TEST_F(BufferStorageWriteTest, CR_BorrowedReadOwnsItsPinnedPage) {
   const std::string expected = "borrowed";
   {
     auto storage = open_writable();
@@ -2142,7 +2147,7 @@ TEST_F(BufferStorageWriteTest, CR_BorrowedReadAvoidsOwningHandle) {
   IndexStorage::MemoryBlock block;
   ASSERT_EQ(expected.size(), seg->read_borrowed(0, block, expected.size()));
   EXPECT_EQ(IndexStorage::MemoryBlock::MBT_BUFFERPOOL, block.type_);
-  EXPECT_EQ(nullptr, block.buffer_pool_handle_owner_);
+  EXPECT_NE(nullptr, block.buffer_pool_handle_owner_);
   EXPECT_NE(nullptr, block.buffer_pool_handle_);
   EXPECT_EQ(0, std::memcmp(expected.data(), block.data(), expected.size()));
 

@@ -356,10 +356,9 @@ class SegmentImpl : public Segment,
   const std::vector<BlockMeta> &get_persist_block_metas(
       BlockType type, const std::string &col_name = "") const;
 
-  VectorColumnIndexer::Ptr create_vector_indexer(const std::string &field_name,
-                                                 const FieldSchema &field,
-                                                 BlockID block_id,
-                                                 bool is_quantized = false);
+  Result<VectorColumnIndexer::Ptr> create_vector_indexer(
+      const std::string &field_name, const FieldSchema &field, BlockID block_id,
+      bool is_quantized = false);
 
   Result<VectorColumnIndexer::Ptr> merge_vector_indexer(
       const std::string &index_file_path, const FieldSchema &field,
@@ -5363,18 +5362,16 @@ Status SegmentImpl::load_vector_index_blocks() {
   return Status::OK();
 }
 
-VectorColumnIndexer::Ptr SegmentImpl::create_vector_indexer(
+Result<VectorColumnIndexer::Ptr> SegmentImpl::create_vector_indexer(
     const std::string &field_name, const FieldSchema &field, BlockID block_id,
     bool is_quantized) {
   std::string index_file_path;
   if (is_quantized) {
     index_file_path = FileHelper::MakeQuantizeVectorIndexPath(
         path_, field_name, segment_meta_->id(), block_id);
-    quant_memory_vector_block_ids_[field_name] = block_id;
   } else {
     index_file_path = FileHelper::MakeVectorIndexPath(
         path_, field_name, segment_meta_->id(), block_id);
-    memory_vector_block_ids_[field_name] = block_id;
   }
 
   if (FileHelper::FileExists(index_file_path)) {
@@ -5392,8 +5389,11 @@ VectorColumnIndexer::Ptr SegmentImpl::create_vector_indexer(
   if (!status.ok()) {
     LOG_ERROR("Failed to open vector indexer for field: %s, err: %s",
               field.to_string().c_str(), status.message().c_str());
-    return nullptr;
+    return tl::make_unexpected(std::move(status));
   }
+  auto &block_ids =
+      is_quantized ? quant_memory_vector_block_ids_ : memory_vector_block_ids_;
+  block_ids[field_name] = block_id;
   return vector_indexer;
 }
 
@@ -5409,6 +5409,8 @@ Status SegmentImpl::init_memory_components() {
       memory_store_.reset();
       memory_vector_indexers_.clear();
       quant_memory_vector_indexers_.clear();
+      memory_vector_block_ids_.clear();
+      quant_memory_vector_block_ids_.clear();
     }
   });
   // init memory block id
@@ -5436,64 +5438,36 @@ Status SegmentImpl::init_memory_components() {
     auto index_params =
         std::dynamic_pointer_cast<VectorIndexParams>(field->index_params());
 
-    if (index_params->quantize_type() == QuantizeType::UNDEFINED) {
-      // create normal vector indexer
-      FieldSchema normal_field(*field);
-      normal_field.set_index_params(MakeDefaultVectorIndexParams(
-          index_params->metric_type(),
-          index_params->use_flat_contiguous_memory(),
-          segment_detail::FlatStorageDataTypeForField(
-              field->data_type(), index_params->flat_data_type())));
-      auto block_id = allocate_block_id();
-      auto vector_indexer =
-          create_vector_indexer(field->name(), normal_field, block_id);
-      if (!vector_indexer) {
-        return Status::InternalError("Create vector column indexer failed: ",
-                                     field->name());
-      }
-      memory_vector_indexers_.insert({field->name(), vector_indexer});
-    } else {
-      // first create normal vector indexer
-      FieldSchema normal_field(*field);
-      normal_field.set_index_params(MakeDefaultVectorIndexParams(
-          index_params->metric_type(),
-          index_params->use_flat_contiguous_memory(),
-          segment_detail::FlatStorageDataTypeForField(
-              field->data_type(), index_params->flat_data_type())));
-      auto block_id = allocate_block_id();
-      auto vector_indexer =
-          create_vector_indexer(field->name(), normal_field, block_id);
-      if (!vector_indexer) {
-        return Status::InternalError("Create vector column indexer failed: ",
-                                     field->name());
-      }
-      memory_vector_indexers_.insert({field->name(), vector_indexer});
+    FieldSchema normal_field(*field);
+    normal_field.set_index_params(MakeDefaultVectorIndexParams(
+        index_params->metric_type(), index_params->use_flat_contiguous_memory(),
+        segment_detail::FlatStorageDataTypeForField(
+            field->data_type(), index_params->flat_data_type())));
+    auto vector_indexer =
+        create_vector_indexer(field->name(), normal_field, allocate_block_id());
+    if (!vector_indexer) return vector_indexer.error();
+    memory_vector_indexers_.emplace(field->name(), std::move(*vector_indexer));
 
-      // Uniform and PQ quantizers require dataset-level training.
-      // Until optimize creates that index, retain only the raw writer Flat.
-      if (index_params->quantize_type() == QuantizeType::UNIFORM_UINT7 ||
-          index_params->quantize_type() == QuantizeType::UNIFORM_UINT8 ||
-          index_params->quantize_type() == QuantizeType::UNIFORM_UINT4 ||
-          index_params->quantize_type() == QuantizeType::PQ) {
-        continue;
-      }
-
-      // second create quantize vector indexer
-      block_id = allocate_block_id();
-      FieldSchema normal_quant_field(*field);
-      normal_quant_field.set_index_params(MakeDefaultQuantVectorIndexParams(
-          index_params->metric_type(), index_params->quantize_type(),
-          index_params->quantizer_param()));
-      auto quant_vector_indexer = create_vector_indexer(
-          field->name(), normal_quant_field, block_id, true);
-
-      if (!quant_vector_indexer) {
-        return Status::InternalError("Create vector column indexer failed: ",
-                                     field->name());
-      }
-      quant_memory_vector_indexers_.insert(
-          {field->name(), quant_vector_indexer});
+    // Uniform and PQ quantizers require dataset-level training.
+    // Until optimize creates that index, retain only the raw writer Flat.
+    const auto quantize_type = index_params->quantize_type();
+    if (quantize_type == QuantizeType::UNDEFINED ||
+        quantize_type == QuantizeType::UNIFORM_UINT7 ||
+        quantize_type == QuantizeType::UNIFORM_UINT8 ||
+        quantize_type == QuantizeType::UNIFORM_UINT4 ||
+        quantize_type == QuantizeType::PQ) {
+      continue;
     }
+
+    FieldSchema quant_field(*field);
+    quant_field.set_index_params(MakeDefaultQuantVectorIndexParams(
+        index_params->metric_type(), quantize_type,
+        index_params->quantizer_param()));
+    auto quant_vector_indexer = create_vector_indexer(
+        field->name(), quant_field, allocate_block_id(), true);
+    if (!quant_vector_indexer) return quant_vector_indexer.error();
+    quant_memory_vector_indexers_.emplace(field->name(),
+                                          std::move(*quant_vector_indexer));
   }
 
   committed = true;

@@ -148,7 +148,6 @@ class BufferStorage : public IndexStorage {
           owner_(owner),
           segment_id_(segment_id),
           generation_(owner->directory_generation_),
-          original_handle_(owner->buffer_pool_handle_),
           capacity_(static_cast<size_t>(info->segment.meta()->data_size +
                                         info->segment.meta()->padding_size)) {}
     //! Destructor
@@ -236,7 +235,6 @@ class BufferStorage : public IndexStorage {
         return 0;
       }
       return read_memory_block(absolute_offset(offset), data, len,
-                               /*borrow_handle=*/false,
                                /*immutable=*/false);
     }
 
@@ -252,44 +250,6 @@ class BufferStorage : public IndexStorage {
         return 0;
       }
       return read_memory_block(absolute_offset(offset), data, len,
-                               /*borrow_handle=*/false,
-                               /*immutable=*/true);
-    }
-
-    //! Borrowed read: the caller keeps the Segment alive until block release.
-    size_t read_borrowed(size_t offset, MemoryBlock &data,
-                         size_t len) override {
-      if (!check_read(data)) return 0;
-      if (ailego_unlikely(!owner_->buffer_pool_handle_)) {
-        LOG_ERROR(
-            "WrappedSegment::read_borrowed: handle is null, file[%s], "
-            "id[%s]",
-            owner_->file_name_.c_str(), segment_id_->data());
-        return 0;
-      }
-      len = clamp_length(&offset, len);
-      if (len == 0) {
-        data.reset();
-        return 0;
-      }
-      return read_memory_block(absolute_offset(offset), data, len,
-                               /*borrow_handle=*/true,
-                               /*immutable=*/false);
-    }
-
-    size_t read_borrowed_immutable(size_t offset, MemoryBlock &data,
-                                   size_t len) override {
-      if (!check_read(data)) return 0;
-      if (ailego_unlikely(!owner_->buffer_pool_handle_)) {
-        return 0;
-      }
-      len = clamp_length(&offset, len);
-      if (len == 0) {
-        data.reset();
-        return 0;
-      }
-      return read_memory_block(absolute_offset(offset), data, len,
-                               /*borrow_handle=*/true,
                                /*immutable=*/true);
     }
 
@@ -373,7 +333,7 @@ class BufferStorage : public IndexStorage {
         owner_->buffer_pool_handle_->acquire_one(ids[index]);
         auto *segment = static_cast<WrappedSegment *>(reads[i].segment);
         segment->reset_pinned_block(*reads[i].block, ids[index],
-                                    pages[index] + offsets[i], true);
+                                    pages[index] + offsets[i]);
       }
       return true;
     }
@@ -847,7 +807,7 @@ class BufferStorage : public IndexStorage {
           auto *segment = static_cast<WrappedSegment *>(state.request->segment);
           segment->reset_pinned_block(
               *state.request->block, scratch.unique_page_ids[unique_index],
-              scratch.pages[unique_index] + offset_in_page, true);
+              scratch.pages[unique_index] + offset_in_page);
           continue;
         }
         *state.request->block =
@@ -1087,15 +1047,10 @@ class BufferStorage : public IndexStorage {
     }
 
     void reset_pinned_block(MemoryBlock &block, ailego::block_id_t id,
-                            char *data, bool borrow) const {
-      const auto &handle = owner_->buffer_pool_handle_;
-      if (borrow && !original_handle_.owner_before(handle) &&
-          !handle.owner_before(original_handle_)) {
-        std::call_once(retain_handle_, [&] { borrowed_handle_ = handle; });
-        block.reset(handle.get(), id, data);
-      } else {
-        block.reset(handle, id, data);
-      }
+                            char *data) const {
+      // A block can outlive a close or reopen. Retain its pool for just the
+      // lifetime of that block so an idle Segment cannot keep a file open.
+      block.reset(owner_->buffer_pool_handle_, id, data);
     }
 
     class PreparedBatch final : public PreparedWrite {
@@ -1229,7 +1184,7 @@ class BufferStorage : public IndexStorage {
     }
 
     size_t read_memory_block(size_t abs_offset, MemoryBlock &data, size_t len,
-                             bool borrow_handle, bool immutable) const try {
+                             bool immutable) const try {
       buffer_storage_read_error = IndexError_ReadData;
       const bool can_pin = owner_->cache_enabled_ &&
                            (immutable || !owner_->buffer_pool_->writable());
@@ -1240,7 +1195,7 @@ class BufferStorage : public IndexStorage {
         char *raw = owner_->buffer_pool_handle_->get_single_page(abs_offset,
                                                                  len, page_id);
         if (raw != nullptr) {
-          reset_pinned_block(data, page_id, raw, borrow_handle);
+          reset_pinned_block(data, page_id, raw);
           return len;
         }
         force_bypass = true;
@@ -1316,11 +1271,6 @@ class BufferStorage : public IndexStorage {
     // references and pointers.
     const std::string_view *segment_id_{nullptr};
     std::shared_ptr<DirectoryGeneration> generation_;
-    // Lazily retain the pool this segment initially lends to borrowed blocks.
-    // A surviving segment uses owning pins when it reads from a reopened pool.
-    std::weak_ptr<ailego::VecBufferPoolHandle> original_handle_;
-    mutable std::once_flag retain_handle_;
-    mutable ailego::VecBufferPoolHandle::Pointer borrowed_handle_;
     size_t capacity_{};
   };
 
@@ -1804,24 +1754,28 @@ class BufferStorage : public IndexStorage {
   //! Create an index compatible with the mmap storage format.
   int init_index(const std::string &path) {
     IndexMapping mapping;
-    int ret = mapping.create(path, segment_meta_capacity_);
+    int ret = mapping.create_exclusive(path, segment_meta_capacity_);
     if (ret != 0) {
       LOG_ERROR(
           "BufferStorage failed to create index file: path[%s], errno[%d]",
           path.c_str(), ret);
       return ret;
     }
+    bool initialized = false;
+    AILEGO_DEFER([&] {
+      mapping.close();
+      if (!initialized) ailego::File::Delete(path);
+    });
     ret = this->init_version_segment(mapping);
     if (ret != 0) {
       LOG_ERROR(
           "BufferStorage failed to append version segment: path[%s], errno[%d]",
           path.c_str(), ret);
-      mapping.close();
       return ret;
     }
     mapping.refresh(0);
     ret = mapping.flush();
-    mapping.close();
+    initialized = ret == 0;
     if (ret != 0) {
       LOG_ERROR(
           "BufferStorage failed to flush new index file: path[%s], errno[%d]",

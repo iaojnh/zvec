@@ -6046,12 +6046,15 @@ TEST_F(CollectionTest, FetchReportsVectorAdmissionFailure) {
 
   auto verify = [&] {
     auto &pool = ailego::MemoryLimitPool::get_instance();
-    const size_t occupied = std::max(pool.used(), pool.committed());
     constexpr size_t kSpare = 16384;
-    ASSERT_GT(pool.capacity(), occupied + kSpare);
     {
       ailego::MemoryReservation held;
-      held.add(pool.capacity() - occupied - kSpare);
+      for (size_t attempt = 0; attempt < 8; ++attempt) {
+        const auto available = pool.available();
+        if (available <= kSpare) break;
+        held.add(available - kSpare);
+      }
+      ASSERT_LT(pool.available(), vector.size() * sizeof(float));
       auto scalar = collection_->fetch({"doc"}, std::nullopt, false);
       ASSERT_TRUE(scalar.has_value()) << scalar.error().message();
       ASSERT_NE(nullptr, scalar->at("doc"));

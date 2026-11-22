@@ -829,6 +829,10 @@ int HnswSparseStreamer::search_bf_impl(
   }
 
   ctx->clear();
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) ctx->clear();
+  });
   ctx->update_dist_caculator_distance(search_distance_);
   ctx->resize_results(count);
 
@@ -919,6 +923,7 @@ int HnswSparseStreamer::search_bf_impl(
     }
   }
 
+  complete = true;
   return 0;
 } catch (const GraphStorageError &error) {
   return error.code;
@@ -985,6 +990,10 @@ int HnswSparseStreamer::search_bf_key_batch(
   }
 
   ctx->clear();
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) ctx->clear();
+  });
   ctx->update_dist_caculator_distance(search_distance_);
   ctx->resize_results(count);
 
@@ -1075,6 +1084,7 @@ int HnswSparseStreamer::search_bf_key_batch(
     return IndexError_Runtime;
   }
 
+  complete = true;
   return 0;
 } catch (const GraphStorageError &error) {
   return error.code;

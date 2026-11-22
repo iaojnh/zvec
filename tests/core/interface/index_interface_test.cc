@@ -1398,6 +1398,96 @@ TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
 }
 #endif  // DISKANN_SUPPORTED
 
+TEST(IndexInterface, PropagatesSparseReadStatuses) {
+  using namespace zvec::core;
+  class FaultingStreamer : public IndexStreamer {
+   public:
+    int open(IndexStorage::Pointer) override { return 0; }
+    int flush(uint64_t) override { return 0; }
+    int close() override { return 0; }
+    int cleanup() override { return 0; }
+    const IndexMeta &meta() const override { return meta_; }
+    const Stats &stats() const override { return stats_; }
+
+    int search_impl(uint32_t, const uint32_t *, const void *,
+                    const IndexQueryMeta &, Context::Pointer &) const override {
+      return IndexError_NoMemory;
+    }
+    int search_bf_impl(uint32_t, const uint32_t *, const void *,
+                       const IndexQueryMeta &,
+                       Context::Pointer &) const override {
+      return IndexError_NoMemory;
+    }
+    int search_bf_by_keys_impl(uint32_t, const uint32_t *, const void *,
+                               const std::vector<uint64_t> &,
+                               const IndexQueryMeta &,
+                               Context::Pointer &) const override {
+      return IndexError_NoMemory;
+    }
+    int get_sparse_vector_by_id(uint32_t, uint32_t *, std::string *,
+                                std::string *) const override {
+      return IndexError_NoMemory;
+    }
+
+   private:
+    IndexMeta meta_;
+    Stats stats_;
+  };
+
+  class TestIndex : public HNSWIndex {
+   public:
+    using HNSWIndex::init;
+
+    void set_streamer(IndexStreamer::Pointer streamer) {
+      streamer_ = std::move(streamer);
+    }
+  };
+
+  auto param = HNSWIndexParamBuilder()
+                   .with_metric_type(MetricType::kInnerProduct)
+                   .with_data_type(DataType::DT_FP32)
+                   .with_is_sparse(true)
+                   .build();
+  const std::string path = "sparse_read_status.index";
+  zvec::test_util::RemoveTestFiles(path);
+  TestIndex index;
+  ASSERT_EQ(0, index.init(*param));
+  ASSERT_EQ(0, index.open(path, {StorageOptions::StorageType::kMMAP, true}));
+  const auto streamer = index.index_searcher();
+  const auto faulting_streamer = std::make_shared<FaultingStreamer>();
+  const uint32_t coordinate = 7;
+  const float value = 2.f;
+  const VectorData vector{SparseVector{1, &coordinate, &value}};
+  ASSERT_EQ(0, index.add(vector, 0));
+  VectorDataBuffer fetched;
+  ASSERT_EQ(0, index.fetch(0, &fetched));
+
+  auto query = HNSWQueryParamBuilder()
+                   .with_topk(1)
+                   .with_fetch_vector(true)
+                   .with_ef_search(4)
+                   .build();
+  const std::vector<uint64_t> keys{0};
+  for (int mode = 0; mode < 3; ++mode) {
+    SCOPED_TRACE(mode);
+    query->is_linear = mode == 1;
+    query->borrowed_bf_pks = mode == 2 ? &keys : nullptr;
+    SearchResult result;
+    ASSERT_EQ(0, index.search(vector, query, &result));
+    ASSERT_EQ(1U, result.doc_list_.size());
+    index.set_streamer(faulting_streamer);
+    EXPECT_EQ(IndexError_NoMemory, index.search(vector, query, &result));
+    EXPECT_TRUE(result.doc_list_.empty());
+    index.set_streamer(streamer);
+  }
+
+  index.set_streamer(faulting_streamer);
+  EXPECT_EQ(IndexError_NoMemory, index.fetch(0, &fetched));
+  index.set_streamer(streamer);
+  ASSERT_EQ(0, index.close());
+  zvec::test_util::RemoveTestFiles(path);
+}
+
 TEST(IndexInterface, SparseGeneral) {
   constexpr uint32_t kSparseCount = 3;
   const std::string index_name{"test.index"};

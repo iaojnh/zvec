@@ -26,6 +26,9 @@
 #include <turbo/norm/norm_matrix.h>
 #include <zvec/ailego/container/vector.h>
 #include "tests/test_util.h"
+#include "algorithm/hnsw_sparse/hnsw_sparse_context.h"
+#include "algorithm/hnsw_sparse/hnsw_sparse_index_provider.h"
+#include "algorithm/hnsw_sparse/hnsw_sparse_streamer_entity.h"
 
 #if defined(__GNUC__) || defined(__GNUG__)
 #pragma GCC diagnostic push
@@ -97,6 +100,96 @@ void HnswSparseStreamerTest::SetUp() {
 
 void HnswSparseStreamerTest::TearDown() {
   zvec::test_util::RemoveTestPath(dir_);
+}
+
+TEST_F(HnswSparseStreamerTest, FetchResultsPropagateSparsePayloadReadErrors) {
+  class FaultingPayloadEntity : public HnswSparseStreamerEntity {
+   public:
+    using HnswSparseStreamerEntity::HnswSparseStreamerEntity;
+
+    int get_sparse_data(uint64_t offset, uint32_t length,
+                        IndexStorage::MemoryBlock &block) const override {
+      if (fail_reads) return IndexError_NoMemory;
+      return HnswSparseStreamerEntity::get_sparse_data(offset, length, block);
+    }
+
+    bool fail_reads{false};
+  };
+
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->init(Params()));
+  ASSERT_EQ(0, storage->open(dir_ + "PayloadReadFailure", true));
+  IndexStreamer::Stats stats;
+  auto entity = std::make_shared<FaultingPayloadEntity>(stats);
+  entity->set_sparse_unit_size(sizeof(float));
+  entity->set_sparse_meta_size(HnswSparseEntity::kSparseMetaSize);
+  entity->set_l0_neighbor_cnt(4);
+  entity->set_upper_neighbor_cnt(4);
+  entity->set_scaling_factor(4);
+  ASSERT_EQ(0, entity->init(8UL * 1024 * 1024, 4));
+  ASSERT_EQ(0, entity->open(storage, false));
+  const uint32_t coordinate = 7;
+  const float value = 2.f;
+  std::string sparse;
+  SparseUtility::TransSparseFormat(1, &coordinate, &value, sizeof(value),
+                                   sparse);
+  node_id_t id;
+  ASSERT_EQ(0, entity->add_vector(0, 42, sparse, 1, &id));
+  ASSERT_EQ(0U, id);
+
+  auto metric = IndexFactory::CreateMetric("InnerProductSparse");
+  ASSERT_NE(nullptr, metric);
+  ASSERT_EQ(0, metric->init(*index_meta_ptr_, Params()));
+  for (bool grouped : {false, true}) {
+    SCOPED_TRACE(grouped);
+    HnswSparseContext ctx(metric, entity);
+    ctx.set_fetch_vector(true);
+    ctx.set_topk(1);
+    if (grouped) ctx.set_group_params(1, 1);
+    ctx.resize_results(1);
+    if (grouped) {
+      auto &heap = ctx.group_topk_heaps()["group"];
+      heap.limit(1);
+      heap.emplace(id, 0.f);
+    } else {
+      ctx.topk_heap().emplace(id, 0.f);
+    }
+
+    entity->fail_reads = true;
+    try {
+      ctx.topk_to_result();
+      ADD_FAILURE() << "Expected the payload read error";
+    } catch (const GraphStorageError &error) {
+      EXPECT_EQ(IndexError_NoMemory, error.code);
+    }
+
+    entity->fail_reads = false;
+    ctx.topk_to_result();
+    const auto &docs = grouped ? ctx.group_result()[0].docs() : ctx.result();
+    ASSERT_EQ(1U, docs.size());
+    EXPECT_EQ(42U, docs[0].key());
+    EXPECT_EQ(1U, docs[0].sparse_doc().sparse_count());
+  }
+  HnswSparseIndexProvider provider(*index_meta_ptr_, entity, "test");
+  entity->fail_reads = true;
+  auto failed = provider.create_iterator();
+  ASSERT_NE(nullptr, failed);
+  EXPECT_FALSE(failed->is_valid());
+  EXPECT_EQ(IndexError_NoMemory, failed->status());
+
+  entity->fail_reads = false;
+  auto iterator = provider.create_iterator();
+  ASSERT_NE(nullptr, iterator);
+  ASSERT_TRUE(iterator->is_valid());
+  EXPECT_EQ(42U, iterator->key());
+  EXPECT_EQ(1U, iterator->sparse_count());
+  iterator->next();
+  EXPECT_FALSE(iterator->is_valid());
+  EXPECT_EQ(0, iterator->status());
+
+  ASSERT_EQ(0, entity->close());
+  ASSERT_EQ(0, storage->close());
 }
 
 TEST_F(HnswSparseStreamerTest, TestGeneral) {

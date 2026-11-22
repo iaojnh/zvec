@@ -35,6 +35,7 @@
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include "db/common/document_memory.h"
 #include "db/common/file_helper.h"
+#include "db/common/result_memory_allowance.h"
 #include "db/index/common/delete_store.h"
 #include "db/index/common/id_map.h"
 #include "db/index/common/version_manager.h"
@@ -94,6 +95,41 @@ TEST_P(SegmentTest, EmptySchema) {
   EXPECT_EQ(segment->id(), 0);
 
   segment.reset();
+}
+
+TEST_P(SegmentTest, BufferedVectorOpenAdmissionPrecedesFirstInsert) {
+  if (GetParam()) GTEST_SKIP() << "This case uses BufferStorage";
+  CollectionSchema vector_schema(col_name_);
+  ASSERT_TRUE(vector_schema.add_field(std::make_shared<FieldSchema>(
+      "emb", DataType::VECTOR_FP32, 4, false,
+      std::make_shared<FlatIndexParams>(MetricType::L2))).ok());
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, vector_schema, 0, 0, id_map_, delete_store_, version_manager_,
+      options_, 0, 0);
+  ASSERT_NE(segment, nullptr);
+  auto doc = test::TestHelper::CreateDoc(0, vector_schema);
+
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  detail::SharedResultMemoryAllowance().reclaim_idle();
+  // Admit the empty forward writer's initial document cache and leave less
+  // than one native page for opening the first vector index.
+  const size_t forward_cache_bytes = 2 * 128 * sizeof(Doc);
+  const size_t headroom = forward_cache_bytes + ailego::kVectorPageSize / 2;
+  ASSERT_GT(pool.available(), headroom);
+  {
+    ExternalChargeGuard pressure(pool, pool.available() - headroom);
+    ASSERT_TRUE(pressure.charged());
+    const auto status = segment->insert(doc);
+    EXPECT_EQ(status.code(), StatusCode::RESOURCE_EXHAUSTED)
+        << status.message();
+    EXPECT_NE(status.message().find("Failed to open index"), std::string::npos)
+        << status.message();
+    EXPECT_FALSE(segment->has_record());
+  }
+
+  const auto retried = segment->insert(doc);
+  ASSERT_TRUE(retried.ok()) << retried.message();
+  EXPECT_EQ(1u, segment->doc_count());
 }
 
 

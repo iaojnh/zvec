@@ -650,7 +650,9 @@ int MixedStreamerReducer::read_sparse_vec(
       LOG_DEBUG("read_sparse_vec cancelled.");
       return 0;
     }
-    if (filter(iterator->key() + (uint64_t)id_offset)) {
+    const uint64_t key = iterator->key();
+    if (iterator->status() != 0) return iterator->status();
+    if (filter(key + id_offset)) {
       (*stats_.mutable_filtered_count())++;
       iterator->next();
       continue;
@@ -682,12 +684,12 @@ int MixedStreamerReducer::read_sparse_vec(
                                                   std::move(sparse_indices),
                                                   std::move(sparse_values)))) {
       LOG_ERROR("Produce vector to queue failed. key[%lu]",
-                (size_t)iterator->key());
+                static_cast<size_t>(key));
       return IndexError_Runtime;
     }
     iterator->next();
   }
-  return 0;
+  return iterator->status();
 } catch (const std::bad_alloc &) {
   return IndexError_NoMemory;
 }

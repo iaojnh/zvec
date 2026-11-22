@@ -19,15 +19,19 @@
 
 namespace zvec::sqlengine {
 
-#define CHECK_ARROW_STATUS(msg, expression)                                 \
-  do {                                                                      \
-    const auto operation_status = (expression);                             \
-    if (!operation_status.ok()) {                                           \
-      return tl::make_unexpected(Status(                                    \
-          operation_status.IsOutOfMemory() ? StatusCode::RESOURCE_EXHAUSTED \
-                                           : StatusCode::INTERNAL_ERROR,    \
-          std::string(msg) + operation_status.ToString()));                 \
-    }                                                                       \
+namespace {
+
+Status VectorBuilderError(const char *operation, const arrow::Status &status) {
+  return Status(status.IsOutOfMemory() ? StatusCode::RESOURCE_EXHAUSTED
+                                       : StatusCode::INTERNAL_ERROR,
+                std::string(operation) + ": " + status.ToString());
+}
+
+#define CHECK_ARROW_STATUS(operation, expression)                        \
+  do {                                                                   \
+    const auto status = (expression);                                    \
+    if (!status.ok())                                                    \
+      return tl::make_unexpected(VectorBuilderError(operation, status)); \
   } while (false)
 
 template <typename Iter>
@@ -36,7 +40,7 @@ Result<std::shared_ptr<arrow::Array>> fetch_dense_vector_helper(
     arrow::MemoryPool *pool) {
   size_t count = std::distance(begin, end);
   arrow::BinaryBuilder vector_builder(pool);
-  CHECK_ARROW_STATUS("Reserve vector builder failed:",
+  CHECK_ARROW_STATUS("Reserve vector builder failed",
                      vector_builder.Reserve(count));
   for (Iter i = begin; i != end; ++i) {
     auto vector_res = indexer->fetch(*i);
@@ -47,31 +51,18 @@ Result<std::shared_ptr<arrow::Array>> fetch_dense_vector_helper(
                            vector_res.value().vector_buffer)
                            .data;
     if (data.empty()) {
-      CHECK_ARROW_STATUS("Append null failed:", vector_builder.AppendNull());
+      CHECK_ARROW_STATUS("Append null failed", vector_builder.AppendNull());
     } else {
-      CHECK_ARROW_STATUS("Append vector failed:", vector_builder.Append(data));
+      CHECK_ARROW_STATUS("Append vector failed", vector_builder.Append(data));
     }
   }
   auto vector_array_ret = vector_builder.Finish();
   if (!vector_array_ret.ok()) {
-    return tl::make_unexpected(Status::InternalError(
-        "finish vector builder failed:", vector_array_ret.status().ToString()));
+    return tl::make_unexpected(VectorBuilderError(
+        "Finish vector builder failed", vector_array_ret.status()));
   }
   return vector_array_ret.MoveValueUnsafe();
 }
-
-Result<std::shared_ptr<arrow::Array>> FetchVectorOp::fetch_dense_vector(
-    const Segment &segment, const std::string &vector_name,
-    const std::vector<int> &rows) {
-  auto indexer = segment.get_combined_vector_indexer(vector_name);
-  if (!indexer) {
-    return tl::make_unexpected(
-        Status::InvalidArgument("vector index not found:", vector_name));
-  }
-  return fetch_dense_vector_helper(indexer.get(), rows.begin(), rows.end(),
-                                   segment.query_memory_pool());
-}
-
 
 template <typename Iter>
 Result<std::shared_ptr<arrow::Array>> fetch_sparse_vector_helper(
@@ -83,8 +74,8 @@ Result<std::shared_ptr<arrow::Array>> fetch_sparse_vector_helper(
   arrow::BinaryBuilder *sparse_value_builder = nullptr;
   auto array_builder = arrow::MakeBuilder(Util::sparse_type(), pool);
   if (!array_builder.ok()) {
-    return tl::make_unexpected(Status::InternalError(
-        "make builder failed:", array_builder.status().ToString()));
+    return tl::make_unexpected(
+        VectorBuilderError("Make builder failed", array_builder.status()));
   }
   sparse_builder.reset(dynamic_cast<arrow::StructBuilder *>(
       array_builder.ValueUnsafe().release()));
@@ -93,9 +84,9 @@ Result<std::shared_ptr<arrow::Array>> fetch_sparse_vector_helper(
   sparse_value_builder =
       dynamic_cast<arrow::BinaryBuilder *>(sparse_builder->field_builder(1));
 
-  CHECK_ARROW_STATUS("Reserve failed:", sparse_builder->Reserve(count));
-  CHECK_ARROW_STATUS("Reserve failed:", sparse_index_builder->Reserve(count));
-  CHECK_ARROW_STATUS("Reserve failed:", sparse_value_builder->Reserve(count));
+  CHECK_ARROW_STATUS("Reserve failed", sparse_builder->Reserve(count));
+  CHECK_ARROW_STATUS("Reserve failed", sparse_index_builder->Reserve(count));
+  CHECK_ARROW_STATUS("Reserve failed", sparse_value_builder->Reserve(count));
   for (auto i = begin; i != end; i++) {
     auto vector_res = indexer->fetch(*i);
     if (!vector_res) {
@@ -117,10 +108,26 @@ Result<std::shared_ptr<arrow::Array>> fetch_sparse_vector_helper(
 
   auto vector_array_ret = sparse_builder->Finish();
   if (!vector_array_ret.ok()) {
-    return tl::make_unexpected(Status::InternalError(
-        "finish vector builder failed:", vector_array_ret.status().ToString()));
+    return tl::make_unexpected(VectorBuilderError(
+        "Finish vector builder failed", vector_array_ret.status()));
   }
   return vector_array_ret.MoveValueUnsafe();
+}
+
+#undef CHECK_ARROW_STATUS
+
+}  // namespace
+
+Result<std::shared_ptr<arrow::Array>> FetchVectorOp::fetch_dense_vector(
+    const Segment &segment, const std::string &vector_name,
+    const std::vector<int> &rows) {
+  auto indexer = segment.get_combined_vector_indexer(vector_name);
+  if (!indexer) {
+    return tl::make_unexpected(
+        Status::InvalidArgument("vector index not found:", vector_name));
+  }
+  return fetch_dense_vector_helper(indexer.get(), rows.begin(), rows.end(),
+                                   segment.query_memory_pool());
 }
 
 Result<std::shared_ptr<arrow::Array>> FetchVectorOp::fetch_sparse_vector(

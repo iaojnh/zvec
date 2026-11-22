@@ -293,7 +293,7 @@ int FlatStreamerEntity::flush_linear_meta() {
   }
   if (segment->write(0, &meta_, sizeof(meta_)) != sizeof(meta_)) {
     LOG_ERROR("Failed to write segment %s", FLAT_LINEAR_META_SEG_ID.c_str());
-    return IndexError_WriteData;
+    return segment->write_error();
   }
 
   meta_dirty_ = false;
@@ -1281,11 +1281,11 @@ int FlatStreamerEntity::init_storage(IndexStorage::Pointer storage) {
   }
   if (segment->write(0, &meta_, sizeof(meta_)) != sizeof(meta_)) {
     LOG_ERROR("Failed to write segment data");
-    return IndexError_WriteData;
+    return segment->write_error();
   }
   if (segment->write(sizeof(meta_), str.data(), str.size()) != str.size()) {
     LOG_ERROR("Failed to write segment data, size=%zu", str.size());
-    return IndexError_WriteData;
+    return segment->write_error();
   }
 
   ret = storage->append("IndexMeta", str.size());
@@ -1296,7 +1296,7 @@ int FlatStreamerEntity::init_storage(IndexStorage::Pointer storage) {
   auto index_meta_segment = storage->get("IndexMeta");
   if (index_meta_segment->write(0, str.data(), str.size()) != str.size()) {
     LOG_ERROR("Failed to write segment data, size=%zu", str.size());
-    return IndexError_WriteData;
+    return index_meta_segment->write_error();
   }
   *stats_.mutable_index_size() += size;
 

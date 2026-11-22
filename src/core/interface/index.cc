@@ -1132,21 +1132,23 @@ int Index::_sparse_fetch(const uint32_t doc_id,
 
   SparseVectorBuffer sparse_vector_buffer;
 
-  if (0 != streamer_->get_sparse_vector_by_id(
-               doc_id, &sparse_vector_buffer.count,
-               &sparse_vector_buffer.indices, &sparse_vector_buffer.values)) {
-    LOG_ERROR("Failed to fetch vector");
-    return core::IndexError_Runtime;
+  const int fetch_ret = streamer_->get_sparse_vector_by_id(
+      doc_id, &sparse_vector_buffer.count, &sparse_vector_buffer.indices,
+      &sparse_vector_buffer.values);
+  if (fetch_ret != 0) {
+    LOG_ERROR("Failed to fetch vector, doc_id: %u", doc_id);
+    return fetch_ret;
   }
 
   if (reformer_ != nullptr) {
     std::string reverted_sparse_values_buffer;
-    if (reformer_->revert(
-            sparse_vector_buffer.count, sparse_vector_buffer.get_indices(),
-            sparse_vector_buffer.get_values(), streamer_vector_meta_,
-            &reverted_sparse_values_buffer) != 0) {
+    const int revert_ret = reformer_->revert(
+        sparse_vector_buffer.count, sparse_vector_buffer.get_indices(),
+        sparse_vector_buffer.get_values(), streamer_vector_meta_,
+        &reverted_sparse_values_buffer);
+    if (revert_ret != 0) {
       LOG_ERROR("Failed to convert vector");
-      return core::IndexError_Runtime;
+      return revert_ret;
     }
     sparse_vector_buffer.values = std::move(reverted_sparse_values_buffer);
   }
@@ -1595,34 +1597,30 @@ int Index::_sparse_search(const VectorData &vector_data,
   auto &converted_sparse_values_buffer = sparse_workspace.value;
   core::IndexQueryMeta new_meta = input_vector_meta_;
   if (reformer_ != nullptr) {
-    if (reformer_->transform(sparse_vector.count, indices, values,
-                             input_vector_meta_,
-                             &converted_sparse_values_buffer, &new_meta) != 0) {
+    const int ret = reformer_->transform(
+        sparse_vector.count, indices, values, input_vector_meta_,
+        &converted_sparse_values_buffer, &new_meta);
+    if (ret != 0) {
       LOG_ERROR("Failed to transform vector");
-      return core::IndexError_Runtime;
+      return ret;
     }
     values = converted_sparse_values_buffer.data();
   }
 
-  if (search_param->bf_keys() != nullptr) {
-    if (streamer_->search_bf_by_keys_impl(sparse_vector.count, indices, values,
-                                          *search_param->bf_keys(), new_meta,
-                                          context) != 0) {
-      LOG_ERROR("Failed to search_bf_by_p_keys_impl vector");
-      return core::IndexError_Runtime;
-    }
+  int ret;
+  if (const auto *keys = search_param->bf_keys()) {
+    ret = streamer_->search_bf_by_keys_impl(sparse_vector.count, indices,
+                                            values, *keys, new_meta, context);
   } else if (search_param->is_linear) {
-    if (streamer_->search_bf_impl(sparse_vector.count, indices, values,
-                                  new_meta, context) != 0) {
-      LOG_ERROR("Failed to search vector");
-      return core::IndexError_Runtime;
-    }
+    ret = streamer_->search_bf_impl(sparse_vector.count, indices, values,
+                                    new_meta, context);
   } else {
-    if (streamer_->search_impl(sparse_vector.count, indices, values, new_meta,
-                               context) != 0) {
-      LOG_ERROR("Failed to search vector");
-      return core::IndexError_Runtime;
-    }
+    ret = streamer_->search_impl(sparse_vector.count, indices, values, new_meta,
+                                 context);
+  }
+  if (ret != 0) {
+    LOG_ERROR("Failed to search sparse vector");
+    return ret;
   }
   // Retrieve group_by results if applicable
   const bool has_group_by = has_group_by_search(search_param);
@@ -1681,14 +1679,13 @@ int Index::_sparse_search(const VectorData &vector_data,
         std::string reverted_sparse_values;
         reverted_sparse_values.resize(result_doc.sparse_count() *
                                       input_vector_meta_.unit_size());
-        if (reformer_->revert(result_doc.sparse_count(),
-                              reinterpret_cast<const uint32_t *>(
-                                  result_doc.sparse_indices().data()),
-                              reinterpret_cast<const void *>(
-                                  result_doc.sparse_values().data()),
-                              new_meta, &reverted_sparse_values) != 0) {
+        revert_err = reformer_->revert(result_doc.sparse_count(),
+                                       reinterpret_cast<const uint32_t *>(
+                                           result_doc.sparse_indices().data()),
+                                       result_doc.sparse_values().data(),
+                                       new_meta, &reverted_sparse_values);
+        if (revert_err != 0) {
           LOG_ERROR("Failed to revert sparse vector");
-          revert_err = core::IndexError_Runtime;
           return;
         }
         out->push_back(std::move(reverted_sparse_values));

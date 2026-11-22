@@ -135,7 +135,7 @@ int HnswStreamerEntity::dump_with_vectors(const IndexDumper::Pointer &dumper,
         if (node_chunks_[loc.first]->fetch(loc.second,
                                            node + stored_vector_size,
                                            graph_bytes) != graph_bytes) {
-          return IndexError_ReadData;
+          return node_chunks_[loc.first]->read_error();
         }
       }
       const size_t bytes = batch * output_node_size;
@@ -164,7 +164,7 @@ int HnswStreamerEntity::dump_with_vectors(const IndexDumper::Pointer &dumper,
         const size_t bytes =
             std::min(buffer.size(), chunk->data_size() - offset);
         if (chunk->fetch(offset, buffer.data(), bytes) != bytes) {
-          return IndexError_ReadData;
+          return chunk->read_error();
         }
         crc = ailego::Crc32c::Hash(buffer.data(), bytes, crc);
         if (dumper->write(buffer.data(), bytes) != bytes) {
@@ -511,7 +511,7 @@ int HnswStreamerEntity::init_chunks(const Chunk::Pointer &header_chunk) {
   size_t size = header_chunk->read(0UL, header_block, header_size());
   if (ailego_unlikely(size != header_size())) {
     LOG_ERROR("Read header chunk failed");
-    return IndexError_ReadData;
+    return header_chunk->read_error();
   }
   *mutable_header() =
       *reinterpret_cast<const HNSWHeader *>(header_block.data());
@@ -627,7 +627,7 @@ int HnswStreamerEntity::open(IndexStorage::Pointer stg, uint64_t max_index_size,
     size_t size = p.second->write(0UL, &header(), header_size());
     if (ailego_unlikely(size != header_size())) {
       LOG_ERROR("Write header chunk failed");
-      return IndexError_WriteData;
+      return p.second->write_error();
     }
     return 0;
   }
@@ -826,12 +826,12 @@ int HnswStreamerEntity::add_vector(level_t level, key_t key, const void *vec,
   size_t size = node_chunk->write(chunk_offset, vec, vector_size());
   if (ailego_unlikely(size != vector_size())) {
     LOG_ERROR("Chunk write vec failed, ret=%zu", size);
-    return IndexError_WriteData;
+    return node_chunk->write_error();
   }
   size = node_chunk->write(chunk_offset + vector_size(), &key, sizeof(key_t));
   if (ailego_unlikely(size != sizeof(key_t))) {
     LOG_ERROR("Chunk write vec failed, ret=%zu", size);
-    return IndexError_WriteData;
+    return node_chunk->write_error();
   }
   //! level 0 neighbors is inited to zero by default
 
@@ -918,7 +918,7 @@ int HnswStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
                                     sizeof(key_t));
     if (ailego_unlikely(size != sizeof(key_t))) {
       LOG_ERROR("Chunk write key failed, ret=%zu", size);
-      return IndexError_WriteData;
+      return node_chunk->write_error();
     }
 
     chunk_offset += node_size();
@@ -937,13 +937,13 @@ int HnswStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
   size_t size = node_chunk->write(chunk_offset, vec, vector_size());
   if (ailego_unlikely(size != vector_size())) {
     LOG_ERROR("Chunk write vec failed, ret=%zu", size);
-    return IndexError_WriteData;
+    return node_chunk->write_error();
   }
 
   size = node_chunk->write(chunk_offset + vector_size(), &key, sizeof(key_t));
   if (ailego_unlikely(size != sizeof(key_t))) {
     LOG_ERROR("Chunk write vec failed, ret=%zu", size);
-    return IndexError_WriteData;
+    return node_chunk->write_error();
   }
   //! level 0 neighbors is inited to zero by default
 
@@ -1231,7 +1231,7 @@ int HnswContiguousStreamerEntity::build_contiguous_memory() {
     IndexStorage::MemoryBlock chunk_data;
     size_t data_size = chunks[chunk_idx]->data_size();
     if (chunks[chunk_idx]->read(0, chunk_data, data_size) != data_size)
-      return IndexError_ReadData;
+      return chunks[chunk_idx]->read_error();
 
     uint32_t base_id = chunk_idx * nodes_per_chunk;
     uint32_t count_in_chunk = std::min(nodes_per_chunk, total_docs - base_id);
@@ -1290,7 +1290,7 @@ int HnswContiguousStreamerEntity::build_contiguous_memory() {
     IndexStorage::MemoryBlock chunk_data;
     size_t data_size = upper_chunks[i]->data_size();
     if (upper_chunks[i]->read(0, chunk_data, data_size) != data_size)
-      return IndexError_ReadData;
+      return upper_chunks[i]->read_error();
     std::memcpy(upper_neighbor_base_ + upper_chunk_offsets_[i],
                 chunk_data.data(), data_size);
   }

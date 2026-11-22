@@ -279,6 +279,7 @@ HnswSparseStreamerEntity::get_sparse_data_from_vector(const void *vec) const {
 int HnswSparseStreamerEntity::get_sparse_data_from_vector(
     const void *vec, IndexStorage::MemoryBlock &block,
     int &sparse_length) const {
+  if (vec == nullptr) return IndexError_ReadData;
   const char *vec_ptr = reinterpret_cast<const char *>(vec);
 
   uint64_t offset = *((uint64_t *)(vec_ptr));
@@ -305,8 +306,8 @@ key_t HnswSparseStreamerEntity::get_key(node_id_t id) const {
   size_t ret =
       node_chunks_[loc.first]->read(loc.second, key_block, sizeof(key_t));
   if (ailego_unlikely(ret != sizeof(key_t))) {
-    LOG_ERROR("Read vector failed, ret=%zu", ret);
-    return kInvalidKey;
+    LOG_ERROR("Read key failed, ret=%zu", ret);
+    throw GraphStorageError{node_chunks_[loc.first]->read_error()};
   }
 
   return *reinterpret_cast<const key_t *>(key_block.data());
@@ -347,7 +348,7 @@ int HnswSparseStreamerEntity::init_chunks(
   size_t size = header_chunk->read(0UL, data_block, header_size());
   if (ailego_unlikely(size != header_size())) {
     LOG_ERROR("Read header chunk failed");
-    return IndexError_ReadData;
+    return header_chunk->read_error();
   }
   *mutable_header() =
       *reinterpret_cast<const HNSWSparseHeader *>(data_block.data());
@@ -436,7 +437,7 @@ int HnswSparseStreamerEntity::open(IndexStorage::Pointer stg, bool check_crc) {
     size_t size = p.second->write(0UL, &header(), header_size());
     if (ailego_unlikely(size != header_size())) {
       LOG_ERROR("Write header chunk failed");
-      return IndexError_WriteData;
+      return p.second->write_error();
     }
     return 0;
   }
@@ -693,7 +694,7 @@ int HnswSparseStreamerEntity::add_vector(level_t level, key_t key,
       node_chunk->write(chunk_offset + sparse_meta_size(), &key, sizeof(key_t));
   if (ailego_unlikely(size != sizeof(key_t))) {
     LOG_ERROR("SparseChunk write vec failed, ret=%zu", size);
-    return IndexError_WriteData;
+    return node_chunk->write_error();
   }
 
   //! level 0 neighbors is inited to zero by default
@@ -806,7 +807,7 @@ int HnswSparseStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
                                     &kInvalidKey, sizeof(key_t));
     if (ailego_unlikely(size != sizeof(key_t))) {
       LOG_ERROR("SparseChunk write key failed, ret=%zu", size);
-      return IndexError_WriteData;
+      return node_chunk->write_error();
     }
 
     chunk_offset += node_size();
@@ -879,7 +880,7 @@ int HnswSparseStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
       node_chunk->write(chunk_offset + sparse_meta_size(), &key, sizeof(key_t));
   if (ailego_unlikely(size != sizeof(key_t))) {
     LOG_ERROR("SparseChunk write vec failed, ret=%zu", size);
-    return IndexError_WriteData;
+    return node_chunk->write_error();
   }
 
   //! level 0 neighbors is inited to zero by default
@@ -974,7 +975,7 @@ const HnswSparseEntity::Pointer HnswSparseStreamerEntity::clone() const {
 //! Get sparse vector feature data by key
 int HnswSparseStreamerEntity::get_sparse_vector_by_key(
     key_t key, uint32_t *sparse_count, std::string *sparse_indices_buffer,
-    std::string *sparse_values_buffer) const {
+    std::string *sparse_values_buffer) const try {
   *sparse_count = 0;
 
   auto id = get_id(key);
@@ -984,11 +985,14 @@ int HnswSparseStreamerEntity::get_sparse_vector_by_key(
 
   return get_sparse_vector_by_id(id, sparse_count, sparse_indices_buffer,
                                  sparse_values_buffer);
+} catch (const GraphStorageError &error) {
+  return error.code;
 }
 
 int HnswSparseStreamerEntity::get_sparse_vector_by_id(
     node_id_t id, uint32_t *sparse_count, std::string *sparse_indices_buffer,
-    std::string *sparse_values_buffer) const {
+    std::string *sparse_values_buffer) const try {
+  if (id >= doc_cnt()) return IndexError_OutOfRange;
   IndexStorage::MemoryBlock block;
   const int ret = get_sparse_data(id, block);
   if (ret != 0) return ret;
@@ -1002,6 +1006,8 @@ int HnswSparseStreamerEntity::get_sparse_vector_by_id(
                                      sparse_values_buffer, sparse_unit_size());
 
   return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 }  // namespace core

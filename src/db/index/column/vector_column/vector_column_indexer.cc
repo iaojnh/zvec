@@ -36,7 +36,7 @@ Status VectorColumnIndexer::open(
 }
 
 Status VectorColumnIndexer::create_proxima_index(
-    const vector_column_params::ReadOptions &read_options) {
+    const vector_column_params::ReadOptions &read_options) try {
   auto index_param_result =
       ProximaEngineHelper::convert_to_engine_index_param(field_schema_);
   if (!index_param_result.has_value()) {
@@ -44,8 +44,9 @@ Status VectorColumnIndexer::create_proxima_index(
   }
   auto &index_param = index_param_result.value();
 
-  index = core_interface::IndexFactory::CreateAndInitIndex(*index_param);
-  if (index == nullptr) {
+  auto candidate =
+      core_interface::IndexFactory::CreateAndInitIndex(*index_param);
+  if (!candidate) {
     return Status::InternalError("Failed to create index");
   }
 
@@ -54,13 +55,16 @@ Status VectorColumnIndexer::create_proxima_index(
           ? core_interface::StorageOptions::StorageType::kMMAP
           : core_interface::StorageOptions::StorageType::kBufferPool;
 
-  if (0 != index->open(this->index_file_path(),
-                       {storage_type, read_options.create_new,
-                        read_options.read_only})) {
-    return Status::InternalError("Failed to open index");
-  }
-
+  const int ret = candidate->open(
+      index_file_path_,
+      {storage_type, read_options.create_new, read_options.read_only});
+  if (ret != 0)
+    return ProximaEngineHelper::index_status(ret, "Failed to open index");
+  index = std::move(candidate);
   return Status::OK();
+} catch (const std::bad_alloc &) {
+  return ProximaEngineHelper::index_status(core::IndexError_NoMemory,
+                                           "Failed to open index");
 }
 
 Status VectorColumnIndexer::flush() {
@@ -68,10 +72,8 @@ Status VectorColumnIndexer::flush() {
     return Status::InvalidArgument("Index not opened");
   }
 
-  if (0 != index->flush()) {
-    return Status::InternalError("Failed to flush index");
-  }
-  return Status::OK();
+  return ProximaEngineHelper::index_status(index->flush(),
+                                           "Failed to flush index");
 }
 
 
@@ -80,9 +82,9 @@ Status VectorColumnIndexer::close() {
     return Status::InvalidArgument("Index not opened");
   }
 
-  if (0 != index->close()) {
-    return Status::InternalError("Failed to close index");
-  }
+  const int ret = index->close();
+  if (ret != 0)
+    return ProximaEngineHelper::index_status(ret, "Failed to close index");
   index.reset();
   return Status::OK();
 }
@@ -92,9 +94,8 @@ Status VectorColumnIndexer::destroy() {
     return Status::InvalidArgument("Index not opened");
   }
 
-  if (close() != Status::OK()) {
-    return Status::InternalError("Failed to close index");
-  }
+  auto status = close();
+  if (!status.ok()) return status;
   if (!ailego::File::RemovePath(index_file_path_)) {
     return Status::InternalError("Failed to remove index file");
   }
@@ -126,12 +127,10 @@ Status VectorColumnIndexer::merge(
   if (engine_filter == nullptr) {
     return Status::InvalidArgument("Failed to convert filter");
   }
-  if (0 !=
+  const int ret =
       index->merge(engine_indexers, *engine_filter,
-                   {merge_options.write_concurrency, merge_options.pool})) {
-    return Status::InternalError("Failed to merge index");
-  }
-  return Status::OK();
+                   {merge_options.write_concurrency, merge_options.pool});
+  return ProximaEngineHelper::index_status(ret, "Failed to merge index");
 }
 
 Status VectorColumnIndexer::insert(
@@ -142,10 +141,9 @@ Status VectorColumnIndexer::insert(
 
   auto engine_vector_data =
       ProximaEngineHelper::convert_to_engine_vector(vector_data, is_sparse_);
-  if (0 != index->add(engine_vector_data.value(), doc_id)) {
-    return Status::InternalError("Failed to add vector to index");
-  }
-  return Status::OK();
+  if (!engine_vector_data) return engine_vector_data.error();
+  return ProximaEngineHelper::index_status(
+      index->add(*engine_vector_data, doc_id), "Failed to add vector to index");
 }
 
 Status VectorColumnIndexer::prepare_insert(
@@ -155,13 +153,9 @@ Status VectorColumnIndexer::prepare_insert(
   auto engine_vector_data =
       ProximaEngineHelper::convert_to_engine_vector(vector_data, is_sparse_);
   if (!engine_vector_data) return engine_vector_data.error();
-  const int ret = index->prepare_add(*engine_vector_data, doc_id, out);
-  if (ret == 0) return Status::OK();
-  return Status(ret == core::IndexError_NoMemory
-                    ? StatusCode::RESOURCE_EXHAUSTED
-                    : StatusCode::INTERNAL_ERROR,
-                std::string("Failed to prepare vector insert: ") +
-                    core::IndexError::What(ret));
+  return ProximaEngineHelper::index_status(
+      index->prepare_add(*engine_vector_data, doc_id, out),
+      "Failed to prepare vector insert");
 }
 
 Result<vector_column_params::VectorDataBuffer> VectorColumnIndexer::fetch(
@@ -174,12 +168,8 @@ Result<vector_column_params::VectorDataBuffer> VectorColumnIndexer::fetch(
 
   const int fetch_error = index->fetch(doc_id, &vector_data_buffer);
   if (fetch_error != 0) {
-    return tl::make_unexpected(
-        Status(fetch_error == core::IndexError_NoMemory
-                   ? StatusCode::RESOURCE_EXHAUSTED
-                   : StatusCode::INTERNAL_ERROR,
-               std::string("Failed to fetch vector from index: ") +
-                   core::IndexError::What(fetch_error)));
+    return tl::make_unexpected(ProximaEngineHelper::index_status(
+        fetch_error, "Failed to fetch vector from index"));
   }
   return ProximaEngineHelper::move_from_engine_vector_buffer(
              std::move(vector_data_buffer), is_sparse_)
@@ -221,12 +211,8 @@ Result<IndexResults::Ptr> VectorColumnIndexer::search(
                     &search_result);
   if (!filter.status().ok()) return tl::make_unexpected(filter.status());
   if (search_error != 0) {
-    return tl::make_unexpected(
-        Status(search_error == core::IndexError_NoMemory
-                   ? StatusCode::RESOURCE_EXHAUSTED
-                   : StatusCode::INTERNAL_ERROR,
-               std::string("Failed to search vector: ") +
-                   core::IndexError::What(search_error)));
+    return tl::make_unexpected(ProximaEngineHelper::index_status(
+        search_error, "Failed to search vector"));
   }
 
   // Return grouped results when group_by is active

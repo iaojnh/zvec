@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include "db/index/column/vector_column/engine_helper.hpp"
 #include "db/index/column/vector_column/vector_column_params.h"
 #include "tests/test_util.h"
@@ -32,6 +33,36 @@
 #endif
 
 using namespace zvec;
+
+TEST(VectorColumnIndexerTest, BufferedOpenReportsBudgetRefusalAndCanRetry) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto original_capacity = pool.capacity();
+  AILEGO_DEFER([&] { EXPECT_EQ(0, pool.init(original_capacity)); });
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(8 << 20));
+
+  const std::string path = "test_open_budget.index";
+  test_util::RemoveTestFiles(path);
+  AILEGO_DEFER([&] { test_util::RemoveTestFiles(path); });
+  VectorColumnIndexer indexer(
+      path, FieldSchema("test", DataType::VECTOR_FP32, 4, false,
+                        std::make_shared<FlatIndexParams>(MetricType::L2)));
+
+  const size_t headroom = ailego::kVectorPageSize / 8;
+  ASSERT_GT(pool.available(), headroom);
+  {
+    ailego::MemoryReservation pressure;
+    pressure.add(pool.available() - headroom);
+    const auto status = indexer.open({false, true, false});
+    EXPECT_EQ(status.code(), StatusCode::RESOURCE_EXHAUSTED)
+        << status.message();
+    EXPECT_EQ(nullptr, indexer.debug_get_index());
+    EXPECT_FALSE(ailego::File::IsExist(path));
+  }
+
+  const auto retried = indexer.open({false, true, false});
+  ASSERT_TRUE(retried.ok()) << retried.message();
+  EXPECT_TRUE(indexer.destroy().ok());
+}
 
 TEST(VectorColumnIndexerTest, ReusedQueryParametersAndFlatFallback) {
   FieldSchema field("vector", DataType::VECTOR_FP32, 32, false,

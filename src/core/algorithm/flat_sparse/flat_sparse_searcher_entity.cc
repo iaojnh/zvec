@@ -85,7 +85,7 @@ int FlatSparseSearcherEntity::load_container(
                       sizeof(meta_))) {
     LOG_ERROR("Failed to read meta segment %s",
               PARAM_FLAT_SPARSE_META_SEG_ID.c_str());
-    return IndexError_ReadData;
+    return segment->read_error();
   }
 
   // keys segment
@@ -181,13 +181,13 @@ int FlatSparseSearcherEntity::get_sparse_vector_ptr_by_id(
   char record[sizeof(uint64_t) + sizeof(uint32_t)];
   if (sparse_offset_chunk_->fetch(static_cast<size_t>(id) * sizeof(record),
                                   record, sizeof(record)) != sizeof(record))
-    return IndexError_ReadData;
+    return sparse_offset_chunk_->read_error();
   uint64_t offset;
   std::memcpy(&offset, record, sizeof(offset));
   std::memcpy(length, record + sizeof(offset), sizeof(*length));
   if (!*length) return 0;
   if (sparse_data_chunk_->read(offset, block, *length) != *length)
-    return IndexError_ReadData;
+    return sparse_data_chunk_->read_error();
   return 0;
 }
 
@@ -224,15 +224,15 @@ node_id_t FlatSparseSearcherEntity::get_id(uint64_t key) const {
             mapping_chunk_->fetch(static_cast<size_t>(idx) * sizeof(node_id_t),
                                   &local_id,
                                   sizeof(local_id)) != sizeof(node_id_t))) {
-      LOG_ERROR("Read key from segment failed");
-      throw ReadError{IndexError_ReadData};
+      LOG_ERROR("Read key mapping from segment failed");
+      throw ReadError{mapping_chunk_->read_error()};
     }
     uint64_t mkey;
     if (ailego_unlikely(
             keys_chunk_->fetch(static_cast<size_t>(local_id) * sizeof(uint64_t),
                                &mkey, sizeof(mkey)) != sizeof(uint64_t))) {
       LOG_ERROR("Read key from segment failed");
-      throw ReadError{IndexError_ReadData};
+      throw ReadError{keys_chunk_->read_error()};
     }
     if (mkey < key) {
       start = idx + 1;
@@ -252,7 +252,7 @@ uint64_t FlatSparseSearcherEntity::get_key(node_id_t id) const {
           keys_chunk_->fetch(static_cast<size_t>(id) * sizeof(uint64_t), &key,
                              sizeof(key)) != sizeof(uint64_t))) {
     LOG_ERROR("Read key from segment failed");
-    throw ReadError{IndexError_ReadData};
+    throw ReadError{keys_chunk_->read_error()};
   }
   return key;
 }

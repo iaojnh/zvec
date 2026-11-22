@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <ailego/pattern/defer.h>
 #include <zvec/ailego/io/mmap_file.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/file_helper.h>
@@ -121,15 +122,36 @@ int IndexMapping::open(const std::string &path, bool cow, bool full_mode) try {
   return IndexError_NoMemory;
 }
 
-int IndexMapping::create(const std::string &path,
-                         size_t seg_meta_capacity) try {
+int IndexMapping::create(const std::string &path, size_t seg_meta_capacity) {
+  return create_impl(path, seg_meta_capacity, false);
+}
+
+int IndexMapping::create_exclusive(const std::string &path,
+                                   size_t seg_meta_capacity) {
+  IndexMapping candidate;
+  const int ret = candidate.create_impl(path, seg_meta_capacity, true);
+  if (ret == 0) swap(candidate);
+  return ret;
+}
+
+int IndexMapping::create_impl(const std::string &path, size_t seg_meta_capacity,
+                              bool exclusive) try {
   close();
+  bool created = false;
+  bool initialized = false;
+  AILEGO_DEFER([&] {
+    if (initialized) return;
+    close();
+    if (exclusive && created) ailego::File::Delete(path);
+  });
   path_ = path;
   seg_meta_capacity_ = seg_meta_capacity;
   current_header_start_offset_ = 0;
 
   // write() & copying to mmap() will auto extend the file size
-  if (!file_.create(path.c_str(), 0)) {
+  created = exclusive ? file_.create_exclusive(path.c_str())
+                      : file_.create(path.c_str(), 0);
+  if (!created) {
     LOG_ERROR("Failed to create file %s, %s", path.c_str(),
               ailego::FileHelper::GetLastErrorString().c_str());
     return IndexError_CreateFile;
@@ -137,10 +159,9 @@ int IndexMapping::create(const std::string &path,
   huge_page_ = ishugetlbfs(path);
   const int ret =
       huge_page_ ? init_hugepage_meta_section() : init_meta_section();
-  if (ret != 0) close();
+  initialized = ret == 0;
   return ret;
 } catch (const std::bad_alloc &) {
-  close();
   return IndexError_NoMemory;
 }
 
