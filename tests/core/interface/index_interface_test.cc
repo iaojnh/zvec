@@ -66,6 +66,10 @@ struct VecBufferPoolTestPeer {
   static void quarantine_writeback(VecBufferPool &pool) {
     pool.writeback_error_.store(VecBufferPool::kWritebackQuarantined);
   }
+
+  static bool has_writeback_worker(const VecBufferPool &pool) {
+    return pool.writeback_thread_.joinable();
+  }
 };
 }  // namespace zvec::ailego
 
@@ -180,6 +184,7 @@ TEST(IndexInterface, FailedHnswRollbackMakesDocCountUnavailable) {
               index.open(path, {StorageOptions::StorageType::kBufferPool, true}));
     auto pool = index.buffer_pool();
     ASSERT_NE(nullptr, pool);
+    ASSERT_TRUE(ailego::VecBufferPoolTestPeer::has_writeback_worker(*pool));
     auto streamer = index.index_searcher();
     auto context = streamer->create_context();
     ASSERT_NE(nullptr, context);
@@ -209,6 +214,7 @@ TEST(IndexInterface, FailedHnswRollbackMakesDocCountUnavailable) {
     ASSERT_EQ(core::IndexError_WriteData,
               streamer->add_with_id_impl(1, vector.data(), meta, context));
     ASSERT_TRUE(injected);
+    EXPECT_FALSE(ailego::VecBufferPoolTestPeer::has_writeback_worker(*pool));
     ASSERT_EQ(nullptr, index.create_index_provider());
     EXPECT_EQ(std::numeric_limits<uint32_t>::max(), index.get_doc_count());
     EXPECT_EQ(core::IndexError_WriteData,

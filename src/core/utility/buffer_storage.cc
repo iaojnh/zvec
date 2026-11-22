@@ -1006,7 +1006,12 @@ class BufferStorageFile
         return false;
       if (!owner_->buffer_pool_->restore_range(
               absolute_offset(offset), len, static_cast<const char *>(data))) {
-        owner_->corrupted_.store(true, std::memory_order_release);
+        if (!owner_->corrupted_.exchange(true, std::memory_order_acq_rel)) {
+          // Cached query contexts can release the last storage reference in
+          // a TLS destructor. Stop the worker at the terminal failure so
+          // that destructor never has to join it under Windows' loader lock.
+          owner_->buffer_pool_->quarantine_writeback();
+        }
         return false;
       }
       owner_->set_as_dirty();

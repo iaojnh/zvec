@@ -1393,15 +1393,25 @@ void VecBufferPool::start_writeback() {
 }
 
 void VecBufferPool::stop_writeback() {
+  std::thread worker;
   {
     std::lock_guard<std::mutex> lock(writeback_mutex_);
     if (!writeback_thread_.joinable()) {
       return;
     }
     writeback_stopping_ = true;
+    worker = std::move(writeback_thread_);
   }
   writeback_cv_.notify_all();
-  writeback_thread_.join();
+  worker.join();
+}
+
+void VecBufferPool::quarantine_writeback() {
+  {
+    std::lock_guard<std::mutex> lock(writeback_flush_mutex_);
+    writeback_error_.store(kWritebackQuarantined, std::memory_order_release);
+  }
+  stop_writeback();
 }
 
 void VecBufferPool::drain_writeback() {

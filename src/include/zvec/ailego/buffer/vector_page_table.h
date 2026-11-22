@@ -796,7 +796,11 @@ class ZVEC_AILEGO_API VecBufferPool {
     return initialized_;
   }
 
-  // The kernel could not confirm completion. This pool cannot retry writes.
+  // Permanently abandon writeback after the storage becomes inconsistent.
+  // Call once from the thread reporting the failure, before its owners retire.
+  void quarantine_writeback();
+
+  // The pool cannot retry writes after corruption or unconfirmed kernel I/O.
   bool writeback_quarantined() const {
     return writeback_error() == kWritebackQuarantined;
   }
