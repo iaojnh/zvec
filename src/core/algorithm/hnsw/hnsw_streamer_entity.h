@@ -372,9 +372,11 @@ class HnswStreamerEntity : public HnswEntity {
     // add_upper_neighbor's exclusive lock to avoid data-race on
     // slots_.size() inside HnswIndexHashMap.
     std::shared_lock<std::shared_mutex> lk(*upper_neighbor_rw_mutex_);
-    auto it = upper_neighbor_index_->find(id);
-    ailego_assert_abort(it != upper_neighbor_index_->end(),
-                        "Get upper neighbor header failed");
+    int status = 0;
+    auto it = upper_neighbor_index_->find(id, &status);
+    if (status != 0) throw GraphStorageError{status};
+    if (it == upper_neighbor_index_->end())
+      throw GraphStorageError{IndexError_InvalidFormat};
     auto meta = reinterpret_cast<const UpperNeighborIndexMeta *>(&it->second);
     uint32_t chunk_idx = (meta->bits.index) >> upper_neighbor_mask_bits_;
     uint32_t offset =
@@ -488,13 +490,11 @@ class HnswStreamerEntity : public HnswEntity {
     if (ailego_unlikely(chunk->write(zero_start, zeros.data(),
                                      neighbors_size) != neighbors_size)) {
       LOG_ERROR("Chunk write zeros failed");
-      return IndexError_Runtime;
+      return chunk->write_error();
     }
 
-    if (ailego_unlikely(!upper_neighbor_index_->insert(id, meta.data))) {
-      LOG_ERROR("HashMap insert value failed");
-      return IndexError_Runtime;
-    }
+    const int status = upper_neighbor_index_->insert(id, meta.data);
+    if (status != 0) return status;
 
     return 0;
   }
@@ -919,9 +919,11 @@ class HnswMmapStreamerEntity : public HnswStreamerEntity {
     }
     // Upper level: use index to locate chunk and offset
     std::shared_lock<std::shared_mutex> lk(*upper_neighbor_rw_mutex_);
-    auto it = upper_neighbor_index_->find(id);
-    ailego_assert_abort(it != upper_neighbor_index_->end(),
-                        "Get upper neighbor header failed");
+    int status = 0;
+    auto it = upper_neighbor_index_->find(id, &status);
+    if (status != 0) throw GraphStorageError{status};
+    if (it == upper_neighbor_index_->end())
+      throw GraphStorageError{IndexError_InvalidFormat};
     auto meta = reinterpret_cast<const UpperNeighborIndexMeta *>(&it->second);
     uint32_t chunk_idx = (meta->bits.index) >> upper_neighbor_mask_bits_;
     uint32_t offset =
@@ -1151,9 +1153,11 @@ class HnswContiguousStreamerEntity : public HnswMmapStreamerEntity {
         return TypedNeighbors(std::move(block));
       }
       // Upper level: use index to locate global offset
-      auto it = upper_neighbor_index_->find(id);
-      ailego_assert_abort(it != upper_neighbor_index_->end(),
-                          "Get upper neighbor header failed");
+      int status = 0;
+      auto it = upper_neighbor_index_->find(id, &status);
+      if (status != 0) throw GraphStorageError{status};
+      if (it == upper_neighbor_index_->end())
+        throw GraphStorageError{IndexError_InvalidFormat};
       auto meta = reinterpret_cast<const UpperNeighborIndexMeta *>(&it->second);
       uint32_t chunk_idx = (meta->bits.index) >> upper_neighbor_mask_bits_;
       uint32_t local_idx = (meta->bits.index) & upper_neighbor_mask_;

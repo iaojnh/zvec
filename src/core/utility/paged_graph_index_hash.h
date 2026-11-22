@@ -111,20 +111,24 @@ class PagedGraphIndexHash {
     return item.second != EmptyVal ? const_iterator(item) : end();
   }
 
-  bool insert(Key key, Val val) {
-    if (!broker_ || val == EmptyVal) return false;
+  int insert(Key key, Val val) {
+    if (!broker_ || val == EmptyVal) return IndexError_InvalidArgument;
     const size_t idx = static_cast<size_t>(key >> mask_bits_);
-    if (idx >= max_slots_) return false;
+    if (idx >= max_slots_) return IndexError_IndexFull;
     while (idx >= slots_.size()) {
-      if (!alloc_slot(slots_.size())) return false;
+      const int ret = alloc_slot(slots_.size());
+      if (ret != 0) return ret;
     }
     Item item{};
     size_t offset = 0;
-    if (probe(slots_[idx], key, &item, &offset) != 0) return false;
+    const int ret = probe(slots_[idx], key, &item, &offset);
+    if (ret != 0) return ret;
     item.first = key;
     item.second = val;
-    return slots_[idx].chunk->write(offset, &item, sizeof(item)) ==
-           sizeof(item);
+    const auto &chunk = slots_[idx].chunk;
+    return chunk->write(offset, &item, sizeof(item)) == sizeof(item)
+               ? 0
+               : chunk->write_error();
   }
 
  private:
@@ -147,7 +151,7 @@ class PagedGraphIndexHash {
         if (slot.chunk->read_borrowed(*offset, block, sizeof(Item)) !=
                 sizeof(Item) ||
             !block.data())
-          return IndexError_ReadData;
+          return slot.chunk->read_error();
         std::memcpy(item, block.data(), sizeof(Item));
       }
       if (item->first == key || item->second == EmptyVal) return 0;
@@ -156,22 +160,24 @@ class PagedGraphIndexHash {
     return IndexError_IndexFull;
   }
 
-  bool alloc_slot(size_t idx) {
+  int alloc_slot(size_t idx) {
     const size_t bytes = static_cast<size_t>(slot_items_) * sizeof(Item);
     auto allocated =
         broker_->alloc_chunk(Broker::CHUNK_TYPE_NEIGHBOR_INDEX, idx, bytes);
-    if (allocated.first != 0 || !allocated.second) return false;
+    if (allocated.first != 0) return allocated.first;
+    if (!allocated.second) return IndexError_Runtime;
     auto chunk = std::move(allocated.second);
-    if (chunk->resize(bytes) != bytes) return false;
+    if (chunk->resize(bytes) != bytes) return IndexError_WriteData;
     // Initialize persisted empty entries, not a private shadow copy. This also
     // supports storage backends that do not promise zero-filled new segments.
     const std::array<uint8_t, 4096> zeros{};
     for (size_t offset = 0; offset < bytes; offset += zeros.size()) {
       const size_t n = std::min(zeros.size(), bytes - offset);
-      if (chunk->write(offset, zeros.data(), n) != n) return false;
+      if (chunk->write(offset, zeros.data(), n) != n)
+        return chunk->write_error();
     }
     slots_.emplace_back(std::move(chunk));
-    return true;
+    return 0;
   }
 
   typename Broker::Pointer broker_;

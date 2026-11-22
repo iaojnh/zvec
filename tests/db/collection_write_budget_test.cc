@@ -11,6 +11,7 @@
 #include <numeric>
 #include <string>
 #include <thread>
+#include <ailego/io/file_lock.h>
 #include <ailego/pattern/defer.h>
 #include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
@@ -149,6 +150,76 @@ TEST_F(CollectionWriteBudgetTest, PublishedCreateCanRetryFinalAttachment) {
   auto competing = Collection::Open(collection_path, options);
   EXPECT_FALSE(competing.has_value());
   EXPECT_TRUE(retried.value()->close().ok());
+}
+
+TEST_F(CollectionWriteBudgetTest, WritableOpenCompletesPublishedCreation) {
+  const auto collection_path = path("interrupted_create");
+  const auto marker =
+      ailego::FileHelper::PathJoin(collection_path, ".zvec-create-pending");
+  const CollectionOptions options{false, true, kMiB};
+  auto created = Collection::CreateAndOpen(collection_path, schema(), options);
+  ASSERT_TRUE(created.has_value()) << created.error().message();
+  ASSERT_TRUE(created.value()->close().ok());
+
+  const std::string token = ".zvec-create-123-1";
+  ASSERT_TRUE(std::filesystem::create_directory(root_ / token));
+  {
+    ailego::File lease;
+    const auto owner_path = (root_ / token / "owner").string();
+    ASSERT_TRUE(lease.create_exclusive(owner_path.c_str()));
+    ASSERT_TRUE(ailego::FileLock::TryLock(lease.native_handle()));
+    ailego::File marker_file;
+    ASSERT_TRUE(marker_file.create_exclusive(marker.c_str()));
+    ASSERT_EQ(token.size(), marker_file.write(token.data(), token.size()));
+    marker_file.close();
+
+    auto early_open = Collection::Open(collection_path, options);
+    ASSERT_FALSE(early_open.has_value());
+    EXPECT_EQ(StatusCode::FAILED_PRECONDITION, early_open.error().code());
+    auto early_retry =
+        Collection::CreateAndOpen(collection_path, schema(), options);
+    ASSERT_FALSE(early_retry.has_value());
+    EXPECT_EQ(StatusCode::FAILED_PRECONDITION, early_retry.error().code());
+  }
+
+  auto reopened = Collection::Open(collection_path, options);
+  ASSERT_TRUE(reopened.has_value()) << reopened.error().message();
+  EXPECT_FALSE(ailego::File::IsExist(marker));
+  auto written = docs("published");
+  auto inserted = reopened.value()->insert(written);
+  ASSERT_TRUE(inserted.has_value() && inserted->front().ok());
+  ASSERT_TRUE(reopened.value()->close().ok());
+  EXPECT_FALSE(
+      Collection::CreateAndOpen(collection_path, schema(), options).has_value());
+}
+
+TEST_F(CollectionWriteBudgetTest, NativeFetchRetainsMapBudgetUntilRelease) {
+  const auto collection_path = path("native_fetch_budget");
+  auto writer =
+      Collection::CreateAndOpen(collection_path, schema(), {false, false, kMiB});
+  ASSERT_TRUE(writer.has_value()) << writer.error().message();
+  auto rows = docs("present");
+  auto inserted = writer.value()->insert(rows);
+  ASSERT_TRUE(inserted.has_value() && inserted->front().ok());
+  ASSERT_TRUE(writer.value()->flush().ok());
+
+  auto &allowance = detail::SharedResultMemoryAllowance();
+  const auto idle = allowance.active_bytes();
+  const std::string absent(512, 'x');
+  auto found = writer.value()->fetch({"present", absent}, std::nullopt, false);
+  ASSERT_TRUE(found.has_value()) << found.error().message();
+  EXPECT_NE(nullptr, found->at("present"));
+  EXPECT_EQ(nullptr, found->at(absent));
+  EXPECT_GT(allowance.active_bytes(), idle);
+  found->clear();
+  EXPECT_EQ(allowance.active_bytes(), idle);
+
+  auto missing = writer.value()->fetch({absent}, std::nullopt, false);
+  ASSERT_TRUE(missing.has_value()) << missing.error().message();
+  EXPECT_EQ(nullptr, missing->at(absent));
+  EXPECT_GT(allowance.active_bytes(), idle);
+  missing->clear();
+  EXPECT_EQ(allowance.active_bytes(), idle);
 }
 
 TEST_F(CollectionWriteBudgetTest, LegacyUpsertReplayIgnoresAnAheadIdMap) {
@@ -738,6 +809,78 @@ TEST_F(CollectionWriteBudgetTest, RolloverRequiresPublishedManifestBeforeWrites)
   EXPECT_NE(nullptr, fetched->at("row0"));
   ASSERT_NE(nullptr, fetched->at("next"));
   EXPECT_EQ(rows.size(), fetched->at("next")->doc_id());
+}
+
+TEST_F(CollectionWriteBudgetTest, RecoversUnsealedFullTextSegmentBeforeCompact) {
+  const auto collection_path = path("pending_full_text_seal");
+  const CollectionOptions options{false, false, kMiB};
+  CollectionSchema full_text("full_text");
+  ASSERT_TRUE(full_text
+                  .add_field(std::make_shared<FieldSchema>(
+                      "content", DataType::STRING, false,
+                      std::make_shared<FtsIndexParams>()))
+                  .ok());
+  {
+    auto writer = Collection::CreateAndOpen(collection_path, full_text, options);
+    ASSERT_TRUE(writer.has_value()) << writer.error().message();
+    std::vector<Doc> rows(5);
+    for (size_t i = 0; i < rows.size(); ++i) {
+      rows[i].set_pk("row" + std::to_string(i));
+      rows[i].set("content", "shared term " + std::to_string(i));
+    }
+    auto inserted = writer.value()->insert(rows);
+    ASSERT_TRUE(inserted.has_value()) << inserted.error().message();
+    for (const auto &status : *inserted)
+      ASSERT_TRUE(status.ok()) << status.message();
+    auto deleted = writer.value()->delete_({"row0", "row1"});
+    ASSERT_TRUE(deleted.has_value() && deleted->front().ok() &&
+                deleted->back().ok());
+    ASSERT_TRUE(writer.value()->close().ok());
+  }
+
+  auto version = VersionManager::Recovery(collection_path);
+  ASSERT_TRUE(version.has_value()) << version.error().message();
+  const auto meta = version.value()->get_current_version().writing_segment_meta();
+  const auto segment_path = FileHelper::MakeSegmentPath(collection_path, meta->id());
+  const auto &blocks = meta->persisted_blocks();
+  const auto fts = std::find_if(blocks.begin(), blocks.end(), [](const auto &block) {
+    return block.type() == BlockType::FTS_INDEX;
+  });
+  ASSERT_NE(fts, blocks.end());
+  const auto index_path = FileHelper::MakeFtsIndexPath(segment_path, fts->id());
+  const auto unsealed_copy = path("unsealed_full_text");
+  std::filesystem::copy(index_path, unsealed_copy,
+                        std::filesystem::copy_options::recursive);
+  {
+    auto writer = Collection::Open(collection_path, options);
+    ASSERT_TRUE(writer.has_value()) << writer.error().message();
+    {
+      auto iterator = writer.value()->create_iterator();
+      ASSERT_TRUE(iterator.has_value()) << iterator.error().message();
+    }
+    ASSERT_TRUE(writer.value()->close().ok());
+  }
+  // Restore raw postings while keeping the published replacement manifest.
+  std::filesystem::remove_all(index_path);
+  std::filesystem::rename(unsealed_copy, index_path);
+  const auto marker =
+      ailego::FileHelper::PathJoin(segment_path, ".zvec-seal-pending");
+  {
+    ailego::File file;
+    ASSERT_TRUE(file.create_exclusive(marker.c_str()));
+  }
+  auto read_only = Collection::Open(collection_path, {true, false, kMiB});
+  ASSERT_FALSE(read_only.has_value());
+  EXPECT_EQ(StatusCode::FAILED_PRECONDITION, read_only.error().code());
+
+  auto recovered = Collection::Open(collection_path, options);
+  ASSERT_TRUE(recovered.has_value()) << recovered.error().message();
+  EXPECT_FALSE(ailego::File::IsExist(marker));
+  const auto optimized = recovered.value()->optimize();
+  ASSERT_TRUE(optimized.ok()) << optimized.message();
+  const auto stats = recovered.value()->stats();
+  ASSERT_TRUE(stats.has_value()) << stats.error().message();
+  EXPECT_EQ(3u, stats->doc_count);
 }
 
 TEST_F(CollectionWriteBudgetTest, BufferedVectorRefusalPrecedesWalAndMutation) {

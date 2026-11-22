@@ -323,7 +323,8 @@ class SegmentImpl : public Segment,
 
  public:
   Status Open(const SegmentOptions &options,
-              const std::vector<Segment::Ptr> &older_segments);
+              const std::vector<Segment::Ptr> &older_segments,
+              bool resume_seal);
   Status create(const SegmentOptions &options, uint64_t min_doc_id);
 
  private:
@@ -625,7 +626,8 @@ Result<bool> SegmentImpl::SegmentIndexFilter::is_filtered_checked(
 }
 
 Status SegmentImpl::Open(const SegmentOptions &options,
-                         const std::vector<Segment::Ptr> &older_segments) {
+                         const std::vector<Segment::Ptr> &older_segments,
+                         bool resume_seal) {
   options_ = options;
   options_.enable_mmap_ = version_manager_->get_current_version().enable_mmap();
 
@@ -649,7 +651,7 @@ Status SegmentImpl::Open(const SegmentOptions &options,
   CHECK_RETURN_STATUS(s);
 
   auto writing_block = segment_meta_->writing_forward_block();
-  if (!writing_block.has_value() && !options_.read_only_) {
+  if (!writing_block.has_value() && !options_.read_only_ && !resume_seal) {
     return Status::InternalError(
         "No writing block found when in writing mode.");
   }
@@ -2985,8 +2987,6 @@ Status SegmentImpl::dump() {
 }
 
 void SegmentImpl::remove_writing_forward_block() {
-  // Exclusive: dump() has already released seg_mtx_ by the time the collection
-  // seals the switched-out segment.
   std::lock_guard<std::shared_mutex> lock(seg_mtx_);
   segment_meta_->remove_writing_forward_block();
 }
@@ -5982,14 +5982,12 @@ Result<Segment::Ptr> Segment::CreateAndOpen(
   return segment;
 }
 
-Result<Segment::Ptr> Segment::Open(const std::string &path,
-                                   const CollectionSchema &schema,
-                                   const SegmentMeta &segment_meta,
-                                   const IDMap::Ptr &id_map,
-                                   const DeleteStore::Ptr &delete_store,
-                                   const VersionManager::Ptr &version_manager,
-                                   const SegmentOptions &options,
-                                   const std::vector<Ptr> &older_segments) {
+Result<Segment::Ptr> Segment::Open(
+    const std::string &path, const CollectionSchema &schema,
+    const SegmentMeta &segment_meta, const IDMap::Ptr &id_map,
+    const DeleteStore::Ptr &delete_store,
+    const VersionManager::Ptr &version_manager, const SegmentOptions &options,
+    const std::vector<Ptr> &older_segments, bool resume_seal) {
   auto segment = std::shared_ptr<SegmentImpl>(new SegmentImpl(
       path, schema, segment_meta, id_map, delete_store, version_manager));
 
@@ -6000,7 +5998,7 @@ Result<Segment::Ptr> Segment::Open(const std::string &path,
         "Segment open failed: segment path not found [", segment_path, "]"));
   }
 
-  auto s = segment->Open(options, older_segments);
+  auto s = segment->Open(options, older_segments, resume_seal);
   CHECK_RETURN_STATUS_EXPECTED(s);
 
   return segment;

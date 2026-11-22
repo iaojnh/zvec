@@ -336,9 +336,11 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
 
   inline std::pair<uint32_t, uint32_t> get_upper_neighbor_chunk_loc(
       level_t level, node_id_t id) const {
-    auto it = upper_neighbor_index_->find(id);
-    ailego_assert_abort(it != upper_neighbor_index_->end(),
-                        "Get upper neighbor header failed");
+    int status = 0;
+    auto it = upper_neighbor_index_->find(id, &status);
+    if (status != 0) throw GraphStorageError{status};
+    if (it == upper_neighbor_index_->end())
+      throw GraphStorageError{IndexError_InvalidFormat};
     auto meta = reinterpret_cast<const UpperNeighborIndexMeta *>(&it->second);
     uint32_t chunk_idx = (meta->bits.index) >> upper_neighbor_mask_bits_;
     uint32_t offset =
@@ -426,10 +428,8 @@ class HnswSparseStreamerEntity : public HnswSparseEntity {
     meta.bits.index = (chunk_index << upper_neighbor_mask_bits_) |
                       (chunk_offset / upper_neighbor_size_);
     chunk_offset += upper_neighbor_size_ * level;
-    if (ailego_unlikely(!upper_neighbor_index_->insert(id, meta.data))) {
-      LOG_ERROR("HashMap insert value failed");
-      return IndexError_Runtime;
-    }
+    const int status = upper_neighbor_index_->insert(id, meta.data);
+    if (status != 0) return status;
 
     if (ailego_unlikely(chunk->resize(chunk_offset) != chunk_offset)) {
       LOG_ERROR("SparseChunk resize to %zu failed", (size_t)chunk_offset);

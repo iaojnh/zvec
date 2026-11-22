@@ -233,11 +233,13 @@ class MMapFileStorage : public IndexStorage {
   int open_index(const std::string &path, const OpenOptions &options) {
     std::unique_ptr<ailego::StagedPath> pending;
     ailego::File::Identity created_file;
+    ailego::File::Identity private_identity;
     bool opened = false;
     AILEGO_DEFER([&] {
-      if (created_file.valid && !opened) {
+      if (!opened && (created_file.valid || private_identity.valid)) {
         close_index();
-        if (!ailego::File::DeleteIfSame(path, created_file)) {
+        if (created_file.valid &&
+            !ailego::File::DeleteIfSame(path, created_file)) {
           LOG_ERROR("Failed to remove incomplete index file %s", path.c_str());
         }
       }
@@ -253,7 +255,6 @@ class MMapFileStorage : public IndexStorage {
           ailego::File::MakePath(path.substr(0, last_slash));
         }
       }
-      ailego::File::Identity private_identity;
       int error_code =
           pending ? this->init_index(pending->path(), &private_identity)
                   : this->init_index(path, &created_file);

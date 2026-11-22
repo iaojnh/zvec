@@ -54,14 +54,12 @@ class Segment {
                                    const VersionManager::Ptr &version_manager,
                                    const SegmentOptions &options);
 
-  static Result<Ptr> Open(const std::string &path,
-                          const CollectionSchema &schema,
-                          const SegmentMeta &segment_meta,
-                          const IDMap::Ptr &id_map,
-                          const DeleteStore::Ptr &delete_store,
-                          const VersionManager::Ptr &version_manager,
-                          const SegmentOptions &options,
-                          const std::vector<Ptr> &older_segments = {});
+  static Result<Ptr> Open(
+      const std::string &path, const CollectionSchema &schema,
+      const SegmentMeta &segment_meta, const IDMap::Ptr &id_map,
+      const DeleteStore::Ptr &delete_store,
+      const VersionManager::Ptr &version_manager, const SegmentOptions &options,
+      const std::vector<Ptr> &older_segments = {}, bool resume_seal = false);
 
   virtual SegmentID id() const = 0;
 

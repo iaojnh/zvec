@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -22,6 +23,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
@@ -212,6 +214,7 @@ class CollectionImpl : public Collection {
 
   // Requires write_mtx_ or exclusive schema_handle_mtx_.
   Status publish_pending_rotation();
+  Status seal_writing_segment_if_needed();
   Status acquire_write_buffer();
 
   Status create();
@@ -340,6 +343,7 @@ class CollectionImpl : public Collection {
  private:
   std::string path_;
   std::unique_ptr<ailego::StagedPath> staged_creation_;
+  bool attaching_creation_{false};
 
   bool destroyed_{false};
 
@@ -397,6 +401,7 @@ class CollectionImpl : public Collection {
   bool rotation_manifest_pending_{false};
   // The retired segment is sealed only after its replacement is durable.
   Segment::Ptr pending_segment_seal_;
+  bool pending_segment_sealed_{false};
   // non-writing segments, sort by doc_id range
   SegmentManager::Ptr segment_manager_;
 
@@ -412,21 +417,93 @@ class CollectionImpl : public Collection {
   sqlengine::SQLEngine::Ptr sql_engine_;
 };
 
+namespace {
+
+std::string CreationMarkerPath(const std::string &path) {
+  return ailego::FileHelper::PathJoin(path, ".zvec-create-pending");
+}
+
+std::string PendingSealPath(const std::string &path, SegmentID id) {
+  return ailego::FileHelper::PathJoin(FileHelper::MakeSegmentPath(path, id),
+                                      ".zvec-seal-pending");
+}
+
+Status MarkPendingSeal(const std::string &marker) {
+  ailego::File file;
+  if ((!file.create_exclusive(marker.c_str()) &&
+       !file.open(marker.c_str(), false)) ||
+      !file.flush()) {
+    return Status::InternalError("Failed to record pending segment seal: ",
+                                 marker);
+  }
+  return Status::OK();
+}
+
+Status FinishPendingSeal(const std::string &marker) {
+  if (!ailego::File::Delete(marker)) {
+    return Status::InternalError("Failed to clear pending segment seal: ",
+                                 marker);
+  }
+  return Status::OK();
+}
+
+Status CheckCreationLease(const std::string &path) {
+  const auto marker_path = CreationMarkerPath(path);
+  if (!ailego::File::IsExist(marker_path)) return Status::OK();
+  ailego::File marker;
+  if (!marker.open(marker_path.c_str(), true)) {
+    return ailego::File::IsExist(marker_path)
+               ? Status::InternalError(
+                     "Failed to read collection creation marker")
+               : Status::OK();
+  }
+  std::array<char, 128> bytes;
+  const size_t length = marker.read(bytes.data(), bytes.size());
+  if (length == 0) return Status::OK();
+  const std::string_view name(bytes.data(), length);
+  constexpr std::string_view prefix = ".zvec-create-";
+  if (length == bytes.size() || name.size() <= prefix.size() ||
+      name.substr(0, prefix.size()) != prefix ||
+      name.substr(prefix.size()).find_first_not_of("0123456789-") !=
+          std::string_view::npos) {
+    return Status::InternalError("Invalid collection creation marker");
+  }
+  auto leaf = ailego::FileHelper::PathFromUtf8(path);
+  while (leaf.has_relative_path() &&
+         (!leaf.has_filename() || leaf.filename() == ".")) {
+    leaf = leaf.parent_path();
+  }
+  const auto lease_path = ailego::FileHelper::PathToUtf8(
+      leaf.parent_path() / std::string(name) / "owner");
+  ailego::File lease;
+  if (!lease.open(lease_path.c_str(), true)) {
+    return ailego::File::IsExist(lease_path)
+               ? Status::FailedPrecondition(
+                     "Collection creation is in progress")
+               : Status::OK();
+  }
+  return ailego::FileLock::TryLockShared(lease.native_handle())
+             ? Status::OK()
+             : Status::FailedPrecondition("Collection creation is in progress");
+}
+
+}  // namespace
+
 Result<Collection::Ptr> Collection::CreateAndOpen(
     const std::string &path, const CollectionSchema &schema,
     const CollectionOptions &options) {
   auto collection = std::make_shared<CollectionImpl>(path, schema);
-  const auto marker_path = [](const std::string &root) {
-    return ailego::FileHelper::PathJoin(root, ".zvec-create-pending");
-  };
-  const auto marker = marker_path(path);
+  const auto marker = CreationMarkerPath(path);
   const auto attach = [&](ailego::File lock,
                           bool retry) -> Result<Collection::Ptr> {
     auto opened = std::make_shared<CollectionImpl>(path);
     opened->options_ = options;
+    opened->attaching_creation_ = true;
     opened->lock_file_ = std::move(lock);
     if (retry) {
-      auto s = opened->acquire_file_lock(false);
+      auto s = CheckCreationLease(path);
+      CHECK_RETURN_STATUS_EXPECTED(s);
+      s = opened->acquire_file_lock(false);
       CHECK_RETURN_STATUS_EXPECTED(s);
       if (!ailego::File::IsExist(marker)) {
         return tl::make_unexpected(
@@ -467,18 +544,39 @@ Result<Collection::Ptr> Collection::CreateAndOpen(
   CHECK_RETURN_STATUS_EXPECTED(s);
 
   if (auto staged = std::move(collection->staged_creation_)) {
+    ailego::File publication_lease;
     {
       ailego::File marker_file;
-      const auto staged_marker = marker_path(staged->path());
-      if (!marker_file.create_exclusive(staged_marker.c_str()) ||
-          !marker_file.flush()) {
+      const auto staged_marker = CreationMarkerPath(staged->path());
+      if (!marker_file.create_exclusive(staged_marker.c_str())) {
+        return tl::make_unexpected(Status::InternalError(
+            "Failed to record collection creation: ", path));
+      }
+#if defined(_WIN32) || defined(_WIN64)
+      // Windows cannot rename a directory while a child handle is open.
+      // The lock in the private parent stays live without blocking the rename.
+      const auto stage_root =
+          ailego::FileHelper::PathFromUtf8(staged->path()).parent_path();
+      const auto owner = ailego::FileHelper::PathToUtf8(stage_root / "owner");
+      const auto token = ailego::FileHelper::PathToUtf8(stage_root.filename());
+      if (!publication_lease.create_exclusive(owner.c_str()) ||
+          !ailego::FileLock::TryLock(publication_lease.native_handle()) ||
+          marker_file.write(token.data(), token.size()) != token.size()) {
+        return tl::make_unexpected(Status::InternalError(
+            "Failed to lock collection publication: ", path));
+      }
+#endif
+      if (!marker_file.flush()) {
         return tl::make_unexpected(Status::InternalError(
             "Failed to record collection creation: ", path));
       }
     }
     // The LOCK inode moves with the new directory. Keep its exclusive lock
     // through publication and attach so no competing opener can take it.
-    auto lock = std::move(collection->lock_file_);
+    ailego::File lock;
+#if !defined(_WIN32) && !defined(_WIN64)
+    lock = std::move(collection->lock_file_);
+#endif
     s = collection->close();
     CHECK_RETURN_STATUS_EXPECTED(s);
     if (!staged->publish()) {
@@ -623,6 +721,7 @@ Status CollectionImpl::close_unsafe() {
 
 void CollectionImpl::release_write_resources() {
   pending_segment_seal_.reset();
+  pending_segment_sealed_ = false;
   writing_segment_.reset();
   version_manager_.reset();
   id_map_.reset();
@@ -690,11 +789,22 @@ Status CollectionImpl::publish_pending_rotation() {
     rotation_manifest_pending_ = false;
   }
   if (pending_segment_seal_) {
-    auto status = pending_segment_seal_->dump();
-    CHECK_RETURN_STATUS(status);
+    if (!pending_segment_sealed_) {
+      CHECK_RETURN_STATUS(pending_segment_seal_->dump());
+      pending_segment_sealed_ = true;
+    }
+    CHECK_RETURN_STATUS(
+        FinishPendingSeal(PendingSealPath(path_, pending_segment_seal_->id())));
     pending_segment_seal_.reset();
+    pending_segment_sealed_ = false;
   }
   return Status::OK();
+}
+
+Status CollectionImpl::seal_writing_segment_if_needed() {
+  CHECK_RETURN_STATUS(publish_pending_rotation());
+  return writing_segment_->has_record() ? switch_to_new_segment_for_writing()
+                                        : Status::OK();
 }
 
 Status CollectionImpl::acquire_write_buffer() {
@@ -823,10 +933,7 @@ Status CollectionImpl::create_index(const std::string &column_name,
   // forbidden writing until index is ready
   std::lock_guard write_lock(write_mtx_);
 
-  if (writing_segment_->has_record()) {
-    s = switch_to_new_segment_for_writing();
-    CHECK_RETURN_STATUS(s);
-  }
+  CHECK_RETURN_STATUS(seal_writing_segment_if_needed());
 
   auto old_writing_segment = writing_segment_;
   Version old_version = version_manager_->get_current_version();
@@ -1000,10 +1107,7 @@ Status CollectionImpl::drop_index(const std::string &column_name) {
   // forbidden writing until index is ready
   std::lock_guard write_lock(write_mtx_);
 
-  if (writing_segment_->has_record()) {
-    s = switch_to_new_segment_for_writing();
-    CHECK_RETURN_STATUS(s);
-  }
+  CHECK_RETURN_STATUS(seal_writing_segment_if_needed());
 
   auto old_writing_segment = writing_segment_;
   Version old_version = version_manager_->get_current_version();
@@ -1124,12 +1228,7 @@ Status CollectionImpl::optimize(const OptimizeOptions &options) try {
     CHECK_DESTROY_RETURN_STATUS(destroyed_, false);
     CHECK_CLOSED_RETURN_STATUS(closed_, false);
 
-    if (writing_segment_->has_record()) {
-      auto s = switch_to_new_segment_for_writing();
-      if (!s.ok()) {
-        return s;
-      }
-    }
+    CHECK_RETURN_STATUS(seal_writing_segment_if_needed());
 
     persist_segments =
         get_all_persist_segments();  // will not return writing segment
@@ -1546,10 +1645,7 @@ Status CollectionImpl::add_column(const FieldSchema::Ptr &column_schema,
   s = new_schema->add_field(field_copy);
   CHECK_RETURN_STATUS(s);
 
-  if (writing_segment_->has_record()) {
-    s = switch_to_new_segment_for_writing();
-    CHECK_RETURN_STATUS(s);
-  }
+  CHECK_RETURN_STATUS(seal_writing_segment_if_needed());
 
   auto old_writing_segment = writing_segment_;
   Version old_version = version_manager_->get_current_version();
@@ -1600,10 +1696,7 @@ Status CollectionImpl::drop_column(const std::string &column_name) {
   s = new_schema->drop_field(column_name);
   CHECK_RETURN_STATUS(s);
 
-  if (writing_segment_->has_record()) {
-    s = switch_to_new_segment_for_writing();
-    CHECK_RETURN_STATUS(s);
-  }
+  CHECK_RETURN_STATUS(seal_writing_segment_if_needed());
 
   auto old_writing_segment = writing_segment_;
   Version old_version = version_manager_->get_current_version();
@@ -1664,10 +1757,7 @@ Status CollectionImpl::alter_column(const std::string &column_name,
   s = new_schema->alter_field(column_name, field_copy);
   CHECK_RETURN_STATUS(s);
 
-  if (writing_segment_->has_record()) {
-    s = switch_to_new_segment_for_writing();
-    CHECK_RETURN_STATUS(s);
-  }
+  CHECK_RETURN_STATUS(seal_writing_segment_if_needed());
 
   auto old_writing_segment = writing_segment_;
   Version old_version = version_manager_->get_current_version();
@@ -1899,6 +1989,12 @@ Status CollectionImpl::switch_to_new_segment_for_writing(
   AILEGO_DEFER([&] {
     if (!keep_replacement) (void)new_segment.value()->destroy();
   });
+
+  // Recovery uses the old segment as a writer until the replacement manifest
+  // is published. After publication this marker lets it finish interrupted
+  // index sealing before exposing the segment for maintenance.
+  CHECK_RETURN_STATUS(
+      MarkPendingSeal(PendingSealPath(path_, writing_segment_->id())));
 
   s = segment_manager_->add_segment(writing_segment_);
   CHECK_RETURN_STATUS(s);
@@ -2593,13 +2689,35 @@ Result<GroupResults> CollectionImpl::group_by_query(
 Result<DocPtrMap> CollectionImpl::fetch(
     const std::vector<std::string> &pks,
     const std::optional<std::vector<std::string>> &output_fields,
-    bool include_vector) const {
+    bool include_vector) const try {
   auto result =
       fetch_result_snapshot_impl(pks, output_fields, include_vector, nullptr);
   if (!result) {
     return tl::make_unexpected(result.error());
   }
+  if (result->routing_memory) {
+    struct FetchEntryOwner {
+      std::shared_ptr<void> routing_memory;
+      Doc::Ptr doc;
+    };
+    // Keep the public map type and attach the lease to its entries. An
+    // aliasing null pointer preserves the missing-key value and still owns
+    // its share of the fetch reservation.
+    for (auto &[_, doc] : result->docs) {
+      if (doc) {
+        auto *entry = doc.get();
+        auto owner = std::make_shared<FetchEntryOwner>(
+            FetchEntryOwner{result->routing_memory, std::move(doc)});
+        doc = Doc::Ptr(std::move(owner), entry);
+      } else {
+        doc = Doc::Ptr(result->routing_memory, nullptr);
+      }
+    }
+  }
   return std::move(result->docs);
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "Insufficient native fetch result budget"));
 }
 
 Result<internal::FetchResultSnapshot>
@@ -2830,6 +2948,16 @@ Status CollectionImpl::recovery() {
   }
 
   // get lock file
+  const auto marker = CreationMarkerPath(path_);
+  const bool pending_creation =
+      !attaching_creation_ && ailego::File::IsExist(marker);
+  if (pending_creation) {
+    CHECK_RETURN_STATUS(CheckCreationLease(path_));
+    if (options_.read_only_) {
+      return Status::FailedPrecondition(
+          "Collection creation requires a writable open: ", path_);
+    }
+  }
   Status s;
   if (!lock_file_.is_valid()) {
     s = acquire_file_lock(false);
@@ -2904,9 +3032,27 @@ Status CollectionImpl::recovery() {
   SegmentOptions seg_options;
   seg_options.read_only_ = true;
   seg_options.enable_mmap_ = options_.enable_mmap_;
-  for (size_t i = 0; i < segment_metas.size(); ++i) {
-    auto segment = Segment::Open(path_, *schema_, *segment_metas[i], id_map_,
-                                 delete_store_, version_manager_, seg_options);
+  for (const auto &meta : segment_metas) {
+    const auto pending_seal = PendingSealPath(path_, meta->id());
+    if (ailego::File::IsExist(pending_seal)) {
+      if (options_.read_only_) {
+        return Status::FailedPrecondition(
+            "Collection has an unfinished segment seal. Open read/write "
+            "to complete recovery.");
+      }
+      auto pending_options = seg_options;
+      pending_options.read_only_ = false;
+      {
+        auto pending =
+            Segment::Open(path_, *schema_, *meta, id_map_, delete_store_,
+                          version_manager_, pending_options, {}, true);
+        if (!pending) return pending.error();
+        CHECK_RETURN_STATUS((*pending)->dump());
+      }
+      CHECK_RETURN_STATUS(FinishPendingSeal(pending_seal));
+    }
+    auto segment = Segment::Open(path_, *schema_, *meta, id_map_, delete_store_,
+                                 version_manager_, seg_options);
     if (!segment) {
       return segment.error();
     }
@@ -2934,7 +3080,11 @@ Status CollectionImpl::recovery() {
   // allowance until its reconstructed data is released.
   if (!replays_wal) write_buffer_reservation_.release();
 
-  // recover id map & delete store
+  if (pending_creation && ailego::File::IsExist(marker) &&
+      !ailego::File::Delete(marker)) {
+    return Status::InternalError("Failed to complete collection creation: ",
+                                 path_);
+  }
   return Status::OK();
 }
 
@@ -3392,10 +3542,7 @@ Result<std::unique_ptr<DocIterator::Impl>> CollectionImpl::prepare_iterate(
     } else {
       // Seal the writing segment so concurrent writes cannot mutate the
       // snapshot; has_record() also covers delete-only segments.
-      if (writing_segment_->has_record()) {
-        auto s = switch_to_new_segment_for_writing();
-        CHECK_RETURN_STATUS_EXPECTED(s);
-      }
+      CHECK_RETURN_STATUS_EXPECTED(seal_writing_segment_if_needed());
       impl->segments = get_all_persist_segments();
     }
 

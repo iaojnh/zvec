@@ -465,10 +465,15 @@ int HnswRabitqStreamerEntity::check_hnsw_index(const HNSWHeader *hd) const {
              static_cast<size_t>(hd->doc_cnt()));
     return IndexError_InvalidFormat;
   }
-  if (hd->entry_point() == kInvalidNodeId &&
-      broker_->get_chunk_cnt(HnswRabitqChunkBroker::CHUNK_TYPE_NODE) > 0) {
-    LOG_WARN("The index is broken, maybe it haven't flush");
-    return IndexError_InvalidFormat;
+  if (hd->entry_point() == kInvalidNodeId) {
+    // Admission can leave an empty allocated chunk for a later retry.
+    const auto count =
+        broker_->get_chunk_cnt(HnswRabitqChunkBroker::CHUNK_TYPE_NODE);
+    for (size_t i = 0; i < count; ++i) {
+      const auto chunk =
+          broker_->get_chunk(HnswRabitqChunkBroker::CHUNK_TYPE_NODE, i);
+      if (!chunk || chunk->data_size() != 0) return IndexError_InvalidFormat;
+    }
   }
 
   return 0;
