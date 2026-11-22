@@ -68,31 +68,52 @@ int DumpTurboQuantizerSegment(const IndexStorage::Pointer &storage,
   return 0;
 }
 
-class BufferedGraphReadLock {
+class BufferedGraphLock {
  public:
-  explicit BufferedGraphReadLock(std::shared_mutex *mutex) {
+  enum class Mode { kRead, kWrite };
+
+  explicit BufferedGraphLock(HnswGraphMutex *mutex, Mode mode = Mode::kRead)
+      : mode_(mode) {
     if (!mutex) return;
-    // A search callback can call another read API on the same streamer.
-    // Retain the outer lock and avoid reacquiring it behind a waiting writer.
-    for (auto *guard = active_; guard; guard = guard->previous_) {
-      if (guard->lock_.mutex() == mutex) return;
+    if (mode_ == Mode::kWrite) {
+      mutex->lock();
+    } else {
+      // A filter or provider can read the index this thread already holds.
+      for (auto *guard = active_; guard; guard = guard->previous_) {
+        if (guard->mutex_ == mutex) return;
+      }
+      // A nested read of another index can join its active readers. Waiting
+      // behind a queued writer could make two read callbacks wait on each
+      // other.
+      mutex->lock_shared(/*nested=*/active_ != nullptr);
     }
-    lock_ = std::shared_lock(*mutex);
+    mutex_ = mutex;
     previous_ = active_;
     active_ = this;
   }
 
-  ~BufferedGraphReadLock() {
-    if (lock_.owns_lock()) active_ = previous_;
+  ~BufferedGraphLock() {
+    if (!mutex_) return;
+    active_ = previous_;
+    if (mode_ == Mode::kWrite) {
+      mutex_->unlock();
+    } else {
+      mutex_->unlock_shared();
+    }
   }
 
-  BufferedGraphReadLock(const BufferedGraphReadLock &) = delete;
-  BufferedGraphReadLock &operator=(const BufferedGraphReadLock &) = delete;
+  BufferedGraphLock(const BufferedGraphLock &) = delete;
+  BufferedGraphLock &operator=(const BufferedGraphLock &) = delete;
+
+  bool owns_lock() const {
+    return mutex_ != nullptr;
+  }
 
  private:
-  static inline thread_local const BufferedGraphReadLock *active_{nullptr};
-  const BufferedGraphReadLock *previous_{nullptr};
-  std::shared_lock<std::shared_mutex> lock_;
+  static inline thread_local const BufferedGraphLock *active_{nullptr};
+  const BufferedGraphLock *previous_{nullptr};
+  HnswGraphMutex *mutex_{nullptr};
+  const Mode mode_;
 };
 
 }  // namespace
@@ -490,7 +511,7 @@ size_t HnswStreamer::packed_segment_count() const {
 }
 
 int HnswStreamer::dump_with_vectors(const IndexDumper::Pointer &dumper) {
-  const BufferedGraphReadLock guard(buffered_graph_mutex());
+  const BufferedGraphLock guard(buffered_graph_mutex());
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   if (state_ != STATE_OPENED || !build_vector_source_) {
@@ -811,7 +832,8 @@ int HnswStreamer::open(IndexStorage::Pointer stg, bool read_only) {
 }
 
 int HnswStreamer::close() {
-  const auto guard = lock_buffered_writes();
+  const BufferedGraphLock guard(buffered_graph_mutex(),
+                                BufferedGraphLock::Mode::kWrite);
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   LOG_INFO("HnswStreamer close");
@@ -834,7 +856,8 @@ int HnswStreamer::close() {
 }
 
 int HnswStreamer::flush(uint64_t checkpoint) {
-  const auto guard = lock_buffered_writes();
+  const BufferedGraphLock guard(buffered_graph_mutex(),
+                                BufferedGraphLock::Mode::kWrite);
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   LOG_INFO("HnswStreamer flush checkpoint=%zu", (size_t)checkpoint);
@@ -878,7 +901,7 @@ int HnswStreamer::dump(const IndexDumper::Pointer &dumper) {
 }
 
 IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
-  const BufferedGraphReadLock guard(buffered_graph_mutex());
+  const BufferedGraphLock guard(buffered_graph_mutex());
   if (entity_ && entity_->mutation_error() != 0) return nullptr;
   if (ailego_unlikely(state_ != STATE_OPENED)) {
     LOG_ERROR("Create context failed, open storage first!");
@@ -928,7 +951,7 @@ IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
 }
 
 IndexProvider::Pointer HnswStreamer::create_provider() const {
-  const BufferedGraphReadLock guard(buffered_graph_mutex());
+  const BufferedGraphLock guard(buffered_graph_mutex());
   if (entity_ && entity_->mutation_error() != 0) return nullptr;
   LOG_DEBUG("HnswStreamer create provider");
 
@@ -976,25 +999,20 @@ void HnswStreamer::bind_search_dist_space(HnswContext *ctx) const {
                        meta_.element_size(), extra_values_size);
 }
 
-std::shared_mutex *HnswStreamer::buffered_graph_mutex() const {
+HnswGraphMutex *HnswStreamer::buffered_graph_mutex() const {
   return storage_mode() == HnswStorageMode::kBufferPool ? &buffered_graph_mutex_
                                                         : nullptr;
 }
 
-std::unique_lock<std::shared_mutex> HnswStreamer::lock_buffered_writes() {
-  if (auto *mutex = buffered_graph_mutex()) return std::unique_lock(*mutex);
-  return {};
-}
-
 const void *HnswStreamer::get_vector(uint64_t key) const {
-  const BufferedGraphReadLock guard(buffered_graph_mutex());
+  const BufferedGraphLock guard(buffered_graph_mutex());
   if (!entity_ || entity_->mutation_error() != 0) return nullptr;
   return entity_->get_vector_by_key(key);
 }
 
 int HnswStreamer::get_vector(uint64_t key,
                              IndexStorage::MemoryBlock &block) const {
-  const BufferedGraphReadLock guard(buffered_graph_mutex());
+  const BufferedGraphLock guard(buffered_graph_mutex());
   const int error = entity_ ? entity_->mutation_error() : IndexError_NoReady;
   if (error != 0) {
     block.reset();
@@ -1012,14 +1030,14 @@ int HnswStreamer::get_vector(uint64_t key,
 }
 
 const void *HnswStreamer::get_vector_by_id(uint32_t id) const {
-  const BufferedGraphReadLock guard(buffered_graph_mutex());
+  const BufferedGraphLock guard(buffered_graph_mutex());
   if (!entity_ || entity_->mutation_error() != 0) return nullptr;
   return entity_->get_vector(id);
 }
 
 int HnswStreamer::get_vector_by_id(uint32_t id,
                                    IndexStorage::MemoryBlock &block) const {
-  const BufferedGraphReadLock guard(buffered_graph_mutex());
+  const BufferedGraphLock guard(buffered_graph_mutex());
   const int error = entity_ ? entity_->mutation_error() : IndexError_NoReady;
   if (error != 0) {
     block.reset();
@@ -1053,7 +1071,8 @@ int HnswStreamer::add_with_id_impl(uint32_t id, const void *query,
   }
   AILEGO_DEFER([&]() { shared_mutex_.unlock_shared(); });
 
-  const auto guard = lock_buffered_writes();
+  const BufferedGraphLock guard(buffered_graph_mutex(),
+                                BufferedGraphLock::Mode::kWrite);
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
 
@@ -1159,7 +1178,8 @@ int HnswStreamer::add_impl(uint64_t pkey, const void *query,
   }
   AILEGO_DEFER([&]() { shared_mutex_.unlock_shared(); });
 
-  const auto guard = lock_buffered_writes();
+  const BufferedGraphLock guard(buffered_graph_mutex(),
+                                BufferedGraphLock::Mode::kWrite);
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
 
@@ -1253,7 +1273,7 @@ int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
 int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
                               uint32_t count,
                               IndexStreamer::Context::Pointer &context) const {
-  const BufferedGraphReadLock guard(buffered_graph_mutex());
+  const BufferedGraphLock guard(buffered_graph_mutex());
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   int ret = check_params(query, qmeta, true);
@@ -1315,7 +1335,7 @@ int HnswStreamer::search_candidates_impl(
     const void *query, const IndexQueryMeta &qmeta, std::vector<uint64_t> &keys,
     IndexStreamer::Context::Pointer &context,
     std::vector<float> *scores) const {
-  const BufferedGraphReadLock guard(buffered_graph_mutex());
+  const BufferedGraphLock guard(buffered_graph_mutex());
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   keys.clear();
@@ -1370,7 +1390,7 @@ int HnswStreamer::search_candidates_impl(
 }
 
 void HnswStreamer::print_debug_info() {
-  const BufferedGraphReadLock guard(buffered_graph_mutex());
+  const BufferedGraphLock guard(buffered_graph_mutex());
   if (entity_->mutation_error() != 0) return;
   for (node_id_t id = 0; id < entity_->doc_cnt(); ++id) {
     if (entity_->get_key(id) == kInvalidKey) {
@@ -1402,7 +1422,7 @@ int HnswStreamer::search_bf_impl(
 int HnswStreamer::search_bf_impl(
     const void *query, const IndexQueryMeta &qmeta, uint32_t count,
     IndexStreamer::Context::Pointer &context) const {
-  const BufferedGraphReadLock guard(buffered_graph_mutex());
+  const BufferedGraphLock guard(buffered_graph_mutex());
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   int ret = check_params(query, qmeta, true);
@@ -1508,7 +1528,7 @@ int HnswStreamer::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const {
-  const BufferedGraphReadLock guard(buffered_graph_mutex());
+  const BufferedGraphLock guard(buffered_graph_mutex());
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   int ret = check_params(query, qmeta, true);
