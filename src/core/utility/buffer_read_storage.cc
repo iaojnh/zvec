@@ -215,7 +215,7 @@ class BufferReadStorage : public IndexStorage {
 
       bool pins_owned_by_lease = false;
       try {
-        std::vector<ReadSpan> spans;
+        ScatterBlock::Spans spans;
         spans.reserve(page_count);
         const size_t range_end = abs_offset + len;
         for (size_t i = 0; i < page_count; ++i) {
@@ -681,7 +681,7 @@ class BufferReadStorage : public IndexStorage {
   size_t index_offset_{0};
   uint32_t magic_{0};
   std::string file_path_{};
-  std::map<std::string, IndexUnpacker::SegmentMeta> segments_{};
+  IndexUnpacker::SegmentMap segments_{};
   std::shared_ptr<ailego::VecBufferPool> buffer_pool_{nullptr};
   std::shared_ptr<ailego::VecBufferPoolHandle> handle_{nullptr};
   bool cache_enabled_{false};

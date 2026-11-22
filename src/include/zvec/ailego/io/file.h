@@ -87,8 +87,15 @@ class ZVEC_AILEGO_API File {
   //! Create a local file
   bool create(const char *path, size_t size, bool direct);
 
+  //! Create an empty local file if the path does not already exist.
+  bool create_exclusive(const char *path);
+
   //! Open a local file
   bool open(const char *path, bool rdonly, bool direct);
+
+  //! Duplicate an open handle for positioned I/O. The handles may share a
+  //! file position and have independent lifetimes.
+  bool duplicate(const File &source);
 
   //! Close the local file
   void close();
