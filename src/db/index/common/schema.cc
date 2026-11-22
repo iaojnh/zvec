@@ -92,6 +92,12 @@ static Status validate_index_params(const FieldSchema &field) {
 }
 
 Status FieldSchema::validate() const {
+  CHECK_RETURN_STATUS(validate_structure());
+  return index_type() == IndexType::FTS ? validate_fts_index_params(*this)
+                                        : Status::OK();
+}
+
+Status FieldSchema::validate_structure() const {
   if (auto s = validate_field_name(name_); !s.ok()) {
     return s;
   }
@@ -189,8 +195,9 @@ Status FieldSchema::validate() const {
         }
       }
 
-      auto params_status = validate_index_params(*this);
-      CHECK_RETURN_STATUS(params_status);
+      if (index_params_->type() != IndexType::FTS) {
+        CHECK_RETURN_STATUS(validate_index_params(*this));
+      }
 
       const auto flat_data_type = vector_index_params->flat_data_type();
       if (is_sparse && flat_data_type != DataType::UNDEFINED &&
@@ -337,6 +344,11 @@ std::string FieldSchema::to_string_formatted(int indent_level) const {
 }
 
 Status CollectionSchema::validate() const {
+  CHECK_RETURN_STATUS(validate_structure());
+  return validate_fts_indexes();
+}
+
+Status CollectionSchema::validate_structure() const {
   if (auto s = validate_collection_name(name_); !s.ok()) {
     return s;
   }
@@ -378,8 +390,17 @@ Status CollectionSchema::validate() const {
         v_fields.size());
   }
   for (auto &field : fields_) {
-    auto s = field->validate();
+    auto s = field->validate_structure();
     CHECK_RETURN_STATUS(s);
+  }
+  return Status::OK();
+}
+
+Status CollectionSchema::validate_fts_indexes() const {
+  for (const auto &field : fields_) {
+    if (field->index_type() == IndexType::FTS) {
+      CHECK_RETURN_STATUS(validate_fts_index_params(*field));
+    }
   }
   return Status::OK();
 }

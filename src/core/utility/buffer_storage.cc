@@ -1939,9 +1939,12 @@ class BufferStorage : public IndexStorage {
     // writer can slip in between (which would dirty meta_buf only to have
     // the page table reset under it, dropping the modification).
     AllShardsExclusiveLatch latch(mapping_shards_);
-    if (!force && has_prepared_writes()) return IndexError_Runtime;
+    // A terminal metadata failure cannot be flushed safely. Release the
+    // unusable generation while still reporting its failure to the caller.
+    const bool discard = force || corrupted_.load(std::memory_order_acquire);
+    if (!discard && has_prepared_writes()) return IndexError_Runtime;
     const int flush_status = flush_index_locked();
-    if (flush_status != 0 && !force) return flush_status;
+    if (flush_status != 0 && !discard) return flush_status;
     read_scratch_.clear();
     invalidate_directory();
     file_name_.clear();

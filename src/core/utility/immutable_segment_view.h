@@ -36,7 +36,7 @@ class ImmutableSegmentView {
     IndexStorage::MemoryBlock direct;
     if (bytes && !storage->vec_buffer_pool() &&
         segment->read(offset, direct, bytes) != bytes)
-      return IndexError_ReadData;
+      return segment->read_error();
     direct_ = std::move(direct);
     segment_ = std::move(segment);
     storage_ = storage;
@@ -57,7 +57,7 @@ class ImmutableSegmentView {
       *out = static_cast<const char *>(direct_.data()) + offset;
     } else {
       if (segment_->read(offset_ + offset, *guard, bytes) != bytes)
-        return IndexError_ReadData;
+        return segment_->read_error();
       *out = guard->data();
     }
     return *out ? 0 : IndexError_ReadData;

@@ -152,8 +152,11 @@ class CollectionImpl : public Collection {
   Result<InternalIdsQueryResult> query_internal_ids(
       const SearchQuery &query, bool return_scores) const override;
 
-  Result<ResolvedIdsResult> resolve_internal_ids(
+  Result<std::vector<std::optional<std::string>>> resolve_internal_ids(
       const std::vector<int64_t> &ids) const override;
+
+  Result<internal::ResolvedIdsSnapshot> resolve_internal_ids_snapshot_impl(
+      const std::vector<int64_t> &ids) const;
 
   Result<GroupResults> group_by_query(
       const GroupByVectorQuery &query) const override;
@@ -208,6 +211,7 @@ class CollectionImpl : public Collection {
   Status close_internal();
   Status close_locked();
   Status close_unsafe();
+  void release_read_resources();
   void release_write_resources();
 
   Status flush_unsafe(bool for_close = false);
@@ -241,10 +245,14 @@ class CollectionImpl : public Collection {
   Status switch_to_new_segment_for_writing(
       const CollectionSchema::Ptr &schema = nullptr);
 
+  Result<SegmentManager::Ptr> stage_column_segments() const;
+  Status commit_column_segments(const CollectionSchema::Ptr &schema,
+                                SegmentManager::Ptr segments);
+
   Status commit_schema_change_with_new_writing_segment(
       const CollectionSchema::Ptr &new_schema,
-      const Segment::Ptr &old_writing_segment, const Version &old_version,
-      Version *new_version, uint64_t writing_min_doc_id);
+      const Segment::Ptr &old_writing_segment, Version new_version,
+      uint64_t writing_min_doc_id);
 
   Result<WriteResults> write_impl(std::vector<Doc> &docs, WriteMode mode);
 
@@ -696,9 +704,7 @@ Status CollectionImpl::close_unsafe() {
 
   // Readers cannot run under the exclusive schema lock. Return their caches
   // before the final write needs any serialization workspace.
-  query_internal_ids_fields_.clear();
-  read_only_segments_.clear();
-  segment_manager_.reset();
+  release_read_resources();
 
   // flush
   if (!options_.read_only_) {
@@ -710,6 +716,12 @@ Status CollectionImpl::close_unsafe() {
 
   release_write_resources();
   return result;
+}
+
+void CollectionImpl::release_read_resources() {
+  query_internal_ids_fields_.clear();
+  read_only_segments_.clear();
+  segment_manager_.reset();
 }
 
 void CollectionImpl::release_write_resources() {
@@ -738,10 +750,21 @@ Status CollectionImpl::destroy() {
   CHECK_DESTROY_RETURN_STATUS(destroyed_, false);
   CHECK_CLOSED_RETURN_STATUS(closed_, false);
 
-  auto s = close_unsafe();
-  CHECK_RETURN_STATUS(s);
+  // A failed final checkpoint leaves a live collection, including its
+  // directory lock, so the caller can release pressure and retry.
+  CHECK_RETURN_STATUS(flush_unsafe(true));
+  release_read_resources();
+#if !defined(_WIN32) && !defined(_WIN64)
+  auto directory_lock = std::move(lock_file_);
+#endif
+  release_write_resources();
+  closed_ = true;
 
-  ailego::FileHelper::RemoveDirectory(path_.c_str());
+  if (!ailego::FileHelper::RemoveDirectory(path_.c_str())) {
+    return Status::InternalError(
+        "Failed to remove collection directory: ", path_, ", ",
+        ailego::FileHelper::GetLastErrorString());
+  }
 
   destroyed_ = true;
 
@@ -983,7 +1006,7 @@ Status CollectionImpl::create_index(const std::string &column_name,
   }
 
   s = commit_schema_change_with_new_writing_segment(
-      new_schema, old_writing_segment, old_version, &new_version,
+      new_schema, old_writing_segment, std::move(new_version),
       writing_min_doc_id);
   CHECK_RETURN_STATUS(s);
 
@@ -1152,7 +1175,7 @@ Status CollectionImpl::drop_index(const std::string &column_name) {
   }
 
   s = commit_schema_change_with_new_writing_segment(
-      new_schema, old_writing_segment, old_version, &new_version,
+      new_schema, old_writing_segment, std::move(new_version),
       writing_min_doc_id);
   CHECK_RETURN_STATUS(s);
 
@@ -1640,31 +1663,11 @@ Status CollectionImpl::add_column(const FieldSchema::Ptr &column_schema,
 
   CHECK_RETURN_STATUS(seal_writing_segment_if_needed());
 
-  auto old_writing_segment = writing_segment_;
-  Version old_version = version_manager_->get_current_version();
-  Version new_version = old_version;
-
-  // add column on segment manager
-  s = segment_manager_->add_column(field_copy, expression,
-                                   options.concurrency_);
+  auto staged = stage_column_segments();
+  if (!staged) return staged.error();
+  s = (*staged)->add_column(field_copy, expression, options.concurrency_);
   CHECK_RETURN_STATUS(s);
-
-  auto min_doc_id = writing_segment_->meta()->min_doc_id();
-
-  // update new version
-  new_version.set_schema(*new_schema);
-
-  auto new_segment_metas = segment_manager_->get_segments_meta();
-  for (auto meta : new_segment_metas) {
-    s = new_version.update_persisted_segment_meta(meta);
-    CHECK_RETURN_STATUS(s);
-  }
-
-  s = commit_schema_change_with_new_writing_segment(
-      new_schema, old_writing_segment, old_version, &new_version, min_doc_id);
-  CHECK_RETURN_STATUS(s);
-
-  return Status::OK();
+  return commit_column_segments(new_schema, std::move(*staged));
 }
 
 Status CollectionImpl::drop_column(const std::string &column_name) {
@@ -1691,30 +1694,11 @@ Status CollectionImpl::drop_column(const std::string &column_name) {
 
   CHECK_RETURN_STATUS(seal_writing_segment_if_needed());
 
-  auto old_writing_segment = writing_segment_;
-  Version old_version = version_manager_->get_current_version();
-  Version new_version = old_version;
-
-  // drop column on segment manager
-  s = segment_manager_->drop_column(column_name);
+  auto staged = stage_column_segments();
+  if (!staged) return staged.error();
+  s = (*staged)->drop_column(column_name);
   CHECK_RETURN_STATUS(s);
-
-  auto min_doc_id = writing_segment_->meta()->min_doc_id();
-
-  // update new version
-  new_version.set_schema(*new_schema);
-
-  auto new_segment_metas = segment_manager_->get_segments_meta();
-  for (auto meta : new_segment_metas) {
-    s = new_version.update_persisted_segment_meta(meta);
-    CHECK_RETURN_STATUS(s);
-  }
-
-  s = commit_schema_change_with_new_writing_segment(
-      new_schema, old_writing_segment, old_version, &new_version, min_doc_id);
-  CHECK_RETURN_STATUS(s);
-
-  return Status::OK();
+  return commit_column_segments(new_schema, std::move(*staged));
 }
 
 Status CollectionImpl::alter_column(const std::string &column_name,
@@ -1752,31 +1736,11 @@ Status CollectionImpl::alter_column(const std::string &column_name,
 
   CHECK_RETURN_STATUS(seal_writing_segment_if_needed());
 
-  auto old_writing_segment = writing_segment_;
-  Version old_version = version_manager_->get_current_version();
-  Version new_version = old_version;
-
-  // alter column on segment manager
-  s = segment_manager_->alter_column(column_name, field_copy,
-                                     options.concurrency_);
+  auto staged = stage_column_segments();
+  if (!staged) return staged.error();
+  s = (*staged)->alter_column(column_name, field_copy, options.concurrency_);
   CHECK_RETURN_STATUS(s);
-
-  auto min_doc_id = writing_segment_->meta()->min_doc_id();
-
-  // update new version
-  new_version.set_schema(*new_schema);
-
-  auto new_segment_metas = segment_manager_->get_segments_meta();
-  for (auto meta : new_segment_metas) {
-    s = new_version.update_persisted_segment_meta(meta);
-    CHECK_RETURN_STATUS(s);
-  }
-
-  s = commit_schema_change_with_new_writing_segment(
-      new_schema, old_writing_segment, old_version, &new_version, min_doc_id);
-  CHECK_RETURN_STATUS(s);
-
-  return Status::OK();
+  return commit_column_segments(new_schema, std::move(*staged));
 }
 
 Result<WriteResults> CollectionImpl::insert(std::vector<Doc> &docs) {
@@ -1922,14 +1886,48 @@ bool CollectionImpl::need_switch_to_new_segment() const {
   return writing_segment_->doc_count() >= schema_->max_doc_count_per_segment();
 }
 
-Status CollectionImpl::commit_schema_change_with_new_writing_segment(
-    const CollectionSchema::Ptr &new_schema,
-    const Segment::Ptr &old_writing_segment, const Version &old_version,
-    Version *new_version, uint64_t writing_min_doc_id) {
-  if (new_version == nullptr) {
-    return Status::InvalidArgument("new_version is null");
+Result<SegmentManager::Ptr> CollectionImpl::stage_column_segments() const try {
+  auto staged = std::make_shared<SegmentManager>();
+  for (const auto &segment : get_all_persist_segments()) {
+    auto replacement = Segment::StageColumnChange(segment);
+    if (!replacement) return tl::make_unexpected(replacement.error());
+    CHECK_RETURN_STATUS_EXPECTED(staged->add_segment(std::move(*replacement)));
+  }
+  return staged;
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(
+      Status(StatusCode::RESOURCE_EXHAUSTED,
+             "Insufficient budget to stage collection column changes"));
+}
+
+Status CollectionImpl::commit_column_segments(
+    const CollectionSchema::Ptr &schema, SegmentManager::Ptr segments) try {
+  auto version = version_manager_->get_current_version();
+  version.set_schema(*schema);
+
+  // Gather the fully built segment set before the durable version changes.
+  // No new file or reader is needed between publication and the in-memory swap.
+  const auto staged = segments->get_segments();
+  for (const auto &segment : staged) {
+    CHECK_RETURN_STATUS(version.update_persisted_segment_meta(segment->meta()));
   }
 
+  const auto old_writer = writing_segment_;
+  CHECK_RETURN_STATUS(commit_schema_change_with_new_writing_segment(
+      schema, old_writer, std::move(version),
+      old_writer->meta()->min_doc_id()));
+  segment_manager_ = std::move(segments);
+  for (const auto &segment : staged) Segment::CommitColumnChange(segment);
+  return Status::OK();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Insufficient budget to publish collection column changes");
+}
+
+Status CollectionImpl::commit_schema_change_with_new_writing_segment(
+    const CollectionSchema::Ptr &new_schema,
+    const Segment::Ptr &old_writing_segment, Version new_version,
+    uint64_t writing_min_doc_id) {
   auto seg_options =
       SegmentOptions{false, options_.enable_mmap_, options_.max_buffer_size_};
   auto new_writing_segment = Segment::CreateAndOpen(
@@ -1938,26 +1936,18 @@ Status CollectionImpl::commit_schema_change_with_new_writing_segment(
   if (!new_writing_segment) {
     return new_writing_segment.error();
   }
-  new_version->reset_writing_segment_meta(new_writing_segment.value()->meta());
-  new_version->set_next_segment_id(segment_id_allocator_.load());
-
-  auto s = version_manager_->apply(*new_version);
-  if (!s.ok()) {
-    new_writing_segment.value()->destroy();
-    return s;
-  }
-
-  s = version_manager_->flush();
-  if (!s.ok()) {
-    new_writing_segment.value()->destroy();
-    auto rollback_status = version_manager_->apply(old_version);
-    CHECK_RETURN_STATUS(rollback_status);
-    return s;
-  }
+  bool published = false;
+  AILEGO_DEFER([&] {
+    if (!published) (void)new_writing_segment.value()->destroy();
+  });
+  new_version.reset_writing_segment_meta(new_writing_segment.value()->meta());
+  new_version.set_next_segment_id(segment_id_allocator_.load());
+  CHECK_RETURN_STATUS(version_manager_->publish(std::move(new_version)));
+  published = true;
 
   schema_ = new_schema;
   writing_segment_ = new_writing_segment.value();
-  s = old_writing_segment->destroy();
+  auto s = old_writing_segment->destroy();
   if (!s.ok()) {
     LOG_WARN("Failed to retire old writing segment: %s", s.message().c_str());
   }
@@ -2307,7 +2297,15 @@ Result<InternalIdsQueryResult> CollectionImpl::query_internal_ids(
              "Insufficient shared budget for internal-ID results"));
 }
 
-Result<ResolvedIdsResult> CollectionImpl::resolve_internal_ids(
+Result<std::vector<std::optional<std::string>>>
+CollectionImpl::resolve_internal_ids(const std::vector<int64_t> &ids) const {
+  auto resolved = resolve_internal_ids_snapshot_impl(ids);
+  if (!resolved) return tl::make_unexpected(resolved.error());
+  return std::move(resolved->keys);
+}
+
+Result<internal::ResolvedIdsSnapshot>
+CollectionImpl::resolve_internal_ids_snapshot_impl(
     const std::vector<int64_t> &ids) const try {
   std::shared_lock lock(schema_handle_mtx_);
   CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
@@ -2317,7 +2315,7 @@ Result<ResolvedIdsResult> CollectionImpl::resolve_internal_ids(
         "resolve_internal_ids requires a read-only collection"));
   }
 
-  if (ids.empty()) return ResolvedIdsResult{};
+  if (ids.empty()) return internal::ResolvedIdsSnapshot{};
   auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
       options_.enable_mmap_ ? nullptr : &detail::SharedResultMemoryAllowance());
   detail::QueryResultEstimate result_bytes;
@@ -2325,8 +2323,9 @@ Result<ResolvedIdsResult> CollectionImpl::resolve_internal_ids(
   result_bytes.add(sizeof(std::optional<std::string>), ids.size());
   detail::ResultMemoryAllowance::PendingCopy pending;
   memory->add_pending(result_bytes.bytes(), pending);
-  ResolvedIdsResult resolved;
-  resolved.memory_owner = options_.enable_mmap_ ? nullptr : memory;
+  internal::ResolvedIdsSnapshot result;
+  result.memory_owner = options_.enable_mmap_ ? nullptr : memory;
+  auto &resolved = result.keys;
   pending.start();
   resolved.reserve(ids.size());
   pending.finish();
@@ -2364,7 +2363,9 @@ Result<ResolvedIdsResult> CollectionImpl::resolve_internal_ids(
     key_copy.start();
     resolved.emplace_back(doc->pk_ref());
   }
-  return resolved;
+  return result;
+} catch (const DocIdMap::ReadError &error) {
+  return tl::make_unexpected(error.status());
 } catch (const std::bad_alloc &) {
   return tl::make_unexpected(
       Status(StatusCode::RESOURCE_EXHAUSTED,
@@ -3230,14 +3231,16 @@ Status CollectionImpl::create() {
                                    "not exist");
   }
 
-  // Schema validation can load a tokenizer dictionary on the default
+  auto s = schema_->validate_structure();
+  CHECK_RETURN_STATUS(s);
+
+  // FTS validation can load a tokenizer dictionary on the default
   // native path, so establish its budget before validating the schema.
   if (GlobalResource::Instance().initialize() != 0) {
     return Status::InternalError("Failed to initialize shared memory budget");
   }
 
-  // check schema
-  auto s = schema_->validate();
+  s = schema_->validate_fts_indexes();
   CHECK_RETURN_STATUS(s);
 
   // Admission precedes directory creation and all WAL/ID-map mutations. The
@@ -3438,6 +3441,16 @@ std::vector<Segment::Ptr> CollectionImpl::get_all_persist_segments() const {
 }
 
 namespace internal {
+
+Result<ResolvedIdsSnapshot> resolve_internal_ids_snapshot(
+    const Collection &collection, const std::vector<int64_t> &ids) {
+  const auto *impl = dynamic_cast<const CollectionImpl *>(&collection);
+  if (impl == nullptr) {
+    return tl::make_unexpected(
+        Status::NotSupported("Unsupported Collection implementation"));
+  }
+  return impl->resolve_internal_ids_snapshot_impl(ids);
+}
 
 Result<FetchResultSnapshot> fetch_result_snapshot(
     const Collection &collection, const std::vector<std::string> &pks,

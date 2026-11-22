@@ -219,7 +219,7 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
   CHECK_STATUS(opened_, true);
 
   const auto record_offset = file_.offset();
-  if (record_offset < 0) return -1;
+  if (record_offset < static_cast<ssize_t>(sizeof(header_))) return -1;
   int read_size = 0;
   int ret = -1;
 

@@ -272,6 +272,9 @@ class ZVEC_API FieldSchema {
 
 
  private:
+  friend class CollectionSchema;
+  Status validate_structure() const;
+
   std::string name_;
   DataType data_type_{DataType::UNDEFINED};
   bool nullable_{false};
@@ -414,6 +417,10 @@ class ZVEC_API CollectionSchema {
   }
 
  private:
+  friend class CollectionImpl;
+  Status validate_structure() const;
+  Status validate_fts_indexes() const;
+
   void copy_fields(const FieldSchemaPtrList &fields) {
     for (auto &field : fields) {
       if (!field) {

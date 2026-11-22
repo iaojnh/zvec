@@ -281,6 +281,13 @@ Status VersionManager::flush() {
   return flush_unlocked(current_version_);
 }
 
+Status VersionManager::publish(Version version) {
+  std::lock_guard lock(mtx_);
+  auto status = flush_unlocked(version);
+  if (status.ok()) current_version_ = std::move(version);
+  return status;
+}
+
 Status VersionManager::flush_writing_segment(
     const SegmentMeta::Ptr &meta, uint32_t delete_snapshot_path_suffix) {
   std::lock_guard lock(mtx_);
@@ -302,17 +309,22 @@ Status VersionManager::flush_unlocked(const Version &version) {
                        : FileHelper::MakeFilePath(path_, FileID::MANIFEST_FILE,
                                                   version_id_ - 1);
   const auto temporary_path = next_path + ".tmp";
-  auto cleanup =
-      ailego::ScopeGuard::Make([&] { FileHelper::RemoveFile(temporary_path); });
+  bool published = false;
+  auto cleanup = ailego::ScopeGuard::Make([&] {
+    if (!published) FileHelper::RemoveFile(temporary_path);
+  });
   auto s = Version::Save(temporary_path, version);
   CHECK_RETURN_STATUS(s);
   if (!ailego::File::Rename(temporary_path, next_path)) {
     return Status::InternalError("Failed to publish manifest: ", next_path);
   }
+  published = true;
   ++version_id_;
 
-  if (!current_path.empty()) {
-    FileHelper::RemoveFile(current_path);
+  try {
+    if (!current_path.empty()) FileHelper::RemoveFile(current_path);
+  } catch (...) {
+    LOG_WARN("Could not remove old manifest: %s", current_path.c_str());
   }
 
   return Status::OK();

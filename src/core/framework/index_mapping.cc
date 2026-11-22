@@ -555,8 +555,10 @@ int IndexMapping::flush() {
                   ailego::FileHelper::GetLastErrorString().c_str());
         return IndexError_WriteData;
       }
-    } else {
-      ailego::File::MemoryFlush(item->data(), segment_size);
+    } else if (!ailego::File::MemoryFlush(item->data(), segment_size)) {
+      LOG_ERROR("Failed to flush mapped segment, size %zu, %s", segment_size,
+                ailego::FileHelper::GetLastErrorString().c_str());
+      return IndexError_WriteData;
     }
     item->reset_dirty();
   }
@@ -565,7 +567,6 @@ int IndexMapping::flush() {
     return 0;
   }
 
-  header_dirty_ = false;
   if (full_mode_ && copy_on_write_) {
     for (auto item : header_addr_map_) {
       auto header_start_offset = item.first;
@@ -581,9 +582,15 @@ int IndexMapping::flush() {
   } else {
     for (auto item : header_addr_map_) {
       auto header = item.second.header;
-      ailego::File::MemoryFlush(header, header->content_offset);
+      if (!ailego::File::MemoryFlush(header, header->content_offset)) {
+        LOG_ERROR("Failed to flush mapped index header, size %zu, %s",
+                  (size_t)header->content_offset,
+                  ailego::FileHelper::GetLastErrorString().c_str());
+        return IndexError_WriteData;
+      }
     }
   }
+  header_dirty_ = false;
   return 0;
 }
 

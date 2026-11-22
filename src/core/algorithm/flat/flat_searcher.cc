@@ -190,11 +190,12 @@ int FlatSearcher<BATCH_SIZE>::load(IndexStorage::Pointer cntr,
     return IndexError_Mismatch;
   }
 
-  if (keys_.load(cntr, FLAT_SEGMENT_KEYS_SEG_ID, 0,
-                 keys_segment->data_size()) != 0) {
+  const int keys_status =
+      keys_.load(cntr, FLAT_SEGMENT_KEYS_SEG_ID, 0, keys_segment->data_size());
+  if (keys_status != 0) {
     LOG_ERROR("Failed to read data (%zu bytes) from keys segment",
               keys_segment->data_size());
-    return IndexError_ReadData;
+    return keys_status;
   }
   mapping_ = {};
   mapping_loaded_ = false;

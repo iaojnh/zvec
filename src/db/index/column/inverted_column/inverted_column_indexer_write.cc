@@ -45,25 +45,25 @@ Status InvertedColumnIndexer::insert(uint32_t id, const std::string &value) {
     for (const auto &encoded_value : encoded_values) {
       s = write_batch.Merge(cf_terms_, encoded_value, encoded_id);
       if (!s.ok()) {
-        return Status::InternalError();
+        return ReadFailure(s);
       }
     }
     if (s = ctx_.write(&write_batch); !s.ok()) {
-      return Status::InternalError();
+      return ReadFailure(s);
     }
     if (s = index_array_len(id, encoded_values.size()); !s.ok()) {
-      return Status::InternalError();
+      return ReadFailure(s);
     }
   } else {
     std::string encoded_value = encode(value);
     s = ctx_.merge(cf_terms_, encoded_value, encoded_id);
     if (!s.ok()) {
-      return Status::InternalError();
+      return ReadFailure(s);
     }
     if (cf_reversed_terms_) {
       s = ctx_.merge(cf_reversed_terms_, encode_reversed(value), encoded_id);
       if (!s.ok()) {
-        return Status::InternalError();
+        return ReadFailure(s);
       }
     }
   }
@@ -92,7 +92,7 @@ Status InvertedColumnIndexer::insert(uint32_t id,
   });
 
   if (s = index_array_len(id, encoded_values.size()); !s.ok()) {
-    return Status::InternalError();
+    return ReadFailure(s);
   }
 
   std::sort(encoded_values.begin(), encoded_values.end());
@@ -100,7 +100,7 @@ Status InvertedColumnIndexer::insert(uint32_t id,
   for (const auto &encoded_value : encoded_values) {
     s = write_batch.Merge(cf_terms_, encoded_value, encoded_id);
     if (!s.ok()) {
-      return Status::InternalError();
+      return ReadFailure(s);
     }
   }
   s = ctx_.write(&write_batch);
@@ -108,7 +108,7 @@ Status InvertedColumnIndexer::insert(uint32_t id,
     update_max_id(id);
     return Status::OK();
   } else {
-    return Status::InternalError();
+    return ReadFailure(s);
   }
 }
 
@@ -129,7 +129,7 @@ Status InvertedColumnIndexer::insert(uint32_t id, bool value) {
   } else {
     LOG_ERROR("Failed to insert terms of id[%u] to %s, code[%d], reason[%s]",
               id, this->id().c_str(), s.code(), s.ToString().c_str());
-    return Status::InternalError();
+    return ReadFailure(s);
   }
 }
 
@@ -146,7 +146,7 @@ Status InvertedColumnIndexer::insert(uint32_t id,
   rocksdb::Status rs;
   if (rs = index_array_len(id, values.size()); !rs.ok()) {
     LOG_ERROR("Failed to index array length for %s", this->id().c_str());
-    return Status::InternalError();
+    return ReadFailure(rs);
   }
 
   bool has_true = false;
@@ -173,7 +173,7 @@ Status InvertedColumnIndexer::insert(uint32_t id,
   } else {
     LOG_ERROR("Failed to insert terms of id[%u] to %s, code[%d], reason[%s]",
               id, this->id().c_str(), rs.code(), rs.ToString().c_str());
-    return Status::InternalError();
+    return ReadFailure(rs);
   }
 }
 

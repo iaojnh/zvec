@@ -866,12 +866,13 @@ py::object resolve_ids_for_python(const Collection &self, py::handle source) {
       throw py::type_error("Internal IDs must be integers");
     }
   }
-  Result<ResolvedIdsResult> result;
+  Result<internal::ResolvedIdsSnapshot> result;
   {
     py::gil_scoped_release release;
-    result = self.resolve_internal_ids(ids);
+    result = internal::resolve_internal_ids_snapshot(self, ids);
   }
-  auto resolved = unwrap_expected(std::move(result));
+  auto snapshot = unwrap_expected(std::move(result));
+  const auto &resolved = snapshot.keys;
   if (resolved.empty()) return py::list();
   auto memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
       owner, false, kPythonResultBackingQuantum);

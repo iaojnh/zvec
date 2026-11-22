@@ -137,14 +137,14 @@ struct ResultMemoryOwner {
 };
 
 struct InternalIdsQueryResult : ResultMemoryOwner {
+  InternalIdsQueryResult() = default;
+  InternalIdsQueryResult(std::vector<int64_t> doc_ids,
+                         std::vector<float> doc_scores = {})
+      : ids(std::move(doc_ids)), scores(std::move(doc_scores)) {}
+
   std::vector<int64_t> ids;
   std::vector<float> scores;
 };
-
-// Preserve the sequence interface while carrying the result's admission.
-// Base destruction releases the vector before its memory owner.
-struct ResolvedIdsResult : ResultMemoryOwner,
-                           std::vector<std::optional<std::string>> {};
 
 struct ZVEC_API SearchQuery {
   QueryTarget target_;

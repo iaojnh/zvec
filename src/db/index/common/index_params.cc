@@ -224,6 +224,8 @@ static fts::FtsIndexParams to_internal(const FtsIndexParams &params) {
 Status FtsIndexParams::validate() const {
   auto pipeline = fts::TokenizerFactory::create(to_internal(*this));
   if (!pipeline.has_value()) {
+    if (pipeline.error().code() == StatusCode::RESOURCE_EXHAUSTED)
+      return pipeline.error();
     return Status::InvalidArgument("invalid FTS index params: ",
                                    pipeline.error().message());
   }

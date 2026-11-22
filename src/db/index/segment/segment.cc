@@ -143,7 +143,14 @@ class SegmentImpl : public Segment,
             id(), s.message().c_str());
       }
     }
+    if (column_change_) {
+      for (const auto &[type, block] : column_change_->created)
+        remove_column_artifact(type, block);
+    }
   }
+
+  Result<Segment::Ptr> stage_column_change() const;
+  void commit_column_change() noexcept;
 
   SegmentID id() const override;
 
@@ -412,6 +419,8 @@ class SegmentImpl : public Segment,
   Result<uint64_t> get_global_doc_id(uint64_t segment_doc_id) const;
 
   BlockID allocate_block_id();
+  BlockID allocate_column_block(BlockType type);
+  void remove_column_artifact(BlockType type, BlockID block) const noexcept;
 
   bool validate(const std::vector<std::string> &columns) const;
 
@@ -567,6 +576,12 @@ class SegmentImpl : public Segment,
   mutable std::shared_mutex seg_mtx_;
 
   bool need_destroyed_{false};
+
+  struct ColumnChange {
+    SegmentMeta::Ptr original;
+    std::vector<std::pair<BlockType, BlockID>> created;
+  };
+  std::unique_ptr<ColumnChange> column_change_;
 
   // For performance tuning
   static constexpr size_t INVALID_CHUNK_LAYOUT_ID =
@@ -759,6 +774,7 @@ Status SegmentImpl::close() {
   // Release forward stores and wal so their file handles/mappings are
   // dropped before cleanup() removes the segment directory (on Windows
   // open/mapped files cannot be deleted).
+  persist_chunk_arrays_.clear();
   persist_stores_.clear();
   memory_store_.reset();
   if (wal_file_) {
@@ -4339,11 +4355,22 @@ Status SegmentImpl::reopen_invert_indexer(bool read_only) {
   // build invert index path
   uint32_t block_id = 0;
   auto &persist_blocks = segment_meta_->persisted_blocks();
+  BlockMeta *index_block = nullptr;
   for (auto &block : persist_blocks) {
     if (block.type() == BlockType::SCALAR_INDEX) {
+      index_block = &block;
       block_id = block.id();
       break;
     }
+  }
+  if (column_change_) {
+    if (!index_block || !invert_indexers_)
+      return Status::InternalError("Missing source inverted index");
+    block_id = allocate_column_block(BlockType::SCALAR_INDEX);
+    const auto snapshot =
+        FileHelper::MakeInvertIndexPath(path_, id(), block_id);
+    CHECK_RETURN_STATUS(invert_indexers_->create_snapshot(snapshot));
+    index_block->set_id(block_id);
   }
   std::string invert_index_path =
       FileHelper::MakeInvertIndexPath(path_, id(), block_id);
@@ -4368,6 +4395,66 @@ Status SegmentImpl::reopen_invert_indexer(bool read_only) {
     return open_status;
   }
   return Status::OK();
+}
+
+Result<Segment::Ptr> SegmentImpl::stage_column_change() const try {
+  if (segment_meta_->writing_forward_block().has_value())
+    return tl::make_unexpected(
+        Status::FailedPrecondition("Column changes require a sealed segment"));
+  auto staged =
+      std::make_shared<SegmentImpl>(path_, *collection_schema_, *segment_meta_,
+                                    id_map_, delete_store_, version_manager_);
+  auto options = options_;
+  options.read_only_ = true;
+  auto status = staged->Open(options, {}, false);
+  if (!status.ok()) return tl::make_unexpected(std::move(status));
+  staged->block_id_allocator_.store(
+      std::max(staged->block_id_allocator_.load(), block_id_allocator_.load()));
+  staged->column_change_ = std::make_unique<ColumnChange>();
+  staged->column_change_->original = segment_meta_;
+  return staged;
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(
+      Status(StatusCode::RESOURCE_EXHAUSTED,
+             "Insufficient budget to stage a segment column change"));
+}
+
+BlockID SegmentImpl::allocate_column_block(BlockType type) {
+  const auto block = allocate_block_id();
+  if (column_change_) column_change_->created.emplace_back(type, block);
+  return block;
+}
+
+void SegmentImpl::remove_column_artifact(BlockType type,
+                                         BlockID block) const noexcept try {
+  if (type == BlockType::SCALAR) {
+    (void)FileHelper::RemoveFile(FileHelper::MakeForwardBlockPath(
+        path_, id(), block, !options_.enable_mmap_));
+  } else if (type == BlockType::SCALAR_INDEX) {
+    (void)FileHelper::RemoveDirectory(
+        FileHelper::MakeInvertIndexPath(path_, id(), block));
+  }
+} catch (...) {
+  LOG_WARN("Could not remove unused column block %u in segment %u", block,
+           id());
+}
+
+void SegmentImpl::commit_column_change() noexcept {
+  if (!column_change_) return;
+  const auto &committed = segment_meta_->persisted_blocks();
+  const auto remove_unused = [&](BlockType type, BlockID id) {
+    if (std::none_of(committed.begin(), committed.end(), [&](const auto &b) {
+          return b.type() == type && b.id() == id;
+        }))
+      remove_column_artifact(type, id);
+  };
+  for (const auto &block : column_change_->original->persisted_blocks()) {
+    remove_unused(block.type(), block.id());
+  }
+  for (const auto &[type, block] : column_change_->created) {
+    remove_unused(type, block);
+  }
+  column_change_.reset();
 }
 
 Status SegmentImpl::add_column(FieldSchema::Ptr column_schema,
@@ -4483,7 +4570,8 @@ Status SegmentImpl::add_column(FieldSchema::Ptr column_schema,
   std::vector<BlockMeta> new_blocks;
   status = WriteColumnInBlocks(
       column_schema->name(), new_column, filter_column_blocks, path_,
-      segment_meta_->id(), [this]() { return allocate_block_id(); },
+      segment_meta_->id(),
+      [this]() { return allocate_column_block(BlockType::SCALAR); },
       !options_.enable_mmap_, &new_blocks);
   if (!status.ok()) {
     if (status.IsOutOfMemory())
@@ -4528,7 +4616,7 @@ Status SegmentImpl::add_column(FieldSchema::Ptr column_schema,
         }
       }
     } else {
-      auto new_block_id = allocate_block_id();
+      auto new_block_id = allocate_column_block(BlockType::SCALAR_INDEX);
       std::string new_invert_index_path =
           FileHelper::MakeInvertIndexPath(path_, id(), new_block_id);
 
@@ -4556,8 +4644,8 @@ Status SegmentImpl::add_column(FieldSchema::Ptr column_schema,
     auto s = insert_array_to_invert_indexer(column_schema, new_column,
                                             &column_indexer);
     CHECK_RETURN_STATUS(s);
-    column_indexer->seal();
-    invert_indexers_->flush();
+    CHECK_RETURN_STATUS(column_indexer->seal());
+    CHECK_RETURN_STATUS(invert_indexers_->flush());
   }
 
   std::unique_lock<std::shared_mutex> lock(seg_mtx_);
@@ -4651,7 +4739,8 @@ Status SegmentImpl::alter_column(const std::string &column_name,
   std::vector<BlockMeta> new_blocks;
   auto status = WriteColumnInBlocks(
       new_column_name, new_column, filter_column_blocks, path_,
-      segment_meta_->id(), [this]() { return allocate_block_id(); },
+      segment_meta_->id(),
+      [this]() { return allocate_column_block(BlockType::SCALAR); },
       !options_.enable_mmap_, &new_blocks);
   if (!status.ok()) {
     if (status.IsOutOfMemory())
@@ -4683,8 +4772,10 @@ Status SegmentImpl::alter_column(const std::string &column_name,
       auto s = reopen_invert_indexer();
       CHECK_RETURN_STATUS(s);
 
-      s = invert_indexers_->remove_column_indexer(column_name);
-      CHECK_RETURN_STATUS(s);
+      if (old_field_schema->has_invert_index()) {
+        s = invert_indexers_->remove_column_indexer(column_name);
+        CHECK_RETURN_STATUS(s);
+      }
 
       s = invert_indexers_->create_column_indexer(*new_column_schema);
       CHECK_RETURN_STATUS(s);
@@ -4699,7 +4790,7 @@ Status SegmentImpl::alter_column(const std::string &column_name,
         }
       }
     } else {
-      auto new_block_id = allocate_block_id();
+      auto new_block_id = allocate_column_block(BlockType::SCALAR_INDEX);
       std::string new_invert_index_path =
           FileHelper::MakeInvertIndexPath(path_, id(), new_block_id);
 
@@ -4728,8 +4819,8 @@ Status SegmentImpl::alter_column(const std::string &column_name,
     auto s = insert_array_to_invert_indexer(new_column_schema, new_column,
                                             &column_indexer);
     CHECK_RETURN_STATUS(s);
-    column_indexer->seal();
-    invert_indexers_->flush();
+    CHECK_RETURN_STATUS(column_indexer->seal());
+    CHECK_RETURN_STATUS(invert_indexers_->flush());
   } else if (old_field_schema->has_invert_index()) {
     // drop old invert indexer
     auto s = reopen_invert_indexer();
@@ -4744,6 +4835,7 @@ Status SegmentImpl::alter_column(const std::string &column_name,
         block.del_column(old_field_schema->name());
         if (block.columns().empty()) {
           segment_meta_->remove_block(block.id());
+          if (column_change_) invert_indexers_.reset();
         }
         break;
       }
@@ -4795,6 +4887,7 @@ Status SegmentImpl::alter_column(const std::string &column_name,
 
   // delete single column store file
   for (auto block_id : will_del_block_ids) {
+    if (column_change_) continue;
     // delete forward store file
     std::string filepath = FileHelper::MakeForwardBlockPath(
         path_, meta()->id(), block_id, !options_.enable_mmap_);
@@ -4878,6 +4971,7 @@ Status SegmentImpl::drop_column(const std::string &column_name) {
 
   // delete single column store file
   for (auto block_id : will_del_block_ids) {
+    if (column_change_) continue;
     // delete forward store file
     std::string filepath = FileHelper::MakeForwardBlockPath(
         path_, meta()->id(), block_id, !options_.enable_mmap_);
@@ -4895,7 +4989,7 @@ Status SegmentImpl::drop_column(const std::string &column_name) {
 
     s = invert_indexers_->remove_column_indexer(old_field_schema->name());
     CHECK_RETURN_STATUS(s);
-    invert_indexers_->flush();
+    CHECK_RETURN_STATUS(invert_indexers_->flush());
 
     auto &persist_blocks = segment_meta_->persisted_blocks();
     for (auto &block : persist_blocks) {
@@ -4904,6 +4998,7 @@ Status SegmentImpl::drop_column(const std::string &column_name) {
         if (block.columns_.empty()) {
           // remove block meta from segment meta
           segment_meta_->remove_block(block.id_);
+          if (column_change_) invert_indexers_.reset();
         }
         break;
       }
@@ -5980,6 +6075,20 @@ Result<Segment::Ptr> Segment::CreateAndOpen(
 
   created = true;
   return segment;
+}
+
+Result<Segment::Ptr> Segment::StageColumnChange(const Ptr &source) {
+  auto impl = std::dynamic_pointer_cast<SegmentImpl>(source);
+  if (!impl) {
+    return tl::make_unexpected(
+        Status::NotSupported("Unsupported segment for column change"));
+  }
+  return impl->stage_column_change();
+}
+
+void Segment::CommitColumnChange(const Ptr &staged) noexcept {
+  if (auto impl = std::dynamic_pointer_cast<SegmentImpl>(staged))
+    impl->commit_column_change();
 }
 
 Result<Segment::Ptr> Segment::Open(

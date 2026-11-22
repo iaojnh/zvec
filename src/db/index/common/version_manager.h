@@ -203,6 +203,7 @@ class VersionManager {
   Status remove_persisted_segment_meta(SegmentID id);
 
   Status flush();
+  Status publish(Version version);
   Status flush_writing_segment(const SegmentMeta::Ptr &meta,
                                uint32_t delete_snapshot_path_suffix);
 

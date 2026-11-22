@@ -952,10 +952,88 @@ TEST_F(CollectionWriteBudgetTest, FullTextSealReportsSharedWritePressure) {
     auto denied = writer.value()->create_iterator();
     ASSERT_FALSE(denied.has_value());
     EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
+    const auto denied_destroy = writer.value()->destroy();
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied_destroy.code());
   }
 
   auto retried = writer.value()->create_iterator();
   ASSERT_TRUE(retried.has_value()) << retried.error().message();
+  retried.value().reset();
+  const auto destroyed = writer.value()->destroy();
+  EXPECT_TRUE(destroyed.ok()) << destroyed.message();
+  EXPECT_FALSE(std::filesystem::exists(collection_path));
+}
+
+TEST_F(CollectionWriteBudgetTest, FailedColumnChangeKeepsPriorIndexAndSchema) {
+  const auto collection_path = path("column_change");
+  const CollectionOptions options{false, false, kMiB};
+  CollectionSchema indexed("indexed_columns");
+  ASSERT_TRUE(indexed
+                  .add_field(std::make_shared<FieldSchema>(
+                      "value", DataType::INT32, false,
+                      std::make_shared<InvertIndexParams>()))
+                  .ok());
+  auto writer = Collection::CreateAndOpen(collection_path, indexed, options);
+  ASSERT_TRUE(writer.has_value()) << writer.error().message();
+  for (const auto &key : {"first", "second"}) {
+    std::vector<Doc> rows(1);
+    rows.front().set_pk(key);
+    rows.front().set("value", int32_t{7});
+    auto inserted = writer.value()->insert(rows);
+    ASSERT_TRUE(inserted.has_value() && inserted->front().ok());
+    auto iterator = writer.value()->create_iterator();
+    ASSERT_TRUE(iterator.has_value()) << iterator.error().message();
+  }
+
+  auto manager = GlobalResource::Instance().rocksdb_write_buffer_manager();
+  ASSERT_TRUE(manager && manager->enabled());
+  {
+    const auto reserved = manager->buffer_size();
+    manager->ReserveMem(reserved);
+    AILEGO_DEFER([&] {
+      manager->ScheduleFreeMem(reserved);
+      manager->FreeMem(reserved);
+    });
+    const auto denied =
+        writer.value()->alter_column("value", "renamed", nullptr, {2});
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.code());
+  }
+  // Initial manifest plus one forward flush and one rotation per row.
+  const auto blocked =
+      FileHelper::MakeFilePath(collection_path, FileID::MANIFEST_FILE, 5);
+  ASSERT_TRUE(std::filesystem::create_directory(blocked));
+  const auto unpublished =
+      writer.value()->alter_column("value", "renamed", nullptr, {2});
+  ASSERT_TRUE(std::filesystem::remove(blocked));
+  EXPECT_FALSE(unpublished.ok());
+  ASSERT_TRUE(writer.value()->close().ok());
+
+  auto recovered = Collection::Open(collection_path, options);
+  ASSERT_TRUE(recovered.has_value()) << recovered.error().message();
+  auto original = recovered.value()->schema();
+  ASSERT_TRUE(original.has_value());
+  EXPECT_TRUE(original->has_field("value"));
+  EXPECT_FALSE(original->has_field("renamed"));
+  auto original_rows = recovered.value()->fetch({"first", "second"});
+  ASSERT_TRUE(original_rows.has_value()) << original_rows.error().message();
+  for (const auto &key : {"first", "second"}) {
+    ASSERT_NE(nullptr, original_rows->at(key));
+    EXPECT_EQ(7, original_rows->at(key)->get<int32_t>("value"));
+  }
+  original_rows->clear();
+
+  const auto retried =
+      recovered.value()->alter_column("value", "renamed", nullptr, {2});
+  ASSERT_TRUE(retried.ok()) << retried.message();
+  ASSERT_TRUE(recovered.value()->close().ok());
+  auto final = Collection::Open(collection_path, {true, false, kMiB});
+  ASSERT_TRUE(final.has_value()) << final.error().message();
+  auto changed_rows = final.value()->fetch({"first", "second"});
+  ASSERT_TRUE(changed_rows.has_value()) << changed_rows.error().message();
+  for (const auto &key : {"first", "second"}) {
+    ASSERT_NE(nullptr, changed_rows->at(key));
+    EXPECT_EQ(7, changed_rows->at(key)->get<int32_t>("renamed"));
+  }
 }
 
 TEST_F(CollectionWriteBudgetTest, BufferedVectorRefusalPrecedesWalAndMutation) {

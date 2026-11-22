@@ -61,6 +61,11 @@ class Segment {
       const VersionManager::Ptr &version_manager, const SegmentOptions &options,
       const std::vector<Ptr> &older_segments = {}, bool resume_seal = false);
 
+  // A column change reuses immutable files and builds any new blocks at
+  // separate paths until the enclosing collection publishes its manifest.
+  static Result<Ptr> StageColumnChange(const Ptr &source);
+  static void CommitColumnChange(const Ptr &staged) noexcept;
+
   virtual SegmentID id() const = 0;
 
   virtual SegmentMeta::Ptr meta() const = 0;
