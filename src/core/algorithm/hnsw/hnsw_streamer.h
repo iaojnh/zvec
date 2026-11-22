@@ -242,8 +242,7 @@ class HnswStreamer : public IndexStreamer {
 
   //! Bind the distance functions and inline record layout used for search
   void bind_search_dist_space(HnswContext *ctx) const;
-  class BufferedReadGuard;
-  BufferedReadGuard lock_buffered_reads() const;
+  std::shared_mutex *buffered_graph_mutex() const;
   std::unique_lock<std::shared_mutex> lock_buffered_writes();
 
  private:

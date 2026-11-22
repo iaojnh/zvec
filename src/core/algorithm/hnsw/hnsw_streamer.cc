@@ -68,6 +68,33 @@ int DumpTurboQuantizerSegment(const IndexStorage::Pointer &storage,
   return 0;
 }
 
+class BufferedGraphReadLock {
+ public:
+  explicit BufferedGraphReadLock(std::shared_mutex *mutex) {
+    if (!mutex) return;
+    // A search callback can call another read API on the same streamer.
+    // Retain the outer lock and avoid reacquiring it behind a waiting writer.
+    for (auto *guard = active_; guard; guard = guard->previous_) {
+      if (guard->lock_.mutex() == mutex) return;
+    }
+    lock_ = std::shared_lock(*mutex);
+    previous_ = active_;
+    active_ = this;
+  }
+
+  ~BufferedGraphReadLock() {
+    if (lock_.owns_lock()) active_ = previous_;
+  }
+
+  BufferedGraphReadLock(const BufferedGraphReadLock &) = delete;
+  BufferedGraphReadLock &operator=(const BufferedGraphReadLock &) = delete;
+
+ private:
+  static inline thread_local const BufferedGraphReadLock *active_{nullptr};
+  const BufferedGraphReadLock *previous_{nullptr};
+  std::shared_lock<std::shared_mutex> lock_;
+};
+
 }  // namespace
 
 int HnswStreamer::RestoreQuantizer(
@@ -144,42 +171,6 @@ int HnswStreamer::RestoreQuantizer(
   *out_quantizer = quantizer;
   return 0;
 }
-
-class HnswStreamer::BufferedReadGuard {
- public:
-  explicit BufferedReadGuard(std::shared_mutex *mutex)
-      : protects_graph_(mutex != nullptr) {
-    if (!mutex) return;
-    // A search callback can call another read API on the same streamer.
-    // Retain the outer lock and avoid reacquiring it behind a waiting writer.
-    for (auto *guard = active_; guard; guard = guard->previous_) {
-      if (guard->lock_.mutex() == mutex) return;
-    }
-    lock_ = std::shared_lock(*mutex);
-    previous_ = active_;
-    active_ = this;
-  }
-
-  ~BufferedReadGuard() {
-    if (lock_.owns_lock()) active_ = previous_;
-  }
-
-  bool protects_graph() const {
-    return protects_graph_;
-  }
-
-  BufferedReadGuard(const BufferedReadGuard &) = delete;
-  BufferedReadGuard &operator=(const BufferedReadGuard &) = delete;
-
- private:
-  static thread_local const BufferedReadGuard *active_;
-  const bool protects_graph_;
-  const BufferedReadGuard *previous_{nullptr};
-  std::shared_lock<std::shared_mutex> lock_;
-};
-
-thread_local const HnswStreamer::BufferedReadGuard
-    *HnswStreamer::BufferedReadGuard::active_ = nullptr;
 
 HnswStreamer::HnswStreamer() = default;
 
@@ -499,7 +490,7 @@ size_t HnswStreamer::packed_segment_count() const {
 }
 
 int HnswStreamer::dump_with_vectors(const IndexDumper::Pointer &dumper) {
-  const auto guard = lock_buffered_reads();
+  const BufferedGraphReadLock guard(buffered_graph_mutex());
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   if (state_ != STATE_OPENED || !build_vector_source_) {
@@ -887,7 +878,7 @@ int HnswStreamer::dump(const IndexDumper::Pointer &dumper) {
 }
 
 IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
-  const auto guard = lock_buffered_reads();
+  const BufferedGraphReadLock guard(buffered_graph_mutex());
   if (entity_ && entity_->mutation_error() != 0) return nullptr;
   if (ailego_unlikely(state_ != STATE_OPENED)) {
     LOG_ERROR("Create context failed, open storage first!");
@@ -937,7 +928,7 @@ IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
 }
 
 IndexProvider::Pointer HnswStreamer::create_provider() const {
-  const auto guard = lock_buffered_reads();
+  const BufferedGraphReadLock guard(buffered_graph_mutex());
   if (entity_ && entity_->mutation_error() != 0) return nullptr;
   LOG_DEBUG("HnswStreamer create provider");
 
@@ -985,36 +976,31 @@ void HnswStreamer::bind_search_dist_space(HnswContext *ctx) const {
                        meta_.element_size(), extra_values_size);
 }
 
-HnswStreamer::BufferedReadGuard HnswStreamer::lock_buffered_reads() const {
-  return BufferedReadGuard(entity_ && entity_->storage_mode() ==
-                                          HnswStorageMode::kBufferPool
-                               ? &buffered_graph_mutex_
-                               : nullptr);
+std::shared_mutex *HnswStreamer::buffered_graph_mutex() const {
+  return storage_mode() == HnswStorageMode::kBufferPool ? &buffered_graph_mutex_
+                                                        : nullptr;
 }
 
 std::unique_lock<std::shared_mutex> HnswStreamer::lock_buffered_writes() {
-  std::unique_lock<std::shared_mutex> lock(buffered_graph_mutex_,
-                                           std::defer_lock);
-  if (entity_ && entity_->storage_mode() == HnswStorageMode::kBufferPool)
-    lock.lock();
-  return lock;
+  if (auto *mutex = buffered_graph_mutex()) return std::unique_lock(*mutex);
+  return {};
 }
 
 const void *HnswStreamer::get_vector(uint64_t key) const {
-  const auto guard = lock_buffered_reads();
+  const BufferedGraphReadLock guard(buffered_graph_mutex());
   if (!entity_ || entity_->mutation_error() != 0) return nullptr;
   return entity_->get_vector_by_key(key);
 }
 
 int HnswStreamer::get_vector(uint64_t key,
                              IndexStorage::MemoryBlock &block) const {
-  const auto guard = lock_buffered_reads();
+  const BufferedGraphReadLock guard(buffered_graph_mutex());
   const int error = entity_ ? entity_->mutation_error() : IndexError_NoReady;
   if (error != 0) {
     block.reset();
     return error;
   }
-  if (!guard.protects_graph() || read_only_) {
+  if (read_only_ || storage_mode() != HnswStorageMode::kBufferPool) {
     return entity_->get_vector_by_key(key, block);
   }
   const auto id = entity_->get_id(key);
@@ -1026,21 +1012,21 @@ int HnswStreamer::get_vector(uint64_t key,
 }
 
 const void *HnswStreamer::get_vector_by_id(uint32_t id) const {
-  const auto guard = lock_buffered_reads();
+  const BufferedGraphReadLock guard(buffered_graph_mutex());
   if (!entity_ || entity_->mutation_error() != 0) return nullptr;
   return entity_->get_vector(id);
 }
 
 int HnswStreamer::get_vector_by_id(uint32_t id,
                                    IndexStorage::MemoryBlock &block) const {
-  const auto guard = lock_buffered_reads();
+  const BufferedGraphReadLock guard(buffered_graph_mutex());
   const int error = entity_ ? entity_->mutation_error() : IndexError_NoReady;
   if (error != 0) {
     block.reset();
     return error;
   }
   // The caller can retain the block after the read lock is released.
-  return guard.protects_graph() && !read_only_
+  return !read_only_ && storage_mode() == HnswStorageMode::kBufferPool
              ? entity_->get_vector_snapshot(id, block)
              : entity_->get_vector(id, block);
 }
@@ -1267,7 +1253,7 @@ int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
 int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
                               uint32_t count,
                               IndexStreamer::Context::Pointer &context) const {
-  const auto guard = lock_buffered_reads();
+  const BufferedGraphReadLock guard(buffered_graph_mutex());
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   int ret = check_params(query, qmeta, true);
@@ -1329,7 +1315,7 @@ int HnswStreamer::search_candidates_impl(
     const void *query, const IndexQueryMeta &qmeta, std::vector<uint64_t> &keys,
     IndexStreamer::Context::Pointer &context,
     std::vector<float> *scores) const {
-  const auto guard = lock_buffered_reads();
+  const BufferedGraphReadLock guard(buffered_graph_mutex());
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   keys.clear();
@@ -1384,7 +1370,7 @@ int HnswStreamer::search_candidates_impl(
 }
 
 void HnswStreamer::print_debug_info() {
-  const auto guard = lock_buffered_reads();
+  const BufferedGraphReadLock guard(buffered_graph_mutex());
   if (entity_->mutation_error() != 0) return;
   for (node_id_t id = 0; id < entity_->doc_cnt(); ++id) {
     if (entity_->get_key(id) == kInvalidKey) {
@@ -1416,7 +1402,7 @@ int HnswStreamer::search_bf_impl(
 int HnswStreamer::search_bf_impl(
     const void *query, const IndexQueryMeta &qmeta, uint32_t count,
     IndexStreamer::Context::Pointer &context) const {
-  auto guard = lock_buffered_reads();
+  const BufferedGraphReadLock guard(buffered_graph_mutex());
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   int ret = check_params(query, qmeta, true);
@@ -1522,7 +1508,7 @@ int HnswStreamer::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const {
-  auto guard = lock_buffered_reads();
+  const BufferedGraphReadLock guard(buffered_graph_mutex());
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   int ret = check_params(query, qmeta, true);
