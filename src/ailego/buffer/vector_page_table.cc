@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstring>
 #include <thread>
+#include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/memory_helper.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/logger/logger.h>
@@ -668,6 +669,19 @@ bool VectorPageTable::force_evict_block(block_id_t block_id) {
 }
 
 bool VectorPageTable::reclaim_clean_block(block_id_t block_id) {
+  return reclaim_clean_block(block_id, /*discard_backing=*/false);
+}
+
+EvictableBlockOwner::CleanReclaim VectorPageTable::try_reclaim_clean(
+    eviction_key_t key, version_t version) {
+  if (is_dead_block(key, version)) return CleanReclaim::kStale;
+  return reclaim_clean_block(key, /*discard_backing=*/true)
+             ? CleanReclaim::kReclaimed
+             : CleanReclaim::kKeep;
+}
+
+bool VectorPageTable::reclaim_clean_block(block_id_t block_id,
+                                          bool discard_backing) {
   assert(block_id < entry_num_.load(std::memory_order_relaxed));
   Entry &entry = entry_at(block_id);
   int expected = 0;
@@ -681,7 +695,8 @@ bool VectorPageTable::reclaim_clean_block(block_id_t block_id) {
 
   char *buffer = entry.buffer.exchange(nullptr, std::memory_order_acq_rel);
   if (buffer != nullptr) {
-    MemoryLimitPool::get_instance().release_buffer(buffer, kVectorPageSize);
+    MemoryLimitPool::get_instance().release_buffer(buffer, kVectorPageSize,
+                                                   discard_backing);
   }
   inc_evict(entry.evict_priority.load(std::memory_order_relaxed));
   entry.in_evict_queue.store(false, std::memory_order_relaxed);
@@ -807,6 +822,11 @@ bool VectorPageTable::do_evict_block(block_id_t block_id, bool force) {
     }
     MetadataEntry &metadata = metadata_entry_at(block_id);
     char *buffer = e.buffer.load(std::memory_order_acquire);
+    bool writing_back = false;
+    auto finish_writeback = ScopeGuard::Make([&] {
+      if (writing_back)
+        MemoryLimitPool::get_instance().finish_pending_writeback(true);
+    });
     if (buffer && metadata.is_dirty.load(std::memory_order_relaxed)) {
       if (!force && writeback_callback_) {
         bool scheduled = false;
@@ -837,6 +857,8 @@ bool VectorPageTable::do_evict_block(block_id_t block_id, bool force) {
       }
       int flush_rc = -1;
       if (flush_callback_) {
+        MemoryLimitPool::get_instance().add_pending_writeback(true);
+        writing_back = true;
         try {
           flush_rc = flush_callback_(block_id, buffer, kVectorPageSize,
                                      metadata.file_offset);
@@ -1250,6 +1272,7 @@ bool VecBufferPool::enqueue_writeback(block_id_t page_id) {
         return false;
       }
       writeback_queue_.push_back(page_id);
+      MemoryLimitPool::get_instance().add_pending_writeback(false);
       writeback_requests_.fetch_add(1, std::memory_order_relaxed);
       const uint64_t pending =
           writeback_pending_.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1341,6 +1364,7 @@ void VecBufferPool::writeback_loop() {
     writeback_pending_.fetch_sub(page_ids.size(), std::memory_order_relaxed);
     for (block_id_t page_id : page_ids) {
       (void)page_table_.reclaim_clean_block(page_id);
+      MemoryLimitPool::get_instance().finish_pending_writeback(false);
     }
 
     {

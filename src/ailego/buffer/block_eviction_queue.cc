@@ -1196,6 +1196,17 @@ size_t MemoryLimitPool::page_buffer_size() {
 }
 
 bool BlockEvictionQueue::dequeue_priority(size_t priority, BlockType &item) {
+  if (has_deferred_requeue_.load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> lock(deferred_requeue_mutex_);
+    if (has_deferred_requeue_.load(std::memory_order_relaxed) &&
+        deferred_requeue_.priority == priority) {
+      item = deferred_requeue_;
+      has_deferred_requeue_.store(false, std::memory_order_release);
+      approximate_queue_sizes_[priority].fetch_sub(1,
+                                                   std::memory_order_relaxed);
+      return true;
+    }
+  }
   // Tokenless dequeue can repeatedly choose the reclaiming thread's own
   // requeued pinned page and starve older producer streams forever. Consumer
   // tokens rotate across producers without allocating on the pressure path.
@@ -1320,7 +1331,8 @@ void BlockEvictionQueue::recycle() {
   }
 }
 
-size_t BlockEvictionQueue::recycle_inactive(size_t max_attempts) {
+size_t BlockEvictionQueue::recycle_inactive(size_t max_attempts,
+                                            const ReclaimCheck *check) {
   // Sampling must progress even when ordinary pages are continuously
   // replenished. Collect the sample before requeueing so a hot/pinned entry
   // is not inspected twice in the same pass. Never scan a whole cache here.
@@ -1339,7 +1351,7 @@ size_t BlockEvictionQueue::recycle_inactive(size_t max_attempts) {
       continue;
     }
     const uint8_t priority = item.owner->eviction_priority(item.owner_key);
-    if (priority == kExplicitHotPriority) {
+    if (priority == kExplicitHotPriority && (!check || check->allows_work())) {
       inactive_probes_.fetch_add(1, std::memory_order_relaxed);
       if (item.owner->evict_inactive_block(item.owner_key)) {
         ++evicted;
@@ -1376,6 +1388,49 @@ size_t BlockEvictionQueue::reclaim_for_allocation(size_t bytes,
   return batch_recycle_impl(count, 256, true, bytes, check);
 }
 
+size_t BlockEvictionQueue::reclaim_clean_for_allocation(
+    size_t bytes, const ReclaimCheck &check) {
+  constexpr size_t max_scan = 256;
+  const size_t page = MemoryLimitPool::page_buffer_size();
+  const size_t count = bytes / page + (bytes % page != 0);
+  std::unique_lock<std::mutex> scan_lock(clean_reclaim_mutex_,
+                                         std::try_to_lock);
+  if (!scan_lock.owns_lock() ||
+      has_deferred_requeue_.load(std::memory_order_acquire))
+    return 0;
+  std::shared_lock<std::shared_mutex> owners(valid_owners_mutex_,
+                                             std::try_to_lock);
+  if (!owners.owns_lock()) return 0;
+  std::array<size_t, kQueueCount> remaining;
+  for (size_t i = 0; i < remaining.size(); ++i)
+    remaining[i] = approximate_queue_sizes_[i].load(std::memory_order_relaxed);
+
+  size_t reclaimed = 0;
+  for (size_t scanned = 0;
+       scanned < max_scan && reclaimed < count && check.allows_work();
+       ++scanned) {
+    BlockType item;
+    if (!evict_single_block(item, /*age_protected=*/false, &remaining)) break;
+    if (!item.owner || valid_owners_.count(item.owner) == 0) continue;
+    using Result = EvictableBlockOwner::CleanReclaim;
+    const auto result = check.allows_work() ? item.owner->try_reclaim_clean(
+                                                  item.owner_key, item.version)
+                                            : Result::kKeep;
+    if (result == Result::kReclaimed) ++reclaimed;
+    if (result == Result::kKeep && !add_single_block(item, item.priority)) {
+      // The owner may repair a missing queue entry by writing it back. Keep
+      // this entry for the ordinary eviction path instead of calling it here.
+      std::lock_guard<std::mutex> lock(deferred_requeue_mutex_);
+      deferred_requeue_ = item;
+      approximate_queue_sizes_[item.priority].fetch_add(
+          1, std::memory_order_relaxed);
+      has_deferred_requeue_.store(true, std::memory_order_release);
+      break;
+    }
+  }
+  return reclaimed;
+}
+
 size_t BlockEvictionQueue::batch_recycle_impl(size_t count, size_t scan_count,
                                               bool age_protected, size_t bytes,
                                               const ReclaimCheck *check) {
@@ -1389,8 +1444,9 @@ size_t BlockEvictionQueue::batch_recycle_impl(size_t count, size_t scan_count,
   // Larger pressure batches give inactive decoded payloads bounded CLOCK
   // attention, rather than letting them monopolize the pool indefinitely.
   size_t evicted =
-      age_protected ? recycle_inactive(std::min<size_t>(bytes ? 1 : 8, count))
-                    : 0;
+      age_protected
+          ? recycle_inactive(std::min<size_t>(bytes ? 1 : 8, count), check)
+          : 0;
   size_t reclaimed =
       estimate_global_refunds ? before - std::min(before, pool.used()) : 0;
   // Bound work when no page is currently evictable.
@@ -1960,6 +2016,20 @@ bool MemoryLimitPool::reclaim_process_cache() {
   return true;
 }
 
+void MemoryLimitPool::add_pending_writeback(bool synchronous) {
+  pending_writeback_bytes_.fetch_add(page_buffer_size(),
+                                     std::memory_order_release);
+  if (synchronous)
+    synchronous_writebacks_.fetch_add(1, std::memory_order_release);
+}
+
+void MemoryLimitPool::finish_pending_writeback(bool synchronous) {
+  pending_writeback_bytes_.fetch_sub(page_buffer_size(),
+                                     std::memory_order_acq_rel);
+  if (synchronous)
+    synchronous_writebacks_.fetch_sub(1, std::memory_order_release);
+}
+
 void MemoryLimitPool::notify_reclaimable() {
   if (mandatory_waiters_.load(std::memory_order_relaxed) == 0) return;
   {
@@ -1967,19 +2037,23 @@ void MemoryLimitPool::notify_reclaimable() {
     ++reclaimable_generation_;
   }
   required_reclaim_cv_.notify_one();
+  if (synchronous_writebacks_.load(std::memory_order_acquire) != 0)
+    capacity_cv_.notify_all();
   bg_cv_.notify_one();
 }
 
-void MemoryLimitPool::register_required_waiter(RequiredWaiter &waiter) {
+uint64_t MemoryLimitPool::register_required_waiter(RequiredWaiter &waiter) {
+  uint64_t generation;
   {
     std::lock_guard<std::mutex> lock(capacity_mutex_);
     waiter.ticket = ++next_required_ticket_;
-    waiter.generation = reclaimable_generation_;
+    generation = waiter.generation = reclaimable_generation_;
     waiter.next = required_waiters_;
     required_waiters_ = &waiter;
   }
   required_reclaim_cv_.notify_one();
   bg_cv_.notify_one();
+  return generation;
 }
 
 void MemoryLimitPool::unregister_required_waiter(RequiredWaiter &waiter) {
@@ -2803,6 +2877,7 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
   using namespace std::chrono_literals;
   constexpr auto retry_interval = 100ms;
   constexpr auto release_grace = 350ms;
+  constexpr auto min_clean_scan_interval = 5ms;
   // One deadline covers inline retries and sleeps. Ready hints and spurious
   // notifications cannot turn a bounded wait into unbounded retry work.
   if (admit()) return true;
@@ -2865,8 +2940,10 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
   });
   // Close the race between the first denial and publishing priority.
   if (wait && admit()) return true;
-  if (wait) register_required_waiter(waiter);
+  auto clean_generation = wait ? register_required_waiter(waiter) : 0;
   size_t previous_shortfall = std::numeric_limits<size_t>::max();
+  auto last_clean_scan = Clock::now();
+  auto next_clean_scan = last_clean_scan + retry_interval;
   while (Clock::now() < deadline) {
     if (!wait) {
       const size_t shortfall = admission_shortfall(request);
@@ -2897,6 +2974,32 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
     }
     if (impossible()) break;
 
+    // A budget waiter can still reclaim clean pages while eviction workers
+    // run synchronous writes. This scan never invokes a flush callback.
+    const auto now = Clock::now();
+    if (now >= next_clean_scan &&
+        synchronous_writebacks_.load(std::memory_order_acquire) != 0) {
+      last_clean_scan = now;
+      next_clean_scan = now + retry_interval;
+      struct CleanRequest {
+        MemoryLimitPool *pool;
+        RequiredWaiter *waiter;
+      } current{this, &waiter};
+      const BlockEvictionQueue::ReclaimCheck check{
+          &current, +[](const void *context) {
+            const auto &entry = *static_cast<const CleanRequest *>(context);
+            return Clock::now() < entry.waiter->deadline &&
+                   entry.pool->admission_shortfall(entry.waiter->request) != 0;
+          }};
+      const auto shortfall = admission_shortfall(request);
+      if (shortfall &&
+          BlockEvictionQueue::get_instance().reclaim_clean_for_allocation(
+              shortfall, check)) {
+        if (process_rss_.limit()) process_rss_.refresh(true);
+        if (admit()) return true;
+      }
+    }
+
     const auto room = room_for_request();
     observe_progress(room);
     if (Clock::now() >= quiet_until) {
@@ -2921,8 +3024,14 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
           uses_rss &&
           (request.rss_bytes == 0 || room.rss < request.rss_bytes) &&
           process_rss_.has_resident_uncertainty();
+      const size_t writeback =
+          pending_writeback_bytes_.load(std::memory_order_acquire);
+      // Dequeued pages can still return backing to any waiter. Only count
+      // writeback that could cover the remaining deficit on an empty queue.
+      const bool writeback_can_help =
+          writeback != 0 && admission_shortfall(request) <= writeback;
       if (!has_reclaimer && !has_queued_work && !needs_rss_proof &&
-          !required_reclaim_pending(waiter) &&
+          !writeback_can_help && !required_reclaim_pending(waiter) &&
           workspace_releases_in_progress_.load(std::memory_order_acquire) ==
               0) {
         // Read the ledger after the release check. A release may already have
@@ -2937,9 +3046,21 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
     capacity_waits_.fetch_add(1, std::memory_order_relaxed);
     {
       std::unique_lock<std::mutex> lock(capacity_mutex_);
+      const auto clean_work_changed = [&] {
+        return clean_generation != reclaimable_generation_ &&
+               synchronous_writebacks_.load(std::memory_order_acquire) != 0;
+      };
+      if (clean_work_changed()) {
+        clean_generation = reclaimable_generation_;
+        next_clean_scan = std::min(next_clean_scan,
+                                   last_clean_scan + min_clean_scan_interval);
+      }
+      if (synchronous_writebacks_.load(std::memory_order_acquire) != 0)
+        check_at = std::min(check_at, next_clean_scan);
       if (!capacity_cv_.wait_until(lock, check_at, [&] {
             const auto current = room_for_request();
-            return current.native > room.native || current.rss > room.rss;
+            return current.native > room.native || current.rss > room.rss ||
+                   clean_work_changed();
           })) {
         capacity_wait_timeouts_.fetch_add(1, std::memory_order_relaxed);
       }
@@ -3003,6 +3124,11 @@ bool MemoryLimitPool::try_charge_fixed_once(size_t bytes,
 }
 
 void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
+  release_buffer(buffer, buffer_size, /*discard_backing=*/false);
+}
+
+void MemoryLimitPool::release_buffer(char *buffer, size_t buffer_size,
+                                     bool discard_backing) {
   if (!buffer) {
     size_t prev = used_size_.fetch_sub(buffer_size, std::memory_order_relaxed);
     (void)prev;
@@ -3034,7 +3160,7 @@ void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
   size_t committed = committed_size_.load(std::memory_order_relaxed);
   size_t used = used_size_.load(std::memory_order_relaxed);
   size_t released_retained = 0;
-  if (committed > used && committed - used >= reserve &&
+  if (!discard_backing && committed > used && committed - used >= reserve &&
       retained_idle_bytes_.load(std::memory_order_relaxed) != 0) {
     // Idle mappings and free pages share one reserve. Prefer retiring an
     // exclusively idle mapping before discarding a page in an active reuse
@@ -3044,8 +3170,9 @@ void MemoryLimitPool::release_buffer(char *buffer, const size_t buffer_size) {
     committed = committed_size_.load(std::memory_order_relaxed);
     used = used_size_.load(std::memory_order_relaxed);
   }
-  const bool discarded = committed > used && committed - used >= reserve &&
-                         reclaim_slab_buffer(buffer);
+  const bool discarded =
+      (discard_backing || (committed > used && committed - used >= reserve)) &&
+      reclaim_slab_buffer(buffer);
   if (!discarded) {
     push_free_buffer(buffer, pick_shard());
   }

@@ -85,6 +85,14 @@ class ZVEC_AILEGO_API EvictableBlockOwner {
   virtual size_t recover_eviction_queue() {
     return 0;
   }
+
+  enum class CleanReclaim { kKeep, kStale, kReclaimed };
+
+  // Admission may use this while eviction workers are in writeback.
+  // Owners must not run writeback or wait for another eviction here.
+  virtual CleanReclaim try_reclaim_clean(eviction_key_t, version_t) {
+    return CleanReclaim::kKeep;
+  }
 };
 
 class ZVEC_AILEGO_API BlockEvictionQueue {
@@ -227,7 +235,8 @@ class ZVEC_AILEGO_API BlockEvictionQueue {
     }
   };
   size_t reclaim_for_allocation(size_t bytes, const ReclaimCheck *check);
-  size_t recycle_inactive(size_t max_attempts);
+  size_t reclaim_clean_for_allocation(size_t bytes, const ReclaimCheck &check);
+  size_t recycle_inactive(size_t max_attempts, const ReclaimCheck *check);
   size_t batch_recycle_impl(size_t count, size_t scan_count, bool age_protected,
                             size_t bytes = 0,
                             const ReclaimCheck *check = nullptr);
@@ -251,6 +260,11 @@ class ZVEC_AILEGO_API BlockEvictionQueue {
   std::atomic<uint64_t> cleanup_attempts_{0};
   std::atomic<uint64_t> inactive_probes_{0};
   std::atomic<uint64_t> inactive_evictions_{0};
+  std::mutex clean_reclaim_mutex_;
+  // A failed clean requeue keeps its membership for an ordinary consumer.
+  std::mutex deferred_requeue_mutex_;
+  BlockType deferred_requeue_;
+  std::atomic<bool> has_deferred_requeue_{false};
   std::mutex cleanup_mutex_;
   uint64_t cleanup_generation_seen_{0};
   bool cleanup_in_progress_{false};
@@ -648,6 +662,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
 
  private:
   friend class BlockEvictionQueue;
+  friend class VecBufferPool;
+  friend class VectorPageTable;
   friend struct EvictionQueueTraits;
   friend struct MemoryLimitPoolTestPeer;
   friend struct QueueResidentSampleTestPeer;
@@ -742,7 +758,10 @@ class ZVEC_AILEGO_API MemoryLimitPool {
       const BlockEvictionQueue::ReclaimCheck *check = nullptr);
   bool trim_idle_buffers();
   bool reclaim_process_cache();
-  void register_required_waiter(RequiredWaiter &waiter);
+  void release_buffer(char *buffer, size_t bytes, bool discard_backing);
+  void add_pending_writeback(bool synchronous);
+  void finish_pending_writeback(bool synchronous);
+  uint64_t register_required_waiter(RequiredWaiter &waiter);
   void unregister_required_waiter(RequiredWaiter &waiter);
   RequiredWaiter *find_required_waiter(uint64_t ticket);
   bool required_reclaim_pending(const RequiredWaiter &waiter);
@@ -899,6 +918,8 @@ class ZVEC_AILEGO_API MemoryLimitPool {
   uint64_t next_required_ticket_{0};
   uint64_t reclaimable_generation_{0};
   std::atomic<size_t> workspace_releases_in_progress_{0};
+  std::atomic<size_t> pending_writeback_bytes_{0};
+  std::atomic<size_t> synchronous_writebacks_{0};
 
   std::thread bg_thread_;
   std::thread required_reclaim_thread_;
