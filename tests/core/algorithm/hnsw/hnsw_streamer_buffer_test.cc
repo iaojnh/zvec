@@ -70,6 +70,77 @@ TEST_F(HnswStreamerTest, MaxDegreeIsNeighborCountNotSerializedBytes) {
             entity.upper_neighbors_size());
 }
 
+TEST_F(HnswStreamerTest, ProviderReadErrorDuringTraversalRollsBackInsert) {
+  using Provider = MultiPassIndexProvider<IndexMeta::DT_FP32>;
+  class FailingProvider : public Provider {
+   public:
+    using Provider::Provider;
+
+    int get_vector(uint64_t key,
+                   IndexStorage::MemoryBlock &block) const override {
+      if (key == 1 && fail) return IndexError_NoReady;
+      return Provider::get_vector(key, block);
+    }
+
+    bool fail{true};
+  };
+
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
+  auto storage = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_TRUE(storage);
+  ASSERT_EQ(0, storage->init({}));
+  ASSERT_EQ(0, storage->open(dir_ + "ProviderReadError", true));
+  IndexStreamer::Stats stats;
+  HnswBufferPoolStreamerEntity entity(stats);
+  entity.set_vector_size(dim * sizeof(float));
+  entity.set_l0_neighbor_cnt(4);
+  entity.set_upper_neighbor_cnt(4);
+  entity.set_prune_cnt(4);
+  entity.set_scaling_factor(5);
+  entity.set_ef_construction(8);
+  entity.set_use_key_info_map(true);
+  ASSERT_EQ(0, entity.init(8));
+  ASSERT_EQ(0, entity.open(storage, 8UL << 20, false));
+
+  auto provider = std::make_shared<FailingProvider>(dim);
+  NumericalVector<float> vector(dim);
+  for (node_id_t id = 0; id < 3; ++id) {
+    std::fill_n(vector.data(), dim, static_cast<float>(id));
+    ASSERT_TRUE(provider->emplace(id, vector));
+    if (id < 2) {
+      ASSERT_EQ(0, entity.add_vector_with_id(0, id, vector.data()));
+    }
+  }
+  ASSERT_EQ(0, entity.update_neighbors(0, 0, {{1, 1.0f}}));
+  ASSERT_EQ(0, entity.update_neighbors(0, 1, {{0, 1.0f}}));
+  entity.update_ep_and_level(0, 0);
+
+  auto metric = IndexFactory::CreateMetric("SquaredEuclidean");
+  ASSERT_TRUE(metric);
+  ASSERT_EQ(0, metric->init(*index_meta_ptr_, {}));
+  HnswContext context(dim, metric, entity.clone());
+  context.set_max_scan_limit(8);
+  context.set_min_scan_limit(8);
+  ASSERT_EQ(0, context.init(HnswContext::kStreamerContext));
+  HnswAlgorithm<HnswBufferPoolStreamerEntity> algorithm(entity);
+  const auto insert = [&] {
+    context.clear();
+    context.bind_dist_space(metric->distance(), metric->batch_distance(),
+                            provider, dim * sizeof(float), 0);
+    context.reset_query_raw(vector.data(), *index_meta_ptr_);
+    return entity.insert_buffered(0, 2, vector.data(), true, [&](node_id_t id) {
+      return algorithm.add_node(id, 0, &context);
+    });
+  };
+  EXPECT_EQ(IndexError_NoReady, insert());
+  EXPECT_EQ(2u, entity.doc_cnt());
+  provider->fail = false;
+  EXPECT_EQ(0, insert());
+  EXPECT_EQ(3u, entity.doc_cnt());
+  ASSERT_EQ(0, entity.close());
+  ASSERT_EQ(0, storage->close());
+}
+
 TEST_F(HnswStreamerTest, LegacyReadsReleaseStorageBeforeThreadExit) {
   auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
   memory_pool.init(64UL * 1024 * 1024);

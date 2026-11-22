@@ -30,6 +30,7 @@
 #include <zvec/core/framework/index_framework.h>
 #include "hnsw_chunk.h"
 #include "hnsw_entity.h"
+#include "hnsw_graph_mutex.h"
 #include "hnsw_index_hash.h"
 #include "hnsw_params.h"
 
@@ -69,7 +70,8 @@ class HnswStreamerEntity : public HnswEntity {
   int get_vector(const node_id_t id,
                  IndexStorage::MemoryBlock &block) const override;
 
-  int get_vector_snapshot(node_id_t id, IndexStorage::MemoryBlock &block) const;
+  int get_vector_snapshot(node_id_t id,
+                          IndexStorage::MemoryBlock &block) const override;
 
   int get_vector_borrowed(const node_id_t id,
                           IndexStorage::MemoryBlock &block) const override;
@@ -97,7 +99,16 @@ class HnswStreamerEntity : public HnswEntity {
                       bool explicit_id,
                       const std::function<int(node_id_t)> &add_to_graph);
   int mutation_error() const {
-    return mutation_error_;
+    return buffered_graph_ ? buffered_graph_->error : 0;
+  }
+
+  int provider_read_error() const {
+    if (buffered_graph_ && buffered_graph_->closed) return IndexError_NoReady;
+    return mutation_error();
+  }
+
+  HnswGraphMutex *buffered_graph_mutex() const {
+    return buffered_graph_ ? &buffered_graph_->mutex : nullptr;
   }
 
   int update_neighbors(
@@ -413,6 +424,17 @@ class HnswStreamerEntity : public HnswEntity {
   }
 
   struct InsertUndo;
+  struct BufferedGraph {
+    HnswGraphMutex mutex;
+    InsertUndo *undo{nullptr};
+    int error{0};
+    bool closed{false};
+  };
+
+  InsertUndo *insert_undo() const {
+    return buffered_graph_ ? buffered_graph_->undo : nullptr;
+  }
+
   void remember_size(Chunk &chunk);
   int capture_write_undo(Chunk &chunk, const IndexStorage::SegmentData *writes,
                          size_t count, void *mirror = nullptr,
@@ -655,8 +677,7 @@ class HnswStreamerEntity : public HnswEntity {
   static constexpr uint64_t kUpperHashMemoryInflateRatio = 2.0f;
 
  protected:
-  InsertUndo *insert_undo_{nullptr};
-  int mutation_error_{0};
+  std::shared_ptr<BufferedGraph> buffered_graph_;
   IndexStreamer::Stats &stats_;
   std::mutex mutex_{};
   //! Guards upper_neighbor_index_ and upper_neighbor_chunks_ against

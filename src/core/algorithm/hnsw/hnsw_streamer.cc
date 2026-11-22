@@ -68,65 +68,6 @@ int DumpTurboQuantizerSegment(const IndexStorage::Pointer &storage,
   return 0;
 }
 
-class BufferedGraphLock {
- public:
-  enum class Mode { kRead, kWrite };
-
-  explicit BufferedGraphLock(HnswGraphMutex *mutex, Mode mode = Mode::kRead)
-      : mode_(mode) {
-    if (!mutex) return;
-    if (mode_ == Mode::kWrite) {
-      mutex->lock();
-    } else {
-      // A filter or provider can read the index this thread already holds.
-      for (auto *guard = active_; guard; guard = guard->previous_) {
-        if (guard->mutex_ == mutex) return;
-      }
-      // Another index's callback may be waiting on a lock this thread holds.
-      // Join readers without waiting, and report an active write to the caller.
-      if (active_) {
-        if (!mutex->try_lock_shared_for_nested_read()) {
-          blocked_ = true;
-          return;
-        }
-      } else {
-        mutex->lock_shared();
-      }
-    }
-    mutex_ = mutex;
-    previous_ = active_;
-    active_ = this;
-  }
-
-  ~BufferedGraphLock() {
-    if (!mutex_) return;
-    active_ = previous_;
-    if (mode_ == Mode::kWrite) {
-      mutex_->unlock();
-    } else {
-      mutex_->unlock_shared();
-    }
-  }
-
-  BufferedGraphLock(const BufferedGraphLock &) = delete;
-  BufferedGraphLock &operator=(const BufferedGraphLock &) = delete;
-
-  bool owns_lock() const {
-    return mutex_ != nullptr;
-  }
-
-  bool blocked() const {
-    return blocked_;
-  }
-
- private:
-  static inline thread_local const BufferedGraphLock *active_{nullptr};
-  const BufferedGraphLock *previous_{nullptr};
-  HnswGraphMutex *mutex_{nullptr};
-  const Mode mode_;
-  bool blocked_{false};
-};
-
 }  // namespace
 
 int HnswStreamer::RestoreQuantizer(
@@ -522,7 +463,7 @@ size_t HnswStreamer::packed_segment_count() const {
 }
 
 int HnswStreamer::dump_with_vectors(const IndexDumper::Pointer &dumper) {
-  const BufferedGraphLock guard(buffered_graph_mutex());
+  const HnswGraphLock guard(buffered_graph_mutex());
   if (guard.blocked()) return IndexError_NoReady;
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
@@ -844,8 +785,9 @@ int HnswStreamer::open(IndexStorage::Pointer stg, bool read_only) {
 }
 
 int HnswStreamer::close() {
-  const BufferedGraphLock guard(buffered_graph_mutex(),
-                                BufferedGraphLock::Mode::kWrite);
+  const HnswGraphLock guard(buffered_graph_mutex(),
+                            HnswGraphLock::Mode::kWrite);
+  if (guard.blocked()) return IndexError_NoReady;
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   LOG_INFO("HnswStreamer close");
@@ -868,8 +810,9 @@ int HnswStreamer::close() {
 }
 
 int HnswStreamer::flush(uint64_t checkpoint) {
-  const BufferedGraphLock guard(buffered_graph_mutex(),
-                                BufferedGraphLock::Mode::kWrite);
+  const HnswGraphLock guard(buffered_graph_mutex(),
+                            HnswGraphLock::Mode::kWrite);
+  if (guard.blocked()) return IndexError_NoReady;
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   LOG_INFO("HnswStreamer flush checkpoint=%zu", (size_t)checkpoint);
@@ -882,10 +825,13 @@ int HnswStreamer::flush(uint64_t checkpoint) {
 }
 
 int HnswStreamer::dump(const IndexDumper::Pointer &dumper) {
+  if (HnswGraphLock::active()) return IndexError_NoReady;
   LOG_INFO("HnswStreamer dump");
 
   shared_mutex_.lock();
   AILEGO_DEFER([&]() { shared_mutex_.unlock(); });
+  const HnswGraphLock guard(buffered_graph_mutex(),
+                            HnswGraphLock::Mode::kWrite);
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
 
@@ -913,7 +859,7 @@ int HnswStreamer::dump(const IndexDumper::Pointer &dumper) {
 }
 
 IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
-  const BufferedGraphLock guard(buffered_graph_mutex());
+  const HnswGraphLock guard(buffered_graph_mutex());
   if (guard.blocked() || (entity_ && entity_->mutation_error() != 0))
     return nullptr;
   if (ailego_unlikely(state_ != STATE_OPENED)) {
@@ -963,9 +909,10 @@ IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
   return Context::Pointer(ctx);
 }
 
-IndexProvider::Pointer HnswStreamer::create_provider() const {
-  const BufferedGraphLock guard(buffered_graph_mutex());
-  if (guard.blocked() || (entity_ && entity_->mutation_error() != 0))
+IndexProvider::Pointer HnswStreamer::create_provider() const try {
+  const HnswGraphLock guard(buffered_graph_mutex());
+  if (guard.blocked() || state_ != STATE_OPENED ||
+      entity_->mutation_error() != 0)
     return nullptr;
   LOG_DEBUG("HnswStreamer create provider");
 
@@ -976,8 +923,11 @@ IndexProvider::Pointer HnswStreamer::create_provider() const {
   }
   std::shared_ptr<const void> lifetime;
   entity_->retain_stable_data(&lifetime);
-  return Provider::Pointer(new HnswIndexProvider(meta_, entity, "HnswStreamer",
-                                                 std::move(lifetime)));
+  return Provider::Pointer(new HnswIndexProvider(
+      meta_, std::static_pointer_cast<HnswStreamerEntity>(entity),
+      "HnswStreamer", std::move(lifetime), !read_only_));
+} catch (const std::bad_alloc &) {
+  return nullptr;
 }
 
 int HnswStreamer::update_context(HnswContext *ctx) const {
@@ -1014,20 +964,19 @@ void HnswStreamer::bind_search_dist_space(HnswContext *ctx) const {
 }
 
 HnswGraphMutex *HnswStreamer::buffered_graph_mutex() const {
-  return storage_mode() == HnswStorageMode::kBufferPool ? &buffered_graph_mutex_
-                                                        : nullptr;
+  return entity_ ? entity_->buffered_graph_mutex() : nullptr;
 }
 
 const void *HnswStreamer::get_vector(uint64_t key) const {
-  const BufferedGraphLock guard(buffered_graph_mutex());
-  if (guard.blocked() || !entity_ || entity_->mutation_error() != 0)
-    return nullptr;
-  return entity_->get_vector_by_key(key);
+  IndexStorage::MemoryBlock block;
+  if (get_vector(key, block) != 0) return nullptr;
+  static thread_local LegacyReadBuffer buffer;
+  return buffer.assign(block, entity_->vector_size());
 }
 
 int HnswStreamer::get_vector(uint64_t key,
                              IndexStorage::MemoryBlock &block) const {
-  const BufferedGraphLock guard(buffered_graph_mutex());
+  const HnswGraphLock guard(buffered_graph_mutex());
   const int error = entity_ && !guard.blocked() ? entity_->mutation_error()
                                                 : IndexError_NoReady;
   if (error != 0) {
@@ -1038,7 +987,7 @@ int HnswStreamer::get_vector(uint64_t key,
     return entity_->get_vector_by_key(key, block);
   }
   const auto id = entity_->get_id(key);
-  if (id == kInvalidNodeId) {
+  if (id >= entity_->doc_cnt()) {
     block.reset();
     return IndexError_InvalidArgument;
   }
@@ -1046,20 +995,24 @@ int HnswStreamer::get_vector(uint64_t key,
 }
 
 const void *HnswStreamer::get_vector_by_id(uint32_t id) const {
-  const BufferedGraphLock guard(buffered_graph_mutex());
-  if (guard.blocked() || !entity_ || entity_->mutation_error() != 0)
-    return nullptr;
-  return entity_->get_vector(id);
+  IndexStorage::MemoryBlock block;
+  if (get_vector_by_id(id, block) != 0) return nullptr;
+  static thread_local LegacyReadBuffer buffer;
+  return buffer.assign(block, entity_->vector_size());
 }
 
 int HnswStreamer::get_vector_by_id(uint32_t id,
                                    IndexStorage::MemoryBlock &block) const {
-  const BufferedGraphLock guard(buffered_graph_mutex());
+  const HnswGraphLock guard(buffered_graph_mutex());
   const int error = entity_ && !guard.blocked() ? entity_->mutation_error()
                                                 : IndexError_NoReady;
   if (error != 0) {
     block.reset();
     return error;
+  }
+  if (buffered_graph_mutex() && id >= entity_->doc_cnt()) {
+    block.reset();
+    return IndexError_NoExist;
   }
   // The caller can retain the block after the read lock is released.
   return !read_only_ && storage_mode() == HnswStorageMode::kBufferPool
@@ -1071,6 +1024,7 @@ int HnswStreamer::get_vector_by_id(uint32_t id,
 int HnswStreamer::add_with_id_impl(uint32_t id, const void *query,
                                    const IndexQueryMeta &qmeta,
                                    IndexStreamer::Context::Pointer &context) {
+  if (HnswGraphLock::active()) return IndexError_NoReady;
   if (read_only_) return IndexError_Unsupported;
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) {
@@ -1089,8 +1043,9 @@ int HnswStreamer::add_with_id_impl(uint32_t id, const void *query,
   }
   AILEGO_DEFER([&]() { shared_mutex_.unlock_shared(); });
 
-  const BufferedGraphLock guard(buffered_graph_mutex(),
-                                BufferedGraphLock::Mode::kWrite);
+  const HnswGraphLock guard(buffered_graph_mutex(),
+                            HnswGraphLock::Mode::kWrite);
+  if (guard.blocked()) return IndexError_NoReady;
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
 
@@ -1154,7 +1109,7 @@ int HnswStreamer::add_with_id_impl(uint32_t id, const void *query,
   const level_t level = alg_->get_random_level();
   const auto add_to_graph = [&](node_id_t id_to_add) {
     const int result = alg_->add_node(id_to_add, level, ctx);
-    return result == 0 && ctx->error() ? IndexError_Runtime : result;
+    return result == 0 ? ctx->dist_calculator().error_code() : result;
   };
   if (guard.owns_lock()) {
     ret = entity_->insert_buffered(level, id, query,
@@ -1178,6 +1133,7 @@ int HnswStreamer::add_with_id_impl(uint32_t id, const void *query,
 int HnswStreamer::add_impl(uint64_t pkey, const void *query,
                            const IndexQueryMeta &qmeta,
                            IndexStreamer::Context::Pointer &context) {
+  if (HnswGraphLock::active()) return IndexError_NoReady;
   if (read_only_) return IndexError_Unsupported;
   int ret = check_params(query, qmeta);
   if (ailego_unlikely(ret != 0)) {
@@ -1196,8 +1152,9 @@ int HnswStreamer::add_impl(uint64_t pkey, const void *query,
   }
   AILEGO_DEFER([&]() { shared_mutex_.unlock_shared(); });
 
-  const BufferedGraphLock guard(buffered_graph_mutex(),
-                                BufferedGraphLock::Mode::kWrite);
+  const HnswGraphLock guard(buffered_graph_mutex(),
+                            HnswGraphLock::Mode::kWrite);
+  if (guard.blocked()) return IndexError_NoReady;
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
 
@@ -1260,7 +1217,7 @@ int HnswStreamer::add_impl(uint64_t pkey, const void *query,
   const level_t level = alg_->get_random_level();
   const auto add_to_graph = [&](node_id_t id_to_add) {
     const int result = alg_->add_node(id_to_add, level, ctx);
-    return result == 0 && ctx->error() ? IndexError_Runtime : result;
+    return result == 0 ? ctx->dist_calculator().error_code() : result;
   };
   if (guard.owns_lock()) {
     ret = entity_->insert_buffered(level, pkey, query,
@@ -1291,7 +1248,8 @@ int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
 int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
                               uint32_t count,
                               IndexStreamer::Context::Pointer &context) const {
-  const BufferedGraphLock guard(buffered_graph_mutex());
+  if (HnswGraphLock::has_writer()) return IndexError_NoReady;
+  const HnswGraphLock guard(buffered_graph_mutex());
   if (guard.blocked()) return IndexError_NoReady;
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
@@ -1337,7 +1295,8 @@ int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
       LOG_ERROR("Hnsw searcher fast search failed");
       return ret;
     }
-    ctx->topk_to_result(q);
+    if (const int result_status = ctx->topk_to_result(q); result_status != 0)
+      return result_status;
     query = static_cast<const char *>(query) +
             (quantizer_ ? quantizer_->quantized_query_vector_length()
                         : qmeta.element_size());
@@ -1354,7 +1313,8 @@ int HnswStreamer::search_candidates_impl(
     const void *query, const IndexQueryMeta &qmeta, std::vector<uint64_t> &keys,
     IndexStreamer::Context::Pointer &context,
     std::vector<float> *scores) const {
-  const BufferedGraphLock guard(buffered_graph_mutex());
+  if (HnswGraphLock::has_writer()) return IndexError_NoReady;
+  const HnswGraphLock guard(buffered_graph_mutex());
   keys.clear();
   if (scores) scores->clear();
   if (guard.blocked()) return IndexError_NoReady;
@@ -1410,7 +1370,7 @@ int HnswStreamer::search_candidates_impl(
 }
 
 void HnswStreamer::print_debug_info() {
-  const BufferedGraphLock guard(buffered_graph_mutex());
+  const HnswGraphLock guard(buffered_graph_mutex());
   if (guard.blocked() || entity_->mutation_error() != 0) return;
   for (node_id_t id = 0; id < entity_->doc_cnt(); ++id) {
     if (entity_->get_key(id) == kInvalidKey) {
@@ -1442,7 +1402,8 @@ int HnswStreamer::search_bf_impl(
 int HnswStreamer::search_bf_impl(
     const void *query, const IndexQueryMeta &qmeta, uint32_t count,
     IndexStreamer::Context::Pointer &context) const {
-  const BufferedGraphLock guard(buffered_graph_mutex());
+  if (HnswGraphLock::has_writer()) return IndexError_NoReady;
+  const HnswGraphLock guard(buffered_graph_mutex());
   if (guard.blocked()) return IndexError_NoReady;
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
@@ -1492,7 +1453,7 @@ int HnswStreamer::search_bf_impl(
         if (!ctx->filter().is_valid() || !ctx->filter()(entity_->get_key(id))) {
           dist_t dist;
           if (!ctx->try_batch_dist(id, dist, skip_missing_vectors)) {
-            if (ctx->error()) return IndexError_Runtime;
+            if (ctx->error()) return ctx->dist_calculator().error_code();
             continue;
           }
 
@@ -1505,7 +1466,8 @@ int HnswStreamer::search_bf_impl(
           topk_heap.emplace(id, dist);
         }
       }
-      ctx->topk_to_result(q);
+      if (const int result_status = ctx->topk_to_result(q); result_status != 0)
+        return result_status;
       query = static_cast<const char *>(query) +
               (quantizer_ ? quantizer_->quantized_query_vector_length()
                           : qmeta.element_size());
@@ -1525,13 +1487,14 @@ int HnswStreamer::search_bf_impl(
         if (!filter.is_valid() || !filter(entity_->get_key(id))) {
           dist_t dist;
           if (!ctx->try_batch_dist(id, dist, skip_missing_vectors)) {
-            if (ctx->error()) return IndexError_Runtime;
+            if (ctx->error()) return ctx->dist_calculator().error_code();
             continue;
           }
           topk.emplace(id, dist);
         }
       }
-      ctx->topk_to_result(q);
+      if (const int result_status = ctx->topk_to_result(q); result_status != 0)
+        return result_status;
       query = static_cast<const char *>(query) +
               (quantizer_ ? quantizer_->quantized_query_vector_length()
                           : qmeta.element_size());
@@ -1549,7 +1512,8 @@ int HnswStreamer::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const {
-  const BufferedGraphLock guard(buffered_graph_mutex());
+  if (HnswGraphLock::has_writer()) return IndexError_NoReady;
+  const HnswGraphLock guard(buffered_graph_mutex());
   if (guard.blocked()) return IndexError_NoReady;
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
@@ -1604,7 +1568,7 @@ int HnswStreamer::search_bf_by_p_keys_impl(
           if (id != kInvalidNodeId) {
             dist_t dist;
             if (!ctx->try_batch_dist(id, dist, skip_missing_vectors)) {
-              if (ctx->error()) return IndexError_Runtime;
+              if (ctx->error()) return ctx->dist_calculator().error_code();
               continue;
             }
             std::string group_id = group_by(id);
@@ -1617,7 +1581,8 @@ int HnswStreamer::search_bf_by_p_keys_impl(
           }
         }
       }
-      ctx->topk_to_result(q);
+      if (const int result_status = ctx->topk_to_result(q); result_status != 0)
+        return result_status;
       query = static_cast<const char *>(query) +
               (quantizer_ ? quantizer_->quantized_query_vector_length()
                           : qmeta.element_size());
@@ -1636,14 +1601,15 @@ int HnswStreamer::search_bf_by_p_keys_impl(
           if (id != kInvalidNodeId) {
             dist_t dist;
             if (!ctx->try_batch_dist(id, dist, skip_missing_vectors)) {
-              if (ctx->error()) return IndexError_Runtime;
+              if (ctx->error()) return ctx->dist_calculator().error_code();
               continue;
             }
             topk.emplace(id, dist);
           }
         }
       }
-      ctx->topk_to_result(q);
+      if (const int result_status = ctx->topk_to_result(q); result_status != 0)
+        return result_status;
       query = static_cast<const char *>(query) +
               (quantizer_ ? quantizer_->quantized_query_vector_length()
                           : qmeta.element_size());

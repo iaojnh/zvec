@@ -40,6 +40,7 @@
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/utility/float_helper.h>
+#include <zvec/core/framework/index_dumper.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_provider.h>
@@ -195,6 +196,11 @@ TEST(IndexInterface, FailedHnswRollbackMakesDocCountUnavailable) {
     vector.fill(1.0f);
     ASSERT_EQ(0, streamer->add_with_id_impl(1, vector.data(), meta, context));
     ASSERT_EQ(2u, index.get_doc_count());
+    const auto exported = index.create_index_provider();
+    ASSERT_TRUE(exported);
+    const auto iterator = exported->create_iterator();
+    ASSERT_TRUE(iterator);
+
 
     core::IndexStorage::MemoryBlock fetched;
     ASSERT_EQ(0, streamer->get_vector_by_id(1, fetched));
@@ -220,6 +226,10 @@ TEST(IndexInterface, FailedHnswRollbackMakesDocCountUnavailable) {
     EXPECT_EQ(core::IndexError_WriteData,
               streamer->get_vector_by_id(1, fetched));
     EXPECT_EQ(nullptr, fetched.data());
+    EXPECT_EQ(core::IndexError_WriteData, exported->get_vector(1, fetched));
+    EXPECT_EQ(nullptr, fetched.data());
+    EXPECT_EQ(nullptr, iterator->data());
+    EXPECT_EQ(core::IndexError_WriteData, iterator->status());
     EXPECT_EQ(nullptr, streamer->get_vector_by_id(1));
   });
   worker.join();
@@ -333,7 +343,7 @@ void RunHnswProviderFetchDuringAdd(size_t index_count) {
   for (size_t i = 0; i < index_count; ++i) {
     auto &site = sites[i];
     if (site.status != 0) {
-      EXPECT_EQ(core::IndexError_Runtime, site.status);
+      EXPECT_EQ(core::IndexError_NoReady, site.status);
       ASSERT_EQ(1u, site.index->get_doc_count());
       ASSERT_EQ(0, site.index->add(VectorData{DenseVector{next.data()}}, 1));
     }
@@ -426,6 +436,13 @@ void RunHnswFilterFetchWithQueuedWriters(size_t index_count) {
       if (target.index->fetch(key, &fetched) != 0) std::_Exit(4);
       EXPECT_EQ(bytes_of(target.original),
                 std::get<DenseVectorBuffer>(fetched.vector_buffer).data);
+      const VectorData input{DenseVector{site.original.data()}};
+      const auto nested_query = HNSWQueryParamBuilder().with_topk(1).build();
+      SearchResult nested;
+      EXPECT_EQ(core::IndexError_NoReady, target.index->search(
+                                               input, nested_query, &nested));
+      EXPECT_EQ(core::IndexError_NoReady, target.index->add(input, key));
+      EXPECT_EQ(core::IndexError_NoReady, target.index->flush());
       site.did_fetch.set_value();
       // Neither query can release its original read lock until both
       // callbacks have observed the pre-overwrite vectors.
@@ -468,6 +485,201 @@ void RunHnswFilterFetchWithQueuedWriters(size_t index_count) {
   }
 }
 
+void RunHnswExportedProviderAcrossRollback() {
+  using namespace std::chrono_literals;
+  using namespace zvec;
+  using Provider = core::MultiPassIndexProvider<core::IndexMeta::DT_FP32>;
+  class BuildProvider : public Provider {
+   public:
+    using Provider::Provider;
+
+    int get_vector(uint64_t key,
+                   core::IndexStorage::MemoryBlock &block) const override {
+      if (after_staging && ++reads == 2) return after_staging();
+      return Provider::get_vector(key, block);
+    }
+
+    std::function<int()> after_staging;
+    mutable int reads{0};
+  };
+
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(64UL << 20));
+  const std::string path = "hnsw_exported_provider.index";
+  test_util::RemoveTestFiles(path + "*");
+  const auto cleanup =
+      ailego::ScopeGuard::Make([&] { test_util::RemoveTestFiles(path + "*"); });
+  constexpr uint32_t kDim = 16;
+  auto build_provider = std::make_shared<BuildProvider>(kDim);
+  ailego::NumericalVector<float> zero(kDim), original(kDim), replacement(kDim);
+  std::fill_n(zero.data(), kDim, 0.0f);
+  std::fill_n(original.data(), kDim, 2.0f);
+  std::fill_n(replacement.data(), kDim, 9.0f);
+  ASSERT_TRUE(build_provider->emplace(0, zero));
+  ASSERT_TRUE(build_provider->emplace(1, original));
+  ASSERT_TRUE(build_provider->emplace(2, replacement));
+  core::IndexMeta meta(core::IndexMeta::DT_FP32, kDim);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params{});
+  const auto param = HNSWIndexParamBuilder()
+                         .with_dimension(kDim)
+                         .with_metric_type(MetricType::kL2sq)
+                         .with_data_type(DataType::DT_FP32)
+                         .with_provider(build_provider, meta)
+                         .build();
+  auto index = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_TRUE(index);
+  ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kBufferPool,
+                                 true}));
+  ASSERT_EQ(0, index->add(VectorData{DenseVector{zero.data()}}, 0));
+  ASSERT_EQ(0, index->add(VectorData{DenseVector{original.data()}}, 1));
+  const auto exported = index->create_index_provider();
+  ASSERT_TRUE(exported);
+  core::IndexStorage::MemoryBlock retained;
+  ASSERT_EQ(0, exported->get_vector(1, retained));
+  auto iterator = exported->create_iterator();
+  ASSERT_TRUE(iterator);
+  iterator->next();
+  ASSERT_TRUE(iterator->is_valid());
+  ASSERT_EQ(1u, iterator->key());
+
+  const auto query = HNSWQueryParamBuilder()
+                         .with_topk(1)
+                         .with_fetch_vector(true)
+                         .build();
+  SearchResult held_result;
+  ASSERT_EQ(0, index->search(VectorData{DenseVector{original.data()}}, query,
+                             &held_result));
+  ASSERT_EQ(1u, held_result.doc_list_.size());
+  ASSERT_EQ(1u, held_result.doc_list_.front().key());
+  ASSERT_NE(nullptr, held_result.doc_list_.front().vector());
+  int64_t id = -1;
+  const auto ids_query = HNSWQueryParamBuilder().with_topk(1).build();
+  ASSERT_EQ(0, index->search_internal_ids(
+                   VectorData{DenseVector{original.data()}}, ids_query, &id,
+                   nullptr));
+  EXPECT_EQ(1, id);
+
+  std::promise<void> staged, resume_writer, entering_read;
+  auto writer_staged = staged.get_future();
+  auto resumed = resume_writer.get_future();
+  auto reader_started = entering_read.get_future();
+  const std::string expected(reinterpret_cast<const char *>(original.data()),
+                             kDim * sizeof(float));
+  build_provider->after_staging = [&] {
+    VectorDataBuffer fetched;
+    if (index->fetch(1, &fetched) != 0) std::_Exit(2);
+    EXPECT_EQ(expected, std::get<DenseVectorBuffer>(fetched.vector_buffer).data);
+    core::IndexStorage::MemoryBlock from_provider;
+    if (exported->get_vector(1, from_provider) != 0) std::_Exit(3);
+    EXPECT_EQ(expected, std::string(static_cast<const char *>(from_provider.data()),
+                                    kDim * sizeof(float)));
+    staged.set_value();
+    if (resumed.wait_for(5s) != std::future_status::ready) std::_Exit(4);
+    return core::IndexError_NoMemory;
+  };
+  const VectorData input{DenseVector{replacement.data()}};
+  auto write = std::async(std::launch::async, [&] { return index->add(input, 1); });
+  if (writer_staged.wait_for(5s) != std::future_status::ready) std::_Exit(5);
+  auto read = std::async(std::launch::async, [&] {
+    entering_read.set_value();
+    const auto *data = static_cast<const char *>(iterator->data());
+    return data ? std::string(data, kDim * sizeof(float)) : std::string{};
+  });
+  if (reader_started.wait_for(5s) != std::future_status::ready) std::_Exit(6);
+  EXPECT_EQ(std::future_status::timeout, read.wait_for(100ms));
+  resume_writer.set_value();
+  if (write.wait_for(5s) != std::future_status::ready ||
+      read.wait_for(5s) != std::future_status::ready) std::_Exit(7);
+  EXPECT_NE(0, write.get());
+  EXPECT_EQ(expected, read.get());
+  EXPECT_EQ(0, iterator->status());
+
+  build_provider->after_staging = nullptr;
+  ASSERT_EQ(0, index->add(input, 1));
+  ASSERT_EQ(0, index->add(input, 2));
+  EXPECT_EQ(2u, exported->count());
+  EXPECT_EQ(expected, std::string(static_cast<const char *>(
+                                      held_result.doc_list_.front().vector()),
+                                  kDim * sizeof(float)));
+  EXPECT_EQ(expected, std::string(static_cast<const char *>(retained.data()),
+                                  kDim * sizeof(float)));
+  ASSERT_EQ(0, exported->get_vector(1, retained));
+  EXPECT_FLOAT_EQ(9.0f, static_cast<const float *>(retained.data())[0]);
+  EXPECT_EQ(core::IndexError_NoExist, exported->get_vector(2, retained));
+  EXPECT_EQ(nullptr, retained.data());
+  EXPECT_EQ(0, index->close());
+  EXPECT_EQ(core::IndexError_NoReady, exported->get_vector(1, retained));
+}
+
+void RunHnswDumpAndFlush() {
+  using namespace std::chrono_literals;
+  using namespace zvec;
+  class PausingDumper : public core::IndexDumper {
+   public:
+    int init(const ailego::Params &) override { return 0; }
+    int cleanup() override { return 0; }
+    int create(const std::string &) override { return 0; }
+    int close() override { return 0; }
+    int append(const std::string &, size_t, size_t, uint32_t) override {
+      return 0;
+    }
+    uint32_t magic() const override { return 0; }
+    size_t write(const void *, size_t size) override {
+      if (first_write) {
+        auto callback = std::exchange(first_write, nullptr);
+        callback();
+      }
+      return size;
+    }
+
+    std::function<void()> first_write;
+  };
+
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(64UL << 20));
+  const std::string path = "hnsw_dump_flush.index";
+  test_util::RemoveTestFiles(path + "*");
+  const auto cleanup =
+      ailego::ScopeGuard::Make([&] { test_util::RemoveTestFiles(path + "*"); });
+  constexpr uint32_t kDim = 16;
+  const auto param = HNSWIndexParamBuilder()
+                         .with_dimension(kDim)
+                         .with_metric_type(MetricType::kL2sq)
+                         .with_data_type(DataType::DT_FP32)
+                         .build();
+  auto index = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_TRUE(index);
+  ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kBufferPool,
+                                 true}));
+  const std::array<float, kDim> data{};
+  ASSERT_EQ(0, index->add(VectorData{DenseVector{data.data()}}, 0));
+
+  std::promise<void> dumping, resume_dump, entering_flush;
+  auto dump_started = dumping.get_future();
+  auto dump_resumed = resume_dump.get_future();
+  auto flush_started = entering_flush.get_future();
+  auto dumper = std::make_shared<PausingDumper>();
+  dumper->first_write = [&] {
+    EXPECT_EQ(core::IndexError_NoReady, index->flush());
+    dumping.set_value();
+    if (dump_resumed.wait_for(5s) != std::future_status::ready) std::_Exit(2);
+  };
+  auto dump = std::async(std::launch::async, [&] {
+    return index->index_searcher()->dump(dumper);
+  });
+  if (dump_started.wait_for(5s) != std::future_status::ready) std::_Exit(3);
+  auto flush = std::async(std::launch::async, [&] {
+    entering_flush.set_value();
+    return index->flush();
+  });
+  if (flush_started.wait_for(5s) != std::future_status::ready) std::_Exit(4);
+  EXPECT_EQ(std::future_status::timeout, flush.wait_for(100ms));
+  resume_dump.set_value();
+  if (dump.wait_for(5s) != std::future_status::ready ||
+      flush.wait_for(5s) != std::future_status::ready) std::_Exit(5);
+  EXPECT_EQ(0, dump.get());
+  EXPECT_EQ(0, flush.get());
+  EXPECT_EQ(0, index->close());
+}
+
 }  // namespace
 
 TEST(IndexInterface, HnswProviderCanFetchFromTheIndexDuringAdd) {
@@ -490,6 +702,17 @@ TEST(IndexInterface, HnswFilterCanFetchWhileAnOverwriteWaits) {
 
 TEST(IndexInterface, HnswFiltersFetchAcrossIndexesWithQueuedWriters) {
   ASSERT_EXIT((RunHnswFilterFetchWithQueuedWriters(2),
+               std::_Exit(::testing::Test::HasFailure() ? 1 : 0)),
+              ::testing::ExitedWithCode(0), "");
+}
+TEST(IndexInterface, HnswExportedProviderOnlyReadsCommittedVectors) {
+  ASSERT_EXIT((RunHnswExportedProviderAcrossRollback(),
+               std::_Exit(::testing::Test::HasFailure() ? 1 : 0)),
+              ::testing::ExitedWithCode(0), "");
+}
+
+TEST(IndexInterface, HnswDumpSerializesWithFlush) {
+  ASSERT_EXIT((RunHnswDumpAndFlush(),
                std::_Exit(::testing::Test::HasFailure() ? 1 : 0)),
               ::testing::ExitedWithCode(0), "");
 }

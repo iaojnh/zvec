@@ -168,17 +168,16 @@ class HnswContext : public IndexContext {
     }
   }
 
-  inline void topk_to_result() {
+  inline int topk_to_result() {
     return topk_to_result(0);
   }
 
   //! Construct result from topk heap, result will be normalized
-  inline void topk_to_result(uint32_t idx) {
-    if (group_by_search()) {
-      topk_to_group_result(idx);
-    } else {
-      topk_to_single_result(idx);
-    }
+  inline int topk_to_result(uint32_t idx) try {
+    return group_by_search() ? topk_to_group_result(idx)
+                             : topk_to_single_result(idx);
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
   }
 
   inline void topk_to_keys(std::vector<uint64_t> &keys,
@@ -211,18 +210,24 @@ class HnswContext : public IndexContext {
     }
   }
 
-  inline void topk_to_single_result(uint32_t idx) {
+  inline int topk_to_single_result(uint32_t idx) {
     ailego_assert_with(idx < results_.size(), "invalid idx");
     results_[idx].clear();
+    int status = 0;
     collect_search_result([&](node_id_t id, dist_t score) {
+      if (status != 0) return;
       if (fetch_vector_) {
         IndexStorage::MemoryBlock block;
-        entity_->get_vector(id, block);
-        results_[idx].emplace_back(entity_->get_key(id), score, id, block);
+        status = entity_->get_vector_snapshot(id, block);
+        if (status != 0) return;
+        results_[idx].emplace_back(entity_->get_key(id), score, id,
+                                   std::move(block));
       } else {
         results_[idx].emplace_back(entity_->get_key(id), score, id);
       }
     });
+    if (status != 0) results_[idx].clear();
+    return status;
   }
 
  private:
@@ -242,7 +247,7 @@ class HnswContext : public IndexContext {
 
  public:
   //! Construct result from topk heap, result will be normalized
-  inline void topk_to_group_result(uint32_t idx) {
+  inline int topk_to_group_result(uint32_t idx) {
     ailego_assert_with(idx < group_results_.size(), "invalid idx");
 
     group_results_[idx].clear();
@@ -295,15 +300,20 @@ class HnswContext : public IndexContext {
 
         if (fetch_vector_) {
           IndexStorage::MemoryBlock block;
-          entity_->get_vector(id, block);
+          const int status = entity_->get_vector_snapshot(id, block);
+          if (status != 0) {
+            group_results_[idx].clear();
+            return status;
+          }
           group_results_[idx][i].mutable_docs()->emplace_back(
-              entity_->get_key(id), score, id, block);
+              entity_->get_key(id), score, id, std::move(block));
         } else {
           group_results_[idx][i].mutable_docs()->emplace_back(
               entity_->get_key(id), score, id);
         }
       }
     }
+    return 0;
   }
 
   //! Reset the query and apply the index metric query preprocess. The meta
@@ -347,8 +357,10 @@ class HnswContext : public IndexContext {
   //! HNSW algorithm while they already own the vector MemoryBlocks.
   inline dist_t batch_dist(node_id_t id) {
     IndexStorage::MemoryBlock vector_block;
-    if (ailego_unlikely(dc_.get_vector(id, vector_block) != 0)) {
-      return dc_.batch_dist(nullptr, nullptr);
+    const int status = dc_.get_vector(id, vector_block);
+    if (ailego_unlikely(status != 0)) {
+      dc_.set_error(status);
+      return 0.0f;
     }
     const void *vector = vector_block.data();
     return dc_.batch_dist(
@@ -360,9 +372,10 @@ class HnswContext : public IndexContext {
   inline bool try_batch_dist(node_id_t id, dist_t &distance,
                              bool skip_missing_vectors = false) {
     IndexStorage::MemoryBlock block;
-    if (ailego_unlikely(dc_.get_vector(id, block) != 0)) {
+    const int status = dc_.get_vector(id, block);
+    if (ailego_unlikely(status != 0)) {
       LOG_ERROR("Failed to get vector, id=%u", id);
-      dc_.set_error();
+      dc_.set_error(status);
       return false;
     }
     const void *vector = block.data();

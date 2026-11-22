@@ -111,7 +111,7 @@ class IndexDocument {
 
   IndexDocument(uint64_t k, float v, uint32_t i,
                 IndexStorage::MemoryBlock vec_block)
-      : key_(k), score_(v), index_(i), vec_mem_block_(vec_block) {
+      : key_(k), score_(v), index_(i), vec_mem_block_(std::move(vec_block)) {
     vector_ = vec_mem_block_.data();
     has_vec_mem_block_ = true;
   }
@@ -152,7 +152,7 @@ class IndexDocument {
       : key_(k),
         score_(v),
         index_(i),
-        vec_mem_block_(vec_block),
+        vec_mem_block_(std::move(vec_block)),
         sparse_doc_(std::move(sparse_doc)) {
     has_vec_mem_block_ = true;
     vector_ = vec_mem_block_.data();

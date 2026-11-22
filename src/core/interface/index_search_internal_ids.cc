@@ -47,6 +47,7 @@ void CopySearchResult(const SearchResult &result, size_t topk,
 int Index::search_internal_ids(const VectorData &vector_data,
                                const BaseIndexQueryParam::Pointer &search_param,
                                int64_t *output_ids, float *output_scores) {
+  if (inside_hnsw_callback()) return core::IndexError_NoReady;
   if (!output_ids || !search_param || search_param->topk == 0) {
     return core::IndexError_InvalidArgument;
   }

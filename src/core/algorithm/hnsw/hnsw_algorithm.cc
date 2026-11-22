@@ -48,16 +48,18 @@ int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
 
   level_t cur_level = cur_max_level;
   dist_t dist = ctx->batch_dist(entry_point);
-  if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
+  if (ailego_unlikely(ctx->error())) return ctx->dist_calculator().error_code();
   for (; cur_level > level; --cur_level) {
     select_entry_point(cur_level, &entry_point, &dist, ctx);
-    if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
+    if (ailego_unlikely(ctx->error()))
+      return ctx->dist_calculator().error_code();
   }
 
   for (; cur_level >= 0; --cur_level) {
     search_neighbors(cur_level, &entry_point, &dist, ctx->level_topk(cur_level),
                      ctx);
-    if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
+    if (ailego_unlikely(ctx->error()))
+      return ctx->dist_calculator().error_code();
   }
 
   // add neighbors from down level to top level, to avoid upper level visible
@@ -89,10 +91,11 @@ int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const {
   }
 
   dist_t dist = ctx->dist_calculator().dist(entry_point);
-  if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
+  if (ailego_unlikely(ctx->error())) return ctx->dist_calculator().error_code();
   for (level_t cur_level = max_level; cur_level >= 1; --cur_level) {
     select_entry_point(cur_level, &entry_point, &dist, ctx);
-    if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
+    if (ailego_unlikely(ctx->error()))
+      return ctx->dist_calculator().error_code();
   }
 
   const uint32_t capacity = std::max(ctx->topk(), ctx->ef());
@@ -105,12 +108,12 @@ int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const {
     search_neighbors(0, &entry_point, &dist, topk, ctx);
   }
 
-  if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
+  if (ailego_unlikely(ctx->error())) return ctx->dist_calculator().error_code();
   if (ctx->group_by_search()) {
     expand_neighbors_by_group(ctx);
   }
 
-  return ctx->error() ? IndexError_Runtime : 0;
+  return ctx->dist_calculator().error_code();
 }
 
 template <typename EntityType>
@@ -157,7 +160,8 @@ void HnswAlgorithm<EntityType>::select_entry_point(level_t level,
       (*ctx->mutable_stats_get_vector())++;
     }
     if (ailego_unlikely(ret != 0)) {
-      break;
+      dc.set_error(ret);
+      return;
     }
 
     bool find_closer = false;
@@ -378,10 +382,11 @@ void fast_search_neighbors_buffer(const EntityType &entity, HeapType &pool,
     if (unvisited_count == 0) continue;
 
     neighbor_vec_blocks.clear();
-    if (ailego_unlikely(entity.get_vector_typed(neighbor_ids.data(),
-                                                unvisited_count,
-                                                neighbor_vec_blocks) != 0)) {
-      break;
+    const int ret = entity.get_vector_typed(
+        neighbor_ids.data(), unvisited_count, neighbor_vec_blocks);
+    if (ailego_unlikely(ret != 0)) {
+      dc.set_error(ret);
+      return;
     }
     for (uint32_t i = 0; i < unvisited_count; ++i) {
       neighbor_vecs[i] = neighbor_vec_blocks[i].data();
@@ -508,7 +513,8 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
       (*ctx->mutable_stats_get_vector())++;
     }
     if (ailego_unlikely(ret != 0)) {
-      break;
+      dc.set_error(ret);
+      return;
     }
 
     if (ailego_unlikely(use_provider)) {
@@ -700,7 +706,8 @@ void HnswAlgorithm<EntityType>::expand_neighbors_by_group(
         (*ctx->mutable_stats_get_vector())++;
       }
       if (ailego_unlikely(ret != 0)) {
-        break;
+        dc.set_error(ret);
+        return;
       }
 
       std::vector<float> dists(size);
@@ -852,7 +859,7 @@ int HnswAlgorithm<EntityType>::update_neighbors(HnswDistCalculator &dc,
     }
   }
 
-  if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
+  if (ailego_unlikely(ctx->error())) return ctx->dist_calculator().error_code();
   topk_heap.truncate(cur_size);
   return entity_.update_neighbors(level, id, topk_heap.container());
 }
@@ -992,7 +999,7 @@ int HnswAlgorithm<EntityType>::reverse_update_neighbors(
     update_heap.truncate(cur_size);
     const int write_result =
         ctx->error()
-            ? IndexError_Runtime
+            ? dc.error_code()
             : entity_.update_neighbors(level, id, update_heap.container());
     update_heap.clear();
     return write_result;

@@ -23,6 +23,7 @@
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_storage.h>
 #include <zvec/core/interface/index.h>
+#include "algorithm/hnsw/hnsw_graph_mutex.h"
 #include "mixed_reducer/mixed_reducer_params.h"
 #include "utility/utility_params.h"
 
@@ -237,6 +238,12 @@ thread_local static std::array<core::IndexContext::Pointer,
     context_list;
 
 
+bool Index::inside_hnsw_callback() const {
+  // A nested HNSW operation could reuse the context of the running callback.
+  return core::HnswGraphLock::active() &&
+         param_.index_type == IndexType::kHNSW && !is_sparse_;
+}
+
 bool Index::init_context(int *status) {
   context_index_ = (magic_enum::enum_integer(param_.index_type) - 1) * 2 +
                    static_cast<size_t>(is_sparse_);
@@ -273,6 +280,7 @@ int Index::ensure_trained_for_query() {
 }
 
 int Index::train() {
+  if (inside_hnsw_callback()) return core::IndexError_NoReady;
   if (pending_quantizer_training_) return core::IndexError_NoReady;
   is_trained_ = true;
   return 0;
@@ -784,6 +792,7 @@ int Index::fetch(const uint32_t doc_id, VectorDataBuffer *vector_data_buffer) {
 }
 
 int Index::add(const VectorData &vector_data, const uint32_t doc_id) {
+  if (inside_hnsw_callback()) return core::IndexError_NoReady;
   if (pending_quantizer_training_) return core::IndexError_NoReady;
   if (!is_open_) {
     LOG_ERROR("Index is not open");
@@ -828,6 +837,7 @@ int Index::search_with_source(
 int Index::search(const VectorData &vector_data,
                   const BaseIndexQueryParam::Pointer &search_param,
                   SearchResult *result) {
+  if (inside_hnsw_callback()) return core::IndexError_NoReady;
   if (!is_open_) {
     LOG_ERROR("Index is not open");
     return core::IndexError_Runtime;
@@ -954,7 +964,12 @@ int Index::_dense_fetch(const uint32_t doc_id,
   int ret = streamer_->get_vector_by_id(doc_id, vector_block);
   if (ret != 0) {
     LOG_ERROR("Failed to fetch vector, doc_id: %u", doc_id);
-    return ret == core::IndexError_NoMemory ? ret : core::IndexError_Runtime;
+    if (ret == core::IndexError_NoMemory ||
+        (ret == core::IndexError_NoReady &&
+         param_.index_type == IndexType::kHNSW)) {
+      return ret;
+    }
+    return core::IndexError_Runtime;
   }
   const void *vector = vector_block.data();
 
@@ -1033,21 +1048,16 @@ int Index::_dense_add(const VectorData &vector_data, const uint32_t doc_id,
     return core::IndexError_Runtime;
   }
   const DenseVector &dense_vector = std::get<DenseVector>(vector_data.vector);
+  int ret;
   if (turbo_quantizer_ != nullptr) {
     auto *new_vector = context->mutable_features();
     new_vector->resize(turbo_quantizer_->quantized_datapoint_vector_length());
     turbo_quantizer_->quantize_data(dense_vector.data, new_vector->data());
-    if (streamer_->add_with_id_impl(doc_id, new_vector->data(),
-                                    streamer_vector_meta_, context) != 0) {
-      LOG_ERROR("Failed to add vector");
-      return core::IndexError_Runtime;
-    }
-    return 0;
-  }
-  if (reformer_ != nullptr) {
+    ret = streamer_->add_with_id_impl(doc_id, new_vector->data(),
+                                      streamer_vector_meta_, context);
+  } else if (reformer_ != nullptr) {
     core::IndexQueryMeta new_meta;
     auto *new_vector = context->mutable_features();
-    int ret;
     ret = reformer_->convert(dense_vector.data, input_vector_meta_, new_vector,
                              &new_meta);
     if (ret != 0) {
@@ -1056,19 +1066,16 @@ int Index::_dense_add(const VectorData &vector_data, const uint32_t doc_id,
     }
     ret = streamer_->add_with_id_impl(doc_id, new_vector->data(), new_meta,
                                       context);
-    if (ret != 0) {
-      LOG_ERROR("Failed to add vector");
-      return core::IndexError_Runtime;
-    }
   } else {
-    int ret = streamer_->add_with_id_impl(doc_id, dense_vector.data,
-                                          input_vector_meta_, context);
-    if (ret != 0) {
-      LOG_ERROR("Failed to add vector");
-      return core::IndexError_Runtime;
-    }
+    ret = streamer_->add_with_id_impl(doc_id, dense_vector.data,
+                                      input_vector_meta_, context);
   }
-  return 0;
+  if (ret == 0) return 0;
+  LOG_ERROR("Failed to add vector");
+  return ret == core::IndexError_NoReady &&
+                 param_.index_type == IndexType::kHNSW
+             ? ret
+             : core::IndexError_Runtime;
 }
 
 

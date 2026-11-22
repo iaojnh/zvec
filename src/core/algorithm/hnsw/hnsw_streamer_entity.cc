@@ -34,6 +34,7 @@ struct HnswStreamerEntity::InsertUndo {
 
   ailego::BudgetedVector<Write> writes;
   ailego::BudgetedVector<std::pair<Chunk *, size_t>> sizes;
+  node_id_t overwritten_id{kInvalidNodeId};
   node_id_t entry_point{kInvalidNodeId};
   level_t max_level{0};
 
@@ -51,8 +52,9 @@ struct HnswStreamerEntity::InsertUndo {
 };
 
 void HnswStreamerEntity::remember_size(Chunk &chunk) {
-  if (!insert_undo_) return;
-  auto &sizes = insert_undo_->sizes;
+  auto *undo = insert_undo();
+  if (!undo) return;
+  auto &sizes = undo->sizes;
   if (std::none_of(sizes.begin(), sizes.end(), [&](const auto &record) {
         return record.first == &chunk;
       })) {
@@ -63,17 +65,17 @@ void HnswStreamerEntity::remember_size(Chunk &chunk) {
 int HnswStreamerEntity::capture_write_undo(
     Chunk &chunk, const IndexStorage::SegmentData *writes, size_t count,
     void *mirror, bool streamed_vector) {
-  if (insert_undo_) {
-    const auto &sizes = insert_undo_->sizes;
+  if (auto *undo = insert_undo()) {
+    const auto &sizes = undo->sizes;
     const auto known = std::find_if(
         sizes.begin(), sizes.end(),
         [&](const auto &record) { return record.first == &chunk; });
     const size_t previous_size =
         known == sizes.end() ? chunk.data_size() : known->second;
-    const size_t first = insert_undo_->writes.size();
+    const size_t first = undo->writes.size();
     bool captured = false;
     AILEGO_DEFER([&] {
-      if (!captured) insert_undo_->writes.resize(first);
+      if (!captured) undo->writes.resize(first);
     });
     for (size_t i = 0; i < count; ++i) {
       const auto &write = writes[i];
@@ -92,7 +94,7 @@ int HnswStreamerEntity::capture_write_undo(
                                          len) != len) {
         return chunk.read_error();
       }
-      insert_undo_->writes.push_back(std::move(saved));
+      undo->writes.push_back(std::move(saved));
     }
     captured = true;
   }
@@ -110,11 +112,13 @@ int HnswStreamerEntity::write_with_undo(Chunk &chunk,
 int HnswStreamerEntity::insert_buffered(
     level_t level, key_t key, const void *vec, bool explicit_id,
     const std::function<int(node_id_t)> &add_to_graph) {
-  if (mutation_error_ != 0) return mutation_error_;
+  if (!buffered_graph_) return IndexError_Unsupported;
+  if (const int error = mutation_error(); error != 0) return error;
   InsertUndo undo;
-  insert_undo_ = &undo;
-  AILEGO_DEFER([&] { insert_undo_ = nullptr; });
+  buffered_graph_->undo = &undo;
+  AILEGO_DEFER([&] { buffered_graph_->undo = nullptr; });
   node_id_t id = static_cast<node_id_t>(key);
+  if (explicit_id && id < doc_cnt()) undo.overwritten_id = id;
   int ret;
   try {
     ret = explicit_id ? add_vector_with_id(level, id, vec)
@@ -133,8 +137,8 @@ int HnswStreamerEntity::insert_buffered(
   if (ret != 0) {
     if (!undo.rollback()) {
       LOG_ERROR("Failed to restore HNSW graph after insert error %d", ret);
-      mutation_error_ = IndexError_WriteData;
-      return mutation_error_;
+      buffered_graph_->error = IndexError_WriteData;
+      return IndexError_WriteData;
     }
     return ret;
   }
@@ -303,7 +307,13 @@ int HnswStreamerEntity::dump_with_vectors(const IndexDumper::Pointer &dumper,
 }
 
 int HnswStreamerEntity::init(size_t max_doc_cnt) {
-  mutation_error_ = 0;
+  if (storage_mode() == HnswStorageMode::kBufferPool) {
+    try {
+      buffered_graph_ = std::make_shared<BufferedGraph>();
+    } catch (const std::bad_alloc &) {
+      return IndexError_NoMemory;
+    }
+  }
   if (std::pow(scaling_factor(), kMaxGraphLayers) < max_doc_cnt) {
     LOG_ERROR("scalingFactor=%zu is too small", scaling_factor());
     return IndexError_InvalidArgument;
@@ -463,8 +473,21 @@ int HnswStreamerEntity::get_vector(const node_id_t id,
 }
 
 int HnswStreamerEntity::get_vector_snapshot(
-    node_id_t id, IndexStorage::MemoryBlock &block) const {
+    node_id_t id, IndexStorage::MemoryBlock &block) const try {
+  if (!buffered_graph_) return get_vector(id, block);
+  block.reset();
+  if (auto *undo = insert_undo();
+      undo && id == undo->overwritten_id && !undo->writes.empty()) {
+    // The overwrite captures the previous vector before changing the record.
+    const auto &previous = undo->writes.front().bytes;
+    block = IndexStorage::MemoryBlock::AllocateOwned(previous.size());
+    std::memcpy(block.data_, previous.data(), previous.size());
+    return 0;
+  }
   return read_vector(id, block, /*immutable=*/false);
+} catch (const std::bad_alloc &) {
+  block.reset();
+  return IndexError_NoMemory;
 }
 
 int HnswStreamerEntity::read_vector(node_id_t id,
@@ -804,11 +827,12 @@ int HnswStreamerEntity::close() {
   LOG_DEBUG("close index");
 
   std::lock_guard<std::mutex> lock(mutex_);
-  if (mutation_error_ != 0) return mutation_error_;
+  if (const int error = mutation_error(); error != 0) return error;
   int ret = flush_header();
   if (ret != 0) return ret;
   ret = broker_->close();
   if (ret != 0) return ret;
+  if (buffered_graph_) buffered_graph_->closed = true;
   mutable_header()->reset();
   upper_neighbor_index_->cleanup();
   keys_map_->clear();
@@ -825,7 +849,7 @@ int HnswStreamerEntity::flush(uint64_t checkpoint) {
   LOG_INFO("Flush index, curDocs=%u", doc_cnt());
 
   std::lock_guard<std::mutex> lock(mutex_);
-  if (mutation_error_ != 0) return mutation_error_;
+  if (const int error = mutation_error(); error != 0) return error;
   int ret = flush_header();
   if (ret != 0) return ret;
   ret = broker_->flush(checkpoint);
@@ -902,7 +926,7 @@ int HnswStreamerEntity::check_hnsw_index(const HNSWHeader *hd) const {
 
 int HnswStreamerEntity::write_node_data(Chunk &chunk, size_t offset,
                                         const void *vec, key_t key) {
-  if (insert_undo_) {
+  if (insert_undo()) {
     const bool append = offset >= chunk.data_size();
     const uint32_t zero = 0;
     const IndexStorage::SegmentData writes[] = {
@@ -984,7 +1008,7 @@ int HnswStreamerEntity::add_vector(level_t level, key_t key, const void *vec,
   if (ailego_unlikely(ret != 0)) return ret;
   record_stored = true;
   *id = local_id;
-  if (insert_undo_) return 0;
+  if (insert_undo()) return 0;
 
   if (filter_same_key_ || get_vector_enabled_) {
     if (use_key_info_map_) {
@@ -1093,7 +1117,7 @@ int HnswStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
   ret = add_upper_neighbor(level, id);
   if (ailego_unlikely(ret != 0)) return ret;
   record_stored = true;
-  if (insert_undo_) return 0;
+  if (insert_undo()) return 0;
 
   if (grows) *mutable_doc_cnt() = id + 1;
   if (filter_same_key_ || get_vector_enabled_) {
@@ -1110,9 +1134,9 @@ int HnswStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
 }
 
 void HnswStreamerEntity::update_ep_and_level(node_id_t ep, level_t level) {
-  if (insert_undo_) {
-    insert_undo_->entry_point = ep;
-    insert_undo_->max_level = level;
+  if (auto *undo = insert_undo()) {
+    undo->entry_point = ep;
+    undo->max_level = level;
     return;
   }
   HnswEntity::update_ep_and_level(ep, level);
@@ -1217,6 +1241,8 @@ const HnswEntity::Pointer HnswBufferPoolStreamerEntity::clone() const {
       std::move(upper_neighbor_chunks), broker_, nullptr, nullptr);
   if (ailego_unlikely(!entity)) {
     LOG_ERROR("HnswBufferPoolStreamerEntity new failed");
+  } else {
+    entity->buffered_graph_ = buffered_graph_;
   }
   return HnswEntity::Pointer(entity);
 }

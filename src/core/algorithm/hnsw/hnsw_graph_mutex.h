@@ -53,4 +53,79 @@ class HnswGraphMutex {
   bool writing_{false};
 };
 
+class HnswGraphLock {
+ public:
+  enum class Mode { kRead, kWrite };
+
+  explicit HnswGraphLock(HnswGraphMutex *mutex, Mode mode = Mode::kRead)
+      : mode_(mode) {
+    // A callback already holding a graph lock must never wait for a writer.
+    if (mode_ == Mode::kWrite && active()) {
+      blocked_ = true;
+      return;
+    }
+    if (!mutex) return;
+    if (mode_ == Mode::kWrite) {
+      mutex->lock();
+    } else {
+      // A filter or provider can read the index this thread already holds.
+      for (auto *guard = active_; guard; guard = guard->previous_) {
+        if (guard->mutex_ == mutex) return;
+      }
+      // Another index's callback may be waiting on a lock this thread holds.
+      // Join readers without waiting, and report an active write to the caller.
+      if (active_) {
+        if (!mutex->try_lock_shared_for_nested_read()) {
+          blocked_ = true;
+          return;
+        }
+      } else {
+        mutex->lock_shared();
+      }
+    }
+    mutex_ = mutex;
+    previous_ = active_;
+    active_ = this;
+  }
+
+  ~HnswGraphLock() {
+    if (!mutex_) return;
+    active_ = previous_;
+    if (mode_ == Mode::kWrite) {
+      mutex_->unlock();
+    } else {
+      mutex_->unlock_shared();
+    }
+  }
+
+  HnswGraphLock(const HnswGraphLock &) = delete;
+  HnswGraphLock &operator=(const HnswGraphLock &) = delete;
+
+  static bool active() {
+    return active_ != nullptr;
+  }
+
+  static bool has_writer() {
+    for (auto *guard = active_; guard; guard = guard->previous_) {
+      if (guard->mode_ == Mode::kWrite) return true;
+    }
+    return false;
+  }
+
+  bool owns_lock() const {
+    return mutex_ != nullptr;
+  }
+
+  bool blocked() const {
+    return blocked_;
+  }
+
+ private:
+  static inline thread_local const HnswGraphLock *active_{nullptr};
+  const HnswGraphLock *previous_{nullptr};
+  HnswGraphMutex *mutex_{nullptr};
+  const Mode mode_;
+  bool blocked_{false};
+};
+
 }  // namespace zvec::core

@@ -139,6 +139,8 @@ class ZVEC_CORE_API Index {
 
   virtual int fetch(const uint32_t doc_id,
                     VectorDataBuffer *vector_data_buffer);
+  // During a BufferPool HNSW callback, fetch is supported. Reentrant HNSW
+  // searches and mutations return IndexError_NoReady.
   virtual int search(const VectorData &query,
                      const BaseIndexQueryParam::Pointer &search_param,
                      SearchResult *result);
@@ -256,6 +258,7 @@ class ZVEC_CORE_API Index {
   }
 
  protected:
+  bool inside_hnsw_callback() const;
   bool init_context(int *status = nullptr);
   core::IndexContext::Pointer &acquire_context();
 

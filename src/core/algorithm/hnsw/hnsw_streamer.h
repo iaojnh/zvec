@@ -17,7 +17,6 @@
 #include <zvec/core/framework/index_framework.h>
 #include <zvec/core/framework/index_provider.h>
 #include "hnsw_algorithm.h"
-#include "hnsw_graph_mutex.h"
 #include "hnsw_streamer_entity.h"
 
 namespace zvec {
@@ -315,11 +314,8 @@ class HnswStreamer : public IndexStreamer {
   bool use_external_vector_{false};
   const VectorSource *build_vector_source_{nullptr};
 
-  //! avoid add vector while dumping index
+  // Take the dump gate before the BufferPool graph lock.
   ailego::SharedMutex shared_mutex_{};
-  // Buffered graph updates can be rolled back. Keep readers and other
-  // writers out until the insert commits or the old graph is restored.
-  mutable HnswGraphMutex buffered_graph_mutex_;
 };
 
 }  // namespace core

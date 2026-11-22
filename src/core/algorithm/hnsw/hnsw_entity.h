@@ -530,6 +530,12 @@ class HnswEntity {
     return IndexError_NotImplemented;
   }
 
+  // Return vector bytes that can outlive the graph read lock.
+  virtual int get_vector_snapshot(node_id_t id,
+                                  IndexStorage::MemoryBlock &block) const {
+    return get_vector(id, block);
+  }
+
   //! Fetch a vector for an operation bounded by this entity's lifetime.
   //!
   //! Storage-backed implementations may omit shared ownership from the

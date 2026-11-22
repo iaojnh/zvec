@@ -102,6 +102,7 @@ class HnswDistCalculator {
   //! Reset query vector data
   inline void reset_query(const void *query) {
     status_ = Status::kOk;
+    error_code_ = IndexError_Runtime;
     query_ = query;
   }
 
@@ -138,8 +139,8 @@ class HnswDistCalculator {
     IndexStorage::MemoryBlock vec_block;
     int ret = get_vector(id, vec_block);
     if (ailego_unlikely(ret != 0)) {
-      LOG_ERROR("Get nullptr vector, id=%u", id);
-      status_ = Status::kError;
+      LOG_ERROR("Read vector %u failed: %s", id, IndexError::What(ret));
+      set_error(ret);
       return 0.0f;
     }
     const void *feat = vec_block.data();
@@ -160,8 +161,8 @@ class HnswDistCalculator {
     IndexStorage::MemoryBlock vec_block_feat;
     int ret = get_vector(lhs, vec_block_feat);
     if (ailego_unlikely(ret != 0)) {
-      LOG_ERROR("Get nullptr vector, id=%u", lhs);
-      status_ = Status::kError;
+      LOG_ERROR("Read vector %u failed: %s", lhs, IndexError::What(ret));
+      set_error(ret);
       return 0.0f;
     }
     const void *feat = vec_block_feat.data();
@@ -169,8 +170,8 @@ class HnswDistCalculator {
     IndexStorage::MemoryBlock vec_block_query;
     ret = get_vector(rhs, vec_block_query);
     if (ailego_unlikely(ret != 0)) {
-      LOG_ERROR("Get nullptr vector, id=%u", rhs);
-      status_ = Status::kError;
+      LOG_ERROR("Read vector %u failed: %s", rhs, IndexError::What(ret));
+      set_error(ret);
       return 0.0f;
     }
     const void *query = vec_block_query.data();
@@ -250,6 +251,7 @@ class HnswDistCalculator {
   inline void clear() {
     compare_cnt_ = 0;
     status_ = Status::kOk;
+    error_code_ = IndexError_Runtime;
   }
 
   inline void clear_compare_cnt() {
@@ -266,8 +268,13 @@ class HnswDistCalculator {
     return status_;
   }
 
-  inline void set_error() {
+  int error_code() const {
+    return error() ? error_code_ : 0;
+  }
+
+  void set_error(int error = IndexError_Runtime) {
     status_ = Status::kError;
+    error_code_ = error;
   }
 
   //! Get distances compute times
@@ -331,6 +338,7 @@ class HnswDistCalculator {
   uint32_t compare_cnt_;  // record distance compute times
   // uint32_t compare_cnt_batch_;  // record batch distance compute time
   Status status_{Status::kOk};
+  int error_code_{IndexError_Runtime};
 
   // get original vector, used to build graph
   IndexProvider::Pointer provider_{};
