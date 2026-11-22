@@ -199,8 +199,6 @@ Result<FtsIndexResults::Ptr> FtsRecallNode::prepare() {
 
   auto results =
       segment_->fts_search(fts_cond->field_name, *fts_cond->fts_ast, params);
-  auto evaluation_status = doc_filter_->status();
-  if (!evaluation_status.ok()) return tl::make_unexpected(evaluation_status);
   if (!results) {
     return tl::make_unexpected(results.error());
   }

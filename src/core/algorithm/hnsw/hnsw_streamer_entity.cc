@@ -451,7 +451,7 @@ int HnswBufferPoolStreamerEntity::get_vector_for_prune(
           batch_reads, count))) {
     LOG_ERROR("Batch read prune vectors failed, count=%u, read size=%zu", count,
               read_size);
-    return IndexError_ReadData;
+    return batch_reads[0].segment->read_error();
   }
   return 0;
 }

@@ -100,13 +100,13 @@ class SegmentImpl : public Segment,
  public:
   using Ptr = std::shared_ptr<SegmentImpl>;
 
-  class SegmentIndexFilter : public IndexFilter {
+  class SegmentIndexFilter : public CheckedIndexFilter {
    public:
     SegmentIndexFilter(const DeleteStore::Ptr &delete_store,
                        SegmentImpl::Ptr impl)
         : delete_store_(delete_store), impl_(impl) {}
 
-    bool is_filtered(uint64_t id) const override;
+    Result<bool> is_filtered_checked(uint64_t id) const override;
 
    private:
     DeleteStore::Ptr delete_store_;
@@ -117,13 +117,14 @@ class SegmentImpl : public Segment,
               const SegmentMeta &segment_meta, const IDMap::Ptr &id_map,
               const DeleteStore::Ptr &delete_store,
               const VersionManager::Ptr &version_manager)
-      : path_(path),
+      : id_(segment_meta.id()),
+        path_(path),
         collection_schema_(std::make_shared<CollectionSchema>(schema)),
         segment_meta_(std::make_shared<SegmentMeta>(segment_meta)),
         version_manager_(version_manager),
         id_map_(id_map),
         delete_store_(delete_store) {
-    seg_path_ = FileHelper::MakeSegmentPath(path_, segment_meta.id());
+    seg_path_ = FileHelper::MakeSegmentPath(path_, id_);
   }
 
   virtual ~SegmentImpl() {
@@ -405,7 +406,7 @@ class SegmentImpl : public Segment,
   Status update_version(const SegmentMeta::Ptr &meta,
                         uint32_t delete_snapshot_path_suffix);
 
-  Result<uint64_t> get_global_doc_id(uint32_t segment_doc_id) const;
+  Result<uint64_t> get_global_doc_id(uint64_t segment_doc_id) const;
 
   BlockID allocate_block_id();
 
@@ -524,6 +525,9 @@ class SegmentImpl : public Segment,
   // index filter
   IndexFilter::Ptr filter_;
 
+  // Routing reads the ID without taking seg_mtx_. Flush may replace the
+  // metadata snapshot, but it never changes this segment's identity.
+  const SegmentID id_;
   std::string path_;
   std::string seg_path_;
   CollectionSchema::Ptr collection_schema_;
@@ -609,18 +613,13 @@ class SegmentImpl::CombinedRecordBatchReader
 // SegmentImpl implementation
 ////////////////////////////////////////////////////////////////////////////////////
 
-bool SegmentImpl::SegmentIndexFilter::is_filtered(uint64_t id) const {
+Result<bool> SegmentImpl::SegmentIndexFilter::is_filtered_checked(
+    uint64_t id) const {
   auto impl = impl_.lock();
   if (!impl) return false;
   auto result = impl->get_global_doc_id(id);
-  if (!result.has_value()) {
-    return false;
-  }
-  uint64_t doc_id = result.value();
-  if (delete_store_ && delete_store_->is_deleted(doc_id)) {
-    return true;
-  }
-  return false;
+  if (!result) return tl::make_unexpected(std::move(result.error()));
+  return delete_store_ && delete_store_->is_deleted(*result);
 }
 
 Status SegmentImpl::Open(const SegmentOptions &options) {
@@ -766,7 +765,7 @@ Status SegmentImpl::close() {
 }
 
 SegmentID SegmentImpl::id() const {
-  return segment_meta_->id();
+  return id_;
 }
 
 SegmentMeta::Ptr SegmentImpl::meta() const {
@@ -5863,7 +5862,7 @@ Status SegmentImpl::get_global_doc_ids(std::vector<int64_t> &doc_ids) const {
 }
 
 
-Result<uint64_t> SegmentImpl::get_global_doc_id(uint32_t segment_doc_id) const {
+Result<uint64_t> SegmentImpl::get_global_doc_id(uint64_t segment_doc_id) const {
   // Read-only lookup into doc_ids_.
   std::shared_lock<std::shared_mutex> lock(seg_mtx_);
   if (segment_doc_id >= doc_ids_.size()) {

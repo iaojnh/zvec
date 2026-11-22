@@ -203,6 +203,8 @@ Result<IndexResults::Ptr> VectorColumnIndexer::search(
     return tl::make_unexpected(engine_query_param_result.error());
   }
   auto &engine_query_param = engine_query_param_result.value();
+  ProximaEngineHelper::SearchFilter filter(query_params.filter);
+  engine_query_param->filter = filter.engine_filter();
   if (query_params.bf_pks.size() > 1) {
     LOG_ERROR("bf_pks size > 1 is not supported");
     return tl::make_unexpected(
@@ -217,6 +219,7 @@ Result<IndexResults::Ptr> VectorColumnIndexer::search(
   const int search_error =
       index->search(engine_vector_data.value(), std::move(engine_query_param),
                     &search_result);
+  if (!filter.status().ok()) return tl::make_unexpected(filter.status());
   if (search_error != 0) {
     return tl::make_unexpected(
         Status(search_error == core::IndexError_NoMemory

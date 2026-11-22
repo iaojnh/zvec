@@ -14,6 +14,7 @@
 #pragma once
 
 #include <zvec/core/framework/index_meta.h>
+#include "utility/graph_storage_error.h"
 #include "hnsw_sparse_entity.h"
 
 namespace zvec {
@@ -80,8 +81,9 @@ class HnswSparseDistCalculator {
 
     IndexStorage::MemoryBlock sparse;
     int length = 0;
-    if (entity_->get_sparse_data_from_vector(vec, sparse, length) != 0 ||
-        sparse.data() == nullptr) {
+    CheckGraphStorage(
+        entity_->get_sparse_data_from_vector(vec, sparse, length));
+    if (sparse.data() == nullptr) {
       error_ = true;
       return 0.0f;
     }
@@ -94,7 +96,8 @@ class HnswSparseDistCalculator {
     compare_cnt_++;
 
     IndexStorage::MemoryBlock sparse;
-    if (read_sparse(id, sparse) != 0 || !sparse.data()) {
+    CheckGraphStorage(read_sparse(id, sparse));
+    if (!sparse.data()) {
       LOG_ERROR("Get nullptr vector, id=%u", id);
       error_ = true;
       return 0.0f;
@@ -108,8 +111,11 @@ class HnswSparseDistCalculator {
     compare_cnt_++;
 
     IndexStorage::MemoryBlock feat, query;
-    if (read_sparse(lhs, feat) != 0 || !feat.data() ||
-        read_sparse(rhs, query) != 0 || !query.data()) {
+    CheckGraphStorage(read_sparse(lhs, feat));
+    if (feat.data()) {
+      CheckGraphStorage(read_sparse(rhs, query));
+    }
+    if (!feat.data() || !query.data()) {
       LOG_ERROR("Get nullptr vector");
       error_ = true;
       return 0.0f;

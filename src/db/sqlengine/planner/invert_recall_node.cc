@@ -61,9 +61,17 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> InvertRecallNode::gen() {
     }
     for (int i = 0; state.iter_->valid() && i < self->batch_size_;
          state.iter_->next()) {
-      if (self->seg_filter_ &&
-          self->seg_filter_->is_filtered(state.iter_->doc_id())) {
-        continue;
+      if (self->seg_filter_) {
+        auto result =
+            self->seg_filter_->is_filtered_checked(state.iter_->doc_id());
+        if (!result) {
+          const auto &error = result.error();
+          return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+              error.code() == StatusCode::RESOURCE_EXHAUSTED
+                  ? arrow::Status::OutOfMemory(error.message())
+                  : arrow::Status::ExecutionError(error.message()));
+        }
+        if (*result) continue;
       }
       i++;
       indices.push_back(state.iter_->doc_id());

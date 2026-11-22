@@ -210,6 +210,7 @@ class CollectionImpl : public Collection {
   Status flush_unsafe(bool for_close = false);
 
   // Requires write_mtx_ or exclusive schema_handle_mtx_.
+  Status publish_pending_rotation();
   Status acquire_write_buffer();
 
   Status create();
@@ -389,6 +390,9 @@ class CollectionImpl : public Collection {
 
   // writing segment
   Segment::Ptr writing_segment_;
+  // The replacement must appear in the on-disk manifest before it accepts
+  // writes. Guarded by write_mtx_ or the exclusive schema lock.
+  bool rotation_manifest_pending_{false};
   // non-writing segments, sort by doc_id range
   SegmentManager::Ptr segment_manager_;
 
@@ -594,6 +598,7 @@ Status CollectionImpl::flush_unsafe(bool for_close) {
     return Status::InternalError(
         "flush writing segment failed because writing segment is nullptr");
   }
+  CHECK_RETURN_STATUS(publish_pending_rotation());
   auto s = for_close ? writing_segment_->flush_for_close()
                      : writing_segment_->flush();
   // A failed flush may retain Arrow batches and its retry workspace. End the
@@ -603,7 +608,15 @@ Status CollectionImpl::flush_unsafe(bool for_close) {
   return s;
 }
 
+Status CollectionImpl::publish_pending_rotation() {
+  if (!rotation_manifest_pending_) return Status::OK();
+  auto status = version_manager_->flush();
+  if (status.ok()) rotation_manifest_pending_ = false;
+  return status;
+}
+
 Status CollectionImpl::acquire_write_buffer() {
+  CHECK_RETURN_STATUS(publish_pending_rotation());
   return options_.enable_mmap_ ? Status::OK()
                                : write_buffer_reservation_.acquire_managed(
                                      options_.max_buffer_size_);
@@ -1823,10 +1836,8 @@ Status CollectionImpl::switch_to_new_segment_for_writing(
 
   s = version_manager_->apply(version);
   CHECK_RETURN_STATUS(s);
-  s = version_manager_->flush();
-  CHECK_RETURN_STATUS(s);
-
-  return Status::OK();
+  rotation_manifest_pending_ = true;
+  return publish_pending_rotation();
 }
 
 Result<WriteResults> CollectionImpl::delete_(
@@ -2279,17 +2290,24 @@ Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const
       }
     }
   }
-  // FTS recall has scalar output. Keep its SQL projection when the caller
-  // asks to include vectors, even if another route in the query is vector.
-  const bool fts_with_vectors =
-      query.include_vector &&
-      std::any_of(query.queries.begin(), query.queries.end(),
-                  [](const SubQuery &sub) {
-                    return sub.target_.get_fts_clause() != nullptr;
-                  });
+  // FTS recall projects scalars. SQL also represents empty sparse vectors as
+  // absent fields, while point fetch represents them as empty pairs.
+  bool needs_sql_projection = false;
+  if (query.include_vector) {
+    const auto vector_fields = schema_->vector_fields();
+    needs_sql_projection =
+        std::any_of(query.queries.begin(), query.queries.end(),
+                    [](const SubQuery &sub) {
+                      return sub.target_.get_fts_clause() != nullptr;
+                    }) ||
+        std::any_of(vector_fields.begin(), vector_fields.end(),
+                    [](const FieldSchema::Ptr &field) {
+                      return field->is_sparse_vector();
+                    });
+  }
   // Built-in fusion only needs PKs and scores. Custom callbacks receive Docs.
   const bool late_fetch =
-      simple_projection && !fts_with_vectors &&
+      simple_projection && !needs_sql_projection &&
       !std::holds_alternative<reranker::CallbackParams>(query.rerank);
   const std::optional<std::vector<std::string>> no_fields{std::in_place};
   const auto &selected = late_fetch ? no_fields : query.output_fields;
@@ -2435,6 +2453,8 @@ Result<DocPtrList> CollectionImpl::query_unsafe(const MultiQuery &query) const
     begin = end;
   }
   return ranked;
+} catch (const DocIdMap::ReadError &error) {
+  return tl::make_unexpected(error.status());
 } catch (const std::bad_alloc &) {
   return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
                                     "Hybrid query exceeds memory budget"));

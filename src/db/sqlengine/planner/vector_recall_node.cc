@@ -219,8 +219,6 @@ Result<IndexResults::Ptr> VectorRecallNode::prepare() {
   }
 
   auto vector_ret = vector_indexer->search(vector_data, query_params);
-  auto evaluation_status = doc_filter_->status();
-  if (!evaluation_status.ok()) return tl::make_unexpected(evaluation_status);
   if (!vector_ret) {
     return tl::make_unexpected(vector_ret.error());
   }

@@ -125,6 +125,56 @@ TEST(VectorColumnIndexerTest, BaseQueryParametersForFlatFallback) {
 }
 
 
+TEST(VectorColumnIndexerTest, PropagatesFilterReadFailure) {
+  class FailingFilter : public CheckedIndexFilter {
+   public:
+    explicit FailingFilter(StatusCode code) : code_(code) {}
+
+    Result<bool> is_filtered_checked(uint64_t id) const override {
+      if (id == 0) return false;
+      return tl::make_unexpected(Status(code_, "Cannot read document ID range"));
+    }
+
+   private:
+    StatusCode code_;
+  };
+
+  const std::string path = "test_failing_filter.index";
+  test_util::RemoveTestFiles(path);
+  VectorColumnIndexer indexer(
+      path, FieldSchema("test", DataType::VECTOR_FP32, 4, false,
+                        std::make_shared<FlatIndexParams>(MetricType::L2)));
+  ASSERT_TRUE(indexer.open({true, true}).ok());
+
+  const float values[] = {1.0f, 2.0f, 3.0f, 4.0f};
+  const vector_column_params::VectorData vector{
+      vector_column_params::DenseVector{values}};
+  ASSERT_TRUE(indexer.insert(vector, 0).ok());
+  ASSERT_TRUE(indexer.insert(vector, 1).ok());
+  vector_column_params::QueryParams params;
+  params.topk = 2;
+
+  for (auto code : {StatusCode::RESOURCE_EXHAUSTED, StatusCode::INTERNAL_ERROR}) {
+    FailingFilter filter(code);
+    params.filter = &filter;
+    auto result = indexer.search(vector, params);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), code);
+    EXPECT_EQ(result.error().message(), "Cannot read document ID range");
+
+    int64_t ids[2];
+    auto status = indexer.search_internal_ids(vector, params, ids, nullptr);
+    EXPECT_EQ(status.code(), code);
+    EXPECT_EQ(status.message(), "Cannot read document ID range");
+  }
+
+  params.filter = nullptr;
+  EXPECT_TRUE(indexer.search(vector, params));
+  EXPECT_TRUE(indexer.close().ok());
+  test_util::RemoveTestFiles(path);
+}
+
+
 std::string print_dense_vector(const void *vector, size_t dim,
                                DataType data_type) {
   std::stringstream ss;

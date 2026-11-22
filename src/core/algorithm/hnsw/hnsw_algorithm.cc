@@ -71,6 +71,7 @@ int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
 
   return 0;
 } catch (const GraphStorageError &error) {
+  ctx->release_build_workspace();
   return error.code;
 } catch (const std::bad_alloc &) {
   ctx->release_build_workspace();
@@ -79,6 +80,13 @@ int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
 
 template <typename EntityType>
 int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const try {
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) {
+      ctx->search_heap().clear();
+      ctx->group_topk_heaps().clear();
+    }
+  });
   spin_lock_.lock();
   auto max_level = entity_.cur_max_level();
   auto entry_point = entity_.entry_point();
@@ -107,15 +115,12 @@ int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const try {
 
   if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
   if (ctx->group_by_search()) {
-    try {
-      expand_neighbors_by_group(ctx);
-    } catch (const std::bad_alloc &) {
-      ctx->group_topk_heaps().clear();
-      return IndexError_NoMemory;
-    }
+    expand_neighbors_by_group(ctx);
   }
 
-  return ctx->error() ? IndexError_Runtime : 0;
+  if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
+  complete = true;
+  return 0;
 } catch (const GraphStorageError &error) {
   return error.code;
 } catch (const std::bad_alloc &) {
@@ -165,9 +170,7 @@ void HnswAlgorithm<EntityType>::select_entry_point(level_t level,
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_vector())++;
     }
-    if (ailego_unlikely(ret != 0)) {
-      break;
-    }
+    CheckGraphStorage(ret);
 
     bool find_closer = false;
 
@@ -403,11 +406,8 @@ void fast_search_neighbors_buffer(const EntityType &entity, HeapType &pool,
       if (!resident) resident_probe_skip = 15;
     }
     if (!resident) {
-      if (ailego_unlikely(entity.get_vector_typed(neighbor_ids.data(),
-                                                  unvisited_count,
-                                                  neighbor_vec_blocks) != 0)) {
-        break;
-      }
+      CheckGraphStorage(entity.get_vector_typed(
+          neighbor_ids.data(), unvisited_count, neighbor_vec_blocks));
       for (uint32_t i = 0; i < unvisited_count; ++i)
         neighbor_vecs[i] = neighbor_vec_blocks[i].data();
     }
@@ -535,9 +535,7 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_vector())++;
     }
-    if (ailego_unlikely(ret != 0)) {
-      break;
-    }
+    CheckGraphStorage(ret);
 
     if (ailego_unlikely(use_provider)) {
       for (uint32_t i = 0; i < size; ++i) {
@@ -733,9 +731,7 @@ void HnswAlgorithm<EntityType>::expand_neighbors_by_group(
       if (ailego_unlikely(ctx->debugging())) {
         (*ctx->mutable_stats_get_vector())++;
       }
-      if (ailego_unlikely(ret != 0)) {
-        break;
-      }
+      CheckGraphStorage(ret);
 
       ailego::BudgetedVector<float> dists(size);
       ailego::BudgetedVector<const void *> neighbor_vecs(size);
@@ -814,10 +810,7 @@ void HnswAlgorithm<EntityType>::update_neighbors(HnswDistCalculator &dc,
             ? dc.get_vector(prune_ids.data(), prune_ids.size(), prune_blocks)
             : read_entity.get_vector_for_prune(prune_ids.data(),
                                                prune_ids.size(), prune_blocks);
-    if (ailego_unlikely(ret != 0)) {
-      dc.set_error();
-      return;
-    }
+    CheckGraphStorage(ret);
     selected_indices.clear();
     selected_indices.reserve(max_neighbor_cnt);
 
@@ -940,10 +933,7 @@ void HnswAlgorithm<EntityType>::reverse_update_neighbors(
                             candidate_blocks)
             : read_entity.get_vector_for_prune(
                   candidate_ids.data(), candidate_ids.size(), candidate_blocks);
-    if (ailego_unlikely(ret != 0)) {
-      dc.set_error();
-      return;
-    }
+    CheckGraphStorage(ret);
 
     update_heap.clear();
     // Use block indices until pruning is complete.  This keeps sorted heap

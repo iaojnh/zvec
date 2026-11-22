@@ -144,8 +144,10 @@ class DocIdMap {
     Run run{};
     int ret = ranges_.read((index - 1) * sizeof(Run), &run, sizeof(run));
     if (ret != 0)
-      return tl::make_unexpected(
-          Status::InternalError("Cannot read document ID range: ", ret));
+      return tl::make_unexpected(Status(
+          ret == core::IndexError_NoMemory ? StatusCode::RESOURCE_EXHAUSTED
+                                           : StatusCode::INTERNAL_ERROR,
+          "Cannot read document ID range: " + std::to_string(ret)));
     return run;
   }
   Result<Run> preceding(uint64_t value, bool global) const {

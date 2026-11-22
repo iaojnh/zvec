@@ -549,6 +549,60 @@ TEST_F(CollectionWriteBudgetTest, RolloverCanRetryAfterReplacementCreateFails) {
   EXPECT_EQ(rows.size(), fetched->at("next")->doc_id());
 }
 
+TEST_F(CollectionWriteBudgetTest, RolloverRequiresPublishedManifestBeforeWrites) {
+  const auto collection_path = path("rollover_manifest_failure");
+  const auto small_segments = schema();
+  auto writer = Collection::CreateAndOpen(collection_path, small_segments,
+                                          {false, false, kMiB});
+  ASSERT_TRUE(writer.has_value()) << writer.error().message();
+  std::vector<Doc> rows(small_segments.max_doc_count_per_segment());
+  for (size_t i = 0; i < rows.size(); ++i) {
+    rows[i].set_pk("row" + std::to_string(i));
+    rows[i].set("payload", std::string("original value"));
+  }
+  const auto inserted = writer.value()->insert(rows);
+  ASSERT_TRUE(inserted.has_value()) << inserted.error().message();
+  for (const auto &status : *inserted)
+    ASSERT_TRUE(status.ok()) << status.message();
+  // Manifest 1 contains the old writer's complete block. Block only the
+  // subsequent publication that would make the replacement discoverable.
+  ASSERT_TRUE(writer.value()->flush().ok());
+  const auto blocked =
+      FileHelper::MakeFilePath(collection_path, FileID::MANIFEST_FILE, 2);
+  ASSERT_TRUE(std::filesystem::create_directory(blocked));
+  auto next = docs("next");
+  const auto rotation = writer.value()->insert(next);
+  const auto blocked_insert = writer.value()->insert(next);
+  const auto blocked_delete = writer.value()->delete_({"row0"});
+  ASSERT_TRUE(std::filesystem::remove(blocked));
+  EXPECT_FALSE(rotation.has_value());
+  EXPECT_FALSE(blocked_insert.has_value());
+  EXPECT_FALSE(blocked_delete.has_value());
+  {
+    auto fetched = writer.value()->fetch({"row0", "next"});
+    ASSERT_TRUE(fetched.has_value()) << fetched.error().message();
+    EXPECT_NE(nullptr, fetched->at("row0"));
+    EXPECT_EQ(nullptr, fetched->at("next"));
+  }
+
+  const auto retried = writer.value()->insert(next);
+  ASSERT_TRUE(retried.has_value()) << retried.error().message();
+  ASSERT_TRUE(retried->front().ok()) << retried->front().message();
+  auto version = VersionManager::Recovery(collection_path);
+  ASSERT_TRUE(version.has_value()) << version.error().message();
+  const auto writing_meta =
+      version.value()->get_current_version().writing_segment_meta();
+  EXPECT_EQ(1u, writing_meta->id());
+  ASSERT_TRUE(writer.value()->close().ok());
+  auto reopened = Collection::Open(collection_path, {true, false, kMiB});
+  ASSERT_TRUE(reopened.has_value()) << reopened.error().message();
+  auto fetched = reopened.value()->fetch({"row0", "next"});
+  ASSERT_TRUE(fetched.has_value()) << fetched.error().message();
+  EXPECT_NE(nullptr, fetched->at("row0"));
+  ASSERT_NE(nullptr, fetched->at("next"));
+  EXPECT_EQ(rows.size(), fetched->at("next")->doc_id());
+}
+
 TEST_F(CollectionWriteBudgetTest, BufferedVectorRefusalPrecedesWalAndMutation) {
   const auto collection_path = path("vector_write_admission");
   auto schema_with_vectors = schema();

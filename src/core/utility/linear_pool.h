@@ -125,7 +125,8 @@ struct LinearPool {
         data_.capacity() / 2 > static_cast<size_t>(capacity + 1)) {
       decltype(data_)().swap(data_);
     }
-    if (data_.size() < static_cast<size_t>(capacity + 1)) {
+    // Clearing a pool after a failed admission must not allocate a slot.
+    if (capacity != 0 && data_.size() < static_cast<size_t>(capacity + 1)) {
       data_.resize(capacity + 1);
     }
   }

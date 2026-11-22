@@ -26,7 +26,6 @@
 namespace zvec::sqlengine {
 
 Status DocFilter::compute_filter() {
-  error_.store(StatusCode::OK, std::memory_order_relaxed);
   if (invert_cond_) {
     InvertSearch search(segment_.get());
     auto invert_res = search.exec_invert_cond_tree(invert_cond_.get());
@@ -101,43 +100,29 @@ bool DocFilter::empty() const {
            forward_filter_expr_);
 }
 
-Status DocFilter::status() const {
-  const auto code = error_.load(std::memory_order_relaxed);
-  return code == StatusCode::OK
-             ? Status::OK()
-             : Status(code, "Forward filter evaluation failed");
-}
-
-bool DocFilter::is_filtered(uint64_t id) const try {
-  if (error_.load(std::memory_order_relaxed) != StatusCode::OK) return true;
-  if (delete_filter_ && delete_filter_->is_filtered(id)) {
-    return true;
+Result<bool> DocFilter::is_filtered_checked(uint64_t id) const try {
+  if (delete_filter_) {
+    auto result = delete_filter_->is_filtered_checked(id);
+    if (!result || *result) return result;
   }
-  if (invert_filter_ && invert_filter_->is_filtered(id)) {
-    return true;
+  if (invert_filter_) {
+    auto result = invert_filter_->is_filtered_checked(id);
+    if (!result || *result) return result;
   }
-  auto forward_bit = get_forward_bit(id);
-  if (!forward_bit) {
-    if (forward_filter_expr_ || forward_bitmap_) {
-      if (error_.load(std::memory_order_relaxed) == StatusCode::OK)
-        error_.store(StatusCode::INTERNAL_ERROR, std::memory_order_relaxed);
-      return true;
-    }
-    return false;
-  }
-  // revert to return false if forward filter is matched
-  return !forward_bit.value();
+  auto matches = get_forward_bit(id);
+  if (!matches) return tl::make_unexpected(std::move(matches.error()));
+  return !*matches;
 } catch (const std::bad_alloc &) {
-  error_.store(StatusCode::RESOURCE_EXHAUSTED, std::memory_order_relaxed);
-  return true;
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "Forward filter evaluation failed"));
 }
 
-std::optional<bool> DocFilter::get_forward_bit(uint64_t id) const {
+Result<bool> DocFilter::get_forward_bit(uint64_t id) const {
   if (forward_filter_expr_) {
     return is_matched_by_forward_filter(id);
   }
   if (!forward_bitmap_) {
-    return std::nullopt;
+    return true;
   }
   uint64_t rows_seen = 0;
   for (int c = 0; c < forward_bitmap_->num_chunks(); c++) {
@@ -148,9 +133,8 @@ std::optional<bool> DocFilter::get_forward_bit(uint64_t id) const {
     }
     rows_seen += arr->length();
   }
-  LOG_ERROR("ID is out or range: id[%zu] count[%zu]", (size_t)id,
-            (size_t)rows_seen);
-  return std::nullopt;
+  return tl::make_unexpected(Status::InternalError(
+      "Forward filter row ID out of range: ", id, " of ", rows_seen));
 }
 
 std::optional<std::vector<uint64_t>> DocFilter::get_bf_by_keys_and_update(
@@ -195,12 +179,12 @@ std::optional<std::vector<uint64_t>> DocFilter::get_bf_by_keys_and_update(
   return std::nullopt;
 }
 
-std::optional<bool> DocFilter::is_matched_by_forward_filter(uint64_t id) const {
+Result<bool> DocFilter::is_matched_by_forward_filter(uint64_t id) const {
   auto exec_batch =
       segment_->fetch(query_info_->get_forward_filter_field_names(), id);
   if (!exec_batch) {
-    LOG_ERROR("Fetch forward failed, id[%zu]", (size_t)id);
-    return std::nullopt;
+    return tl::make_unexpected(
+        Status::InternalError("Fetch forward failed for row ID ", id));
   }
   auto *pool = segment_->uses_buffer_storage()
                    ? detail::GetParquetMemoryPool().get()
@@ -209,22 +193,20 @@ std::optional<bool> DocFilter::is_matched_by_forward_filter(uint64_t id) const {
   auto maybe_result = arrow::compute::ExecuteScalarExpression(
       *forward_filter_expr_, *exec_batch, &context);
   if (!maybe_result.ok()) {
-    error_.store(maybe_result.status().IsOutOfMemory()
-                     ? StatusCode::RESOURCE_EXHAUSTED
-                     : StatusCode::INTERNAL_ERROR,
-                 std::memory_order_relaxed);
-    LOG_ERROR("Execute scalar expression failed, id[%zu] err[%s]", (size_t)id,
-              maybe_result.status().ToString().c_str());
-    return std::nullopt;
+    const auto &status = maybe_result.status();
+    return tl::make_unexpected(Status(status.IsOutOfMemory()
+                                          ? StatusCode::RESOURCE_EXHAUSTED
+                                          : StatusCode::INTERNAL_ERROR,
+                                      status.ToString()));
   }
   arrow::Datum datum = maybe_result.MoveValueUnsafe();
   if (datum.is_scalar()) {
     const auto &scalar = datum.scalar_as<arrow::BooleanScalar>();
     return scalar.is_valid && scalar.value;
   }
-  LOG_ERROR("Datum is not scalar, id[%zu] type[%s]", (size_t)id,
-            datum.type()->ToString().c_str());
-  return std::nullopt;
+  return tl::make_unexpected(
+      Status::InternalError("Expected a scalar filter result for row ID ", id,
+                            ", got ", datum.type()->ToString()));
 }
 
 

@@ -325,9 +325,7 @@ class HnswContext : public IndexContext {
   //! HNSW algorithm while they already own the vector MemoryBlocks.
   inline dist_t batch_dist(node_id_t id) {
     IndexStorage::MemoryBlock vector_block;
-    if (ailego_unlikely(dc_.get_vector(id, vector_block) != 0)) {
-      return dc_.batch_dist(nullptr, nullptr);
-    }
+    CheckGraphStorage(dc_.get_vector(id, vector_block));
     const void *vector = vector_block.data();
     return dc_.batch_dist(
         vector, vector == nullptr ? nullptr : get_extra_values(vector));
@@ -338,11 +336,7 @@ class HnswContext : public IndexContext {
   inline bool try_batch_dist(node_id_t id, dist_t &distance,
                              bool skip_missing_vectors = false) {
     IndexStorage::MemoryBlock block;
-    if (ailego_unlikely(dc_.get_vector(id, block) != 0)) {
-      LOG_ERROR("Failed to get vector, id=%u", id);
-      dc_.set_error();
-      return false;
-    }
+    CheckGraphStorage(dc_.get_vector(id, block));
     const void *vector = block.data();
     if (ailego_unlikely(vector == nullptr && skip_missing_vectors)) {
       LOG_ERROR("Skip nullptr external vector, id=%u", id);
@@ -555,6 +549,7 @@ class HnswContext : public IndexContext {
 
   inline void clear() {
     search_heap_.clear();
+    group_topk_heaps_.clear();
     dc_.clear();
     if (ailego_unlikely(this->debugging())) {
       stats_get_neighbors_cnt_ = 0u;

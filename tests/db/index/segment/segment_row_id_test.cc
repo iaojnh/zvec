@@ -303,6 +303,30 @@ TEST_P(SegmentTest, DocCountDeleteFilterWithNonZeroGlobalDocID) {
 }
 
 
+TEST_P(SegmentTest, DeleteFilterReportsInvalidLocalRow) {
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, *schema_, 0, 100, id_map_, delete_store_, version_manager_,
+      options_, 0, 2);
+  ASSERT_NE(segment, nullptr);
+  ASSERT_TRUE(segment->Delete(100).ok());
+
+  auto filter = segment->get_filter();
+  ASSERT_NE(filter, nullptr);
+  auto deleted = filter->is_filtered_checked(0);
+  ASSERT_TRUE(deleted);
+  EXPECT_TRUE(*deleted);
+  auto live = filter->is_filtered_checked(1);
+  ASSERT_TRUE(live);
+  EXPECT_FALSE(*live);
+
+  for (uint64_t row_id : {uint64_t{2}, uint64_t{1} << 32}) {
+    auto missing = filter->is_filtered_checked(row_id);
+    ASSERT_FALSE(missing);
+    EXPECT_EQ(missing.error().code(), StatusCode::INVALID_ARGUMENT);
+  }
+}
+
+
 TEST_P(SegmentTest, MapGlobalDocIDsInPlacePreservesPadding) {
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 100, id_map_, delete_store_, version_manager_,

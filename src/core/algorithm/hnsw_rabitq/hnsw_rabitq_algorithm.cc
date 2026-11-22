@@ -113,9 +113,7 @@ void HnswRabitqAlgorithm::select_entry_point(level_t level,
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_vector())++;
     }
-    if (ailego_unlikely(ret != 0)) {
-      break;
-    }
+    CheckGraphStorage(ret);
 
     bool find_closer = false;
 
@@ -224,9 +222,7 @@ void HnswRabitqAlgorithm::search_neighbors(level_t level,
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_vector())++;
     }
-    if (ailego_unlikely(ret != 0)) {
-      break;
-    }
+    CheckGraphStorage(ret);
 
     // do prefetch
     static constexpr node_id_t BATCH_SIZE = 12;

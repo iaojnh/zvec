@@ -14,7 +14,6 @@
 
 #pragma once
 
-#include <atomic>
 #include <memory>
 #include <arrow/acero/api.h>
 #include <arrow/chunked_array.h>
@@ -28,7 +27,7 @@
 
 namespace zvec::sqlengine {
 
-class DocFilter : public IndexFilter {
+class DocFilter : public CheckedIndexFilter {
  public:
   using Ptr = std::shared_ptr<DocFilter>;
 
@@ -44,11 +43,7 @@ class DocFilter : public IndexFilter {
 
   Status compute_filter();
 
-  bool is_filtered(uint64_t id) const override;
-
-  // IndexFilter callbacks cannot return errors. Recall checks this after
-  // workers finish, so a failed forward lookup never publishes partial hits.
-  Status status() const;
+  Result<bool> is_filtered_checked(uint64_t id) const override;
 
   //! When invert cardinality <= \p ratio * doc_count, extract the ids and
   //! clear invert_filter_ so the caller drives evaluation by ids instead of
@@ -62,8 +57,8 @@ class DocFilter : public IndexFilter {
   bool empty() const;
 
  private:
-  std::optional<bool> get_forward_bit(uint64_t id) const;
-  std::optional<bool> is_matched_by_forward_filter(uint64_t id) const;
+  Result<bool> get_forward_bit(uint64_t id) const;
+  Result<bool> is_matched_by_forward_filter(uint64_t id) const;
 
  private:
   Segment::Ptr segment_;
@@ -78,7 +73,6 @@ class DocFilter : public IndexFilter {
   IndexFilter::Ptr invert_filter_{nullptr};
 
   std::shared_ptr<arrow::ChunkedArray> forward_bitmap_;
-  mutable std::atomic<StatusCode> error_{StatusCode::OK};
 };
 
 }  // namespace zvec::sqlengine

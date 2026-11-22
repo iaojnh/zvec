@@ -53,10 +53,7 @@ int VamanaAlgorithm<EntityType>::add_node(node_id_t id,
   // Set query to the new node's vector. Use reset_query (same as search path)
   // so that greedy_search works with the search-optimized distance kernel.
   IndexStorage::MemoryBlock query_block;
-  if (ailego_unlikely(entity_.get_vector(id, query_block) != 0)) {
-    LOG_ERROR("Failed to get vector for node %u", id);
-    return IndexError_ReadData;
-  }
+  CheckGraphStorage(entity_.get_vector(id, query_block));
   ctx->reset_query(query_block.data());
 
   int ret = greedy_search(entry_point, ctx, /*use_pool=*/false);
@@ -156,7 +153,9 @@ int VamanaAlgorithm<EntityType>::search(VamanaContext *ctx) const try {
     search_heap.reset<TopkHeap>(ef_search);
   }
 
-  return greedy_search(entry_point, ctx, /*use_pool=*/true);
+  const int ret = greedy_search(entry_point, ctx, /*use_pool=*/true);
+  if (ailego_unlikely(ret != 0)) search_heap.clear();
+  return ret;
 } catch (const GraphStorageError &error) {
   return error.code;
 } catch (const std::bad_alloc &) {
@@ -488,9 +487,8 @@ void dual_heap_greedy_search(const EntityType &entity, VamanaContext *ctx,
 
     // Batch fetch vectors using typed access (reuse pre-allocated buffer)
     neighbor_vec_blocks.clear();
-    int ret = entity.get_vector_typed(neighbor_ids.data(), unvisited_count,
-                                      neighbor_vec_blocks);
-    if (ailego_unlikely(ret != 0)) break;
+    CheckGraphStorage(entity.get_vector_typed(
+        neighbor_ids.data(), unvisited_count, neighbor_vec_blocks));
 
     for (uint32_t i = 0; i < std::min(prefetch_offset, unvisited_count); ++i) {
       const void *vector = neighbor_vec_blocks[i].data();

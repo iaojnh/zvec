@@ -5826,6 +5826,124 @@ TEST_F(CollectionTest, Feature_MultiQuery_WithOutputFields) {
   EXPECT_EQ(StatusCode::INVALID_ARGUMENT, result.error().code());
 }
 
+TEST_F(CollectionTest, MultiQueryOmitsEmptySparseVector) {
+  using SparseVector = std::pair<std::vector<uint32_t>, std::vector<float>>;
+  auto schema = make_schema();
+  ASSERT_TRUE(schema.add_field(std::make_shared<FieldSchema>(
+      "dense", DataType::VECTOR_FP32, 2, false,
+      std::make_shared<FlatIndexParams>(MetricType::L2))).ok());
+  ASSERT_TRUE(schema.add_field(std::make_shared<FieldSchema>(
+      "sparse", DataType::SPARSE_VECTOR_FP32, 0, true,
+      std::make_shared<FlatIndexParams>(MetricType::IP))).ok());
+  const std::vector<float> vector{1.0f, 2.0f};
+  const SparseVector sparse{{3}, {4.0f}};
+  SearchQuery single;
+  single.target_.field_name_ = "dense";
+  single.target_.set_vector(std::string(
+      reinterpret_cast<const char *>(vector.data()), sizeof(float) * 2));
+  single.topk_ = 2;
+  single.include_vector_ = true;
+  MultiQuery hybrid;
+  hybrid.topk = 2;
+  hybrid.include_vector = true;
+  hybrid.rerank = reranker::RrfParams{60};
+  hybrid.queries = {{single.target_, 2}, {single.target_, 2}};
+
+  for (bool mmap : {true, false}) {
+    SCOPED_TRACE(mmap);
+    options_.enable_mmap_ = mmap;
+    ASSERT_NO_FATAL_FAILURE(create(schema));
+    std::vector<Doc> docs{make_doc("empty", 0), make_doc("present", 1)};
+    for (auto &doc : docs) doc.set("dense", vector);
+    docs[0].set("sparse", SparseVector{});
+    docs[1].set("sparse", sparse);
+    ASSERT_NO_FATAL_FAILURE(expect_write(collection_->insert(docs), 2));
+
+    for (bool persisted : {false, true}) {
+      SCOPED_TRACE(persisted);
+      if (persisted) ASSERT_TRUE(collection_->flush().ok());
+      auto control = collection_->query(single);
+      ASSERT_TRUE(control.has_value()) << control.error().message();
+      auto result = collection_->query(hybrid);
+      ASSERT_TRUE(result.has_value()) << result.error().message();
+      ASSERT_EQ(result->size(), docs.size());
+      ASSERT_EQ(control->size(), docs.size());
+      for (const auto &doc : *result) {
+        EXPECT_TRUE(doc->has("dense"));
+        EXPECT_TRUE(doc->has("value"));
+        const bool has_sparse = doc->pk() == "present";
+        const auto same_row = std::find_if(
+            control->begin(), control->end(),
+            [&](const Doc::Ptr &row) { return row->pk() == doc->pk(); });
+        ASSERT_NE(same_row, control->end());
+        EXPECT_EQ((*same_row)->has("sparse"), doc->has("sparse"));
+        EXPECT_EQ(has_sparse, doc->has("sparse"));
+        if (has_sparse) EXPECT_EQ(sparse, doc->get_ref<SparseVector>("sparse"));
+      }
+    }
+
+    ASSERT_TRUE(collection_->destroy().ok());
+    collection_.reset();
+  }
+}
+
+TEST_F(CollectionTest, MultiQueryReportsReverseIdAdmissionFailure) {
+  auto schema = make_schema();
+  ASSERT_TRUE(schema.add_field(std::make_shared<FieldSchema>(
+      "dense", DataType::VECTOR_FP32, 2, false,
+      std::make_shared<FlatIndexParams>(MetricType::L2))).ok());
+  // mmap keeps recall payloads outside the managed pool. The compacted
+  // segment still reads its non-contiguous ID mapping via BufferStorage.
+  options_.enable_mmap_ = true;
+  ASSERT_NO_FATAL_FAILURE(create(schema));
+  const std::vector<float> vector{1.0f, 2.0f};
+  std::vector<Doc> docs{make_doc("first", 0), make_doc("deleted", 1),
+                        make_doc("last", 2)};
+  for (auto &doc : docs) doc.set("dense", vector);
+  ASSERT_NO_FATAL_FAILURE(expect_write(collection_->insert(docs), 3));
+  ASSERT_NO_FATAL_FAILURE(expect_write(collection_->delete_({"deleted"}), 1));
+  auto optimized = collection_->optimize();
+  ASSERT_TRUE(optimized.ok()) << optimized.message();
+
+  SubQuery sub;
+  sub.target_.field_name_ = "dense";
+  sub.target_.set_vector(std::string(
+      reinterpret_cast<const char *>(vector.data()), sizeof(float) * 2));
+  sub.num_candidates_ = 1;
+  MultiQuery query;
+  query.topk = 1;
+  query.queries = {sub, sub};
+  query.rerank = reranker::RrfParams{60};
+
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(3);
+  while (pool.stats().page_used && std::chrono::steady_clock::now() < deadline) {
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(512);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(0u, pool.stats().page_used);
+  const size_t spare = ailego::kVectorPageSize / 8;
+  {
+    ailego::MemoryReservation held;
+    for (size_t attempt = 0; attempt < 8; ++attempt) {
+      const auto available = pool.available();
+      if (available <= spare) break;
+      // Admission may reclaim other caches while making this reservation.
+      held.add(available - spare);
+    }
+    ASSERT_LT(pool.available(), ailego::kVectorPageSize);
+    auto denied = collection_->query(query);
+    ASSERT_FALSE(denied.has_value());
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
+    EXPECT_NE(std::string::npos,
+              denied.error().message().find("document ID range"));
+  }
+  auto result = collection_->query(query);
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(1u, result->size());
+}
+
 TEST_F(CollectionTest, Feature_MultiQuery_CallbackReranker) {
   FileHelper::RemoveDirectory(col_path);
 

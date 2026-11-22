@@ -836,7 +836,7 @@ inline int HnswStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
           batch_reads, count))) {
     LOG_ERROR("Batch read vectors failed, count=%u, read size=%zu", count,
               read_size);
-    return IndexError_ReadData;
+    return batch_reads[0].segment->read_error();
   }
   return 0;
 }

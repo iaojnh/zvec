@@ -14,6 +14,7 @@
 #pragma once
 
 #include <zvec/core/framework/index_meta.h>
+#include "utility/graph_storage_error.h"
 #include "vamana_entity.h"
 
 namespace zvec {
@@ -96,11 +97,7 @@ class VamanaDistCalculator {
   inline dist_t dist(node_id_t id) {
     compare_cnt_++;
     IndexStorage::MemoryBlock feat_block;
-    if (ailego_unlikely(entity_->get_vector(id, feat_block) != 0)) {
-      LOG_ERROR("Get nullptr vector, id=%u", id);
-      error_ = true;
-      return 0.0f;
-    }
+    CheckGraphStorage(entity_->get_vector(id, feat_block));
     return dist(feat_block.data(), query_);
   }
 
@@ -108,12 +105,8 @@ class VamanaDistCalculator {
     compare_cnt_++;
     IndexStorage::MemoryBlock feat_block;
     IndexStorage::MemoryBlock query_block;
-    if (ailego_unlikely(entity_->get_vector(lhs, feat_block) != 0 ||
-                        entity_->get_vector(rhs, query_block) != 0)) {
-      LOG_ERROR("Get nullptr vector");
-      error_ = true;
-      return 0.0f;
-    }
+    CheckGraphStorage(entity_->get_vector(lhs, feat_block));
+    CheckGraphStorage(entity_->get_vector(rhs, query_block));
     return dist(feat_block.data(), query_block.data());
   }
 
@@ -128,11 +121,7 @@ class VamanaDistCalculator {
   inline dist_t batch_dist(node_id_t id) {
     compare_cnt_++;
     IndexStorage::MemoryBlock feat_block;
-    if (ailego_unlikely(entity_->get_vector(id, feat_block) != 0)) {
-      LOG_ERROR("Get nullptr vector, id=%u", id);
-      error_ = true;
-      return 0.0f;
-    }
+    CheckGraphStorage(entity_->get_vector(id, feat_block));
     const void *feat = feat_block.data();
     dist_t score = 0;
     if (entity_->extra_values_size() != 0) {

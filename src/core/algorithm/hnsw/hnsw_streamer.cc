@@ -1253,6 +1253,10 @@ int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
   }
 
   ctx->clear();
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) ctx->clear();
+  });
   //! search always uses the vectors stored in the entity
   bind_search_dist_space(ctx);
   ctx->resize_results(count);
@@ -1267,7 +1271,9 @@ int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
                         storage_mode() == HnswStorageMode::kExternal)) {
       // Missing graph nodes can include the entry point or disconnect the
       // route to valid neighbors. Retry the batch against available records.
-      return search_bf_impl(queries, qmeta, count, context);
+      ret = search_bf_impl(queries, qmeta, count, context);
+      complete = ret == 0;
+      return ret;
     }
     if (ailego_unlikely(ret != 0)) {
       LOG_ERROR("Hnsw searcher fast search failed");
@@ -1283,6 +1289,7 @@ int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
     return IndexError_Runtime;
   }
 
+  complete = true;
   return 0;
 } catch (const GraphStorageError &error) {
   return error.code;
@@ -1406,6 +1413,10 @@ int HnswStreamer::search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
   }
 
   ctx->clear();
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) ctx->clear();
+  });
   //! search always uses the vectors stored in the entity
   bind_search_dist_space(ctx);
   ctx->resize_results(count);
@@ -1486,6 +1497,7 @@ int HnswStreamer::search_bf_impl(const void *query, const IndexQueryMeta &qmeta,
     return IndexError_Runtime;
   }
 
+  complete = true;
   return 0;
 } catch (const GraphStorageError &error) {
   return error.code;

@@ -88,6 +88,7 @@ int HnswSparseAlgorithm::add_node(node_id_t id, level_t level,
 
   return 0;
 } catch (const GraphStorageError &error) {
+  ctx->release_build_workspace();
   return error.code;
 } catch (const std::bad_alloc &) {
   ctx->release_build_workspace();
@@ -95,6 +96,13 @@ int HnswSparseAlgorithm::add_node(node_id_t id, level_t level,
 }
 
 int HnswSparseAlgorithm::search(HnswSparseContext *ctx) const try {
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) {
+      ctx->topk_heap().clear();
+      ctx->group_topk_heaps().clear();
+    }
+  });
   spin_lock_.lock();
   auto max_level = entity_.cur_max_level();
   auto entry_point = entity_.entry_point();
@@ -114,14 +122,10 @@ int HnswSparseAlgorithm::search(HnswSparseContext *ctx) const try {
   search_neighbors(0, &entry_point, &dist, topk_heap, ctx);
 
   if (ctx->group_by_search()) {
-    try {
-      expand_neighbors_by_group(topk_heap, ctx);
-    } catch (const std::bad_alloc &) {
-      ctx->group_topk_heaps().clear();
-      return IndexError_NoMemory;
-    }
+    expand_neighbors_by_group(topk_heap, ctx);
   }
 
+  complete = true;
   return 0;
 } catch (const GraphStorageError &error) {
   return error.code;
@@ -151,9 +155,7 @@ void HnswSparseAlgorithm::select_entry_point(level_t level,
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_vector())++;
     }
-    if (ailego_unlikely(ret != 0)) {
-      break;
-    }
+    CheckGraphStorage(ret);
     bool find_closer = false;
     for (uint32_t i = 0; i < size; ++i) {
       dist_t cur_dist = dc.dist(neighbor_block_vecs[i].data());
@@ -252,9 +254,7 @@ void HnswSparseAlgorithm::search_neighbors(level_t level,
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_vector())++;
     }
-    if (ailego_unlikely(ret != 0)) {
-      break;
-    }
+    CheckGraphStorage(ret);
 
     static constexpr node_id_t PREFETCH_STEP = 2;
     static constexpr node_id_t SPARSE_PREFETCH_STEP = 1;
@@ -382,9 +382,7 @@ void HnswSparseAlgorithm::expand_neighbors_by_group(
       if (ailego_unlikely(ctx->debugging())) {
         (*ctx->mutable_stats_get_vector())++;
       }
-      if (ailego_unlikely(ret != 0)) {
-        break;
-      }
+      CheckGraphStorage(ret);
 
       static constexpr node_id_t PREFETCH_STEP = 2;
       for (uint32_t i = 0; i < size; ++i) {

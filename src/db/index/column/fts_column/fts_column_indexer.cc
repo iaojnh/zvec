@@ -284,6 +284,8 @@ Result<std::vector<FtsResult>> FtsColumnIndexer::search(
   return results;
 } catch (const FtsReadError &error) {
   return tl::make_unexpected(error.status());
+} catch (const CheckedIndexFilter::Error &error) {
+  return tl::make_unexpected(error.status());
 } catch (const std::bad_alloc &) {
   return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
                                     "Insufficient full-text query workspace"));

@@ -226,6 +226,133 @@ TEST_F(HnswStreamerTest, BufferPruningUsesOriginalProviderVectors) {
   ASSERT_EQ(0, storage->close());
 }
 
+TEST_F(HnswStreamerTest, BufferSearchPropagatesBatchReadFailure) {
+  class NodeSegment : public IndexStorage::Segment {
+   public:
+    NodeSegment(Pointer segment, size_t &failed_reads, bool &fail_reads)
+        : segment_(std::move(segment)),
+          failed_reads_(failed_reads),
+          fail_reads_(fail_reads) {}
+
+    size_t data_size() const override { return segment_->data_size(); }
+    uint32_t data_crc() const override { return segment_->data_crc(); }
+    size_t padding_size() const override { return segment_->padding_size(); }
+    size_t capacity() const override { return segment_->capacity(); }
+    size_t fetch(size_t offset, void *data, size_t length) const override {
+      return segment_->fetch(offset, data, length);
+    }
+    size_t read(size_t offset, IndexStorage::MemoryBlock &block,
+                size_t length) override {
+      return segment_->read(offset, block, length);
+    }
+    size_t read_borrowed_immutable(size_t offset,
+                                   IndexStorage::MemoryBlock &block,
+                                   size_t length) override {
+      return segment_->read_borrowed_immutable(offset, block, length);
+    }
+    bool prefer_borrowed_batch_for(size_t) const override { return true; }
+    bool read_borrowed_batch_immutable(BorrowedRead *reads,
+                                       size_t count) override {
+      if (fail_reads_) {
+        ++failed_reads_;
+        return false;
+      }
+      return IndexStorage::Segment::read_borrowed_batch_immutable(reads, count);
+    }
+    int read_error() const override {
+      return fail_reads_ ? IndexError_NoMemory : segment_->read_error();
+    }
+    size_t write(size_t offset, const void *data, size_t length) override {
+      return segment_->write(offset, data, length);
+    }
+    size_t resize(size_t length) override { return segment_->resize(length); }
+    void update_data_crc(uint32_t crc) override { segment_->update_data_crc(crc); }
+    Pointer clone() override {
+      return std::make_shared<NodeSegment>(segment_->clone(), failed_reads_,
+                                           fail_reads_);
+    }
+
+   private:
+    Pointer segment_;
+    size_t &failed_reads_;
+    bool &fail_reads_;
+  };
+
+  class Entity : public HnswBufferPoolStreamerEntity {
+   public:
+    using HnswBufferPoolStreamerEntity::HnswBufferPoolStreamerEntity;
+
+    void intercept_batch_reads(size_t &failed_reads, bool &fail_reads) {
+      for (auto &chunk : node_chunks_) {
+        chunk = std::make_shared<NodeSegment>(chunk, failed_reads, fail_reads);
+      }
+    }
+  };
+
+  PoolPayloadBudget::get_instance().init(64UL * 1024UL * 1024UL);
+  auto storage = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->init(Params()));
+  // Writable storage leaves the resident-vector shortcut disabled.
+  ASSERT_EQ(0, storage->open(dir_ + "BatchReadFailure", true));
+
+  size_t failed_reads = 0;
+  bool fail_reads = true;
+  IndexStreamer::Stats stats;
+  auto entity = std::make_shared<Entity>(stats);
+  entity->set_vector_size(dim * sizeof(float));
+  entity->set_l0_neighbor_cnt(2);
+  entity->set_upper_neighbor_cnt(2);
+  entity->set_scaling_factor(5);
+  ASSERT_EQ(0, entity->init(4));
+  ASSERT_EQ(0, entity->open(storage, 8UL * 1024UL * 1024UL, false));
+  NumericalVector<float> query(dim);
+  for (node_id_t id = 0; id != 2; ++id) {
+    for (size_t d = 0; d != dim; ++d) query[d] = static_cast<float>(id);
+    node_id_t inserted;
+    ASSERT_EQ(0, entity->add_vector(0, 100 + id, query.data(), &inserted));
+    ASSERT_EQ(id, inserted);
+  }
+  ASSERT_EQ(0, entity->update_neighbors(0, 0, {{1, 0.0f}}));
+  entity->update_ep_and_level(0, 0);
+  entity->intercept_batch_reads(failed_reads, fail_reads);
+
+  auto metric = IndexFactory::CreateMetric("SquaredEuclidean");
+  ASSERT_NE(nullptr, metric);
+  ASSERT_EQ(0, metric->init(*index_meta_ptr_, Params()));
+  HnswAlgorithm<HnswBufferPoolStreamerEntity> algorithm(*entity);
+  for (bool filtered : {false, true}) {
+    SCOPED_TRACE(filtered);
+    HnswContext ctx(dim, metric, entity->clone());
+    ctx.set_min_scan_limit(4);
+    ctx.set_max_scan_limit(4);
+    ASSERT_EQ(0, ctx.init(HnswContext::kStreamerContext));
+    ctx.set_topk(1);
+    ctx.reset_query_raw(query.data(), *index_meta_ptr_);
+    if (filtered) ctx.set_filter([](uint64_t) { return false; });
+
+    fail_reads = true;
+    const size_t initial_failures = failed_reads;
+    EXPECT_EQ(IndexError_NoMemory, algorithm.search(&ctx));
+    EXPECT_EQ(initial_failures + 1, failed_reads);
+    EXPECT_EQ(0U, ctx.search_heap().size());
+
+    fail_reads = false;
+    EXPECT_EQ(0, algorithm.search(&ctx));
+    size_t results = 0;
+    ctx.search_heap().for_each_sorted(1, [&](uint32_t id, float distance) {
+      ++results;
+      EXPECT_EQ(1U, id);
+      EXPECT_FLOAT_EQ(0.0f, distance);
+      return true;
+    });
+    EXPECT_EQ(1U, results);
+  }
+
+  ASSERT_EQ(0, entity->close());
+  ASSERT_EQ(0, storage->close());
+}
+
 TEST_F(HnswStreamerTest, BufferSearchDispatchReusesContextAcrossVisitModes) {
   PoolPayloadBudget::get_instance().init(2 * 1024UL * 1024UL * 1024UL);
   constexpr uint32_t kDocCount = 128;

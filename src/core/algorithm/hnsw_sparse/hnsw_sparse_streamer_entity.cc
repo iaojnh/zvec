@@ -240,15 +240,15 @@ int HnswSparseStreamerEntity::get_sparse_data(
 
 //! Get sparse data from id
 const void *HnswSparseStreamerEntity::get_sparse_data(node_id_t id) const {
-  auto sparse_data = get_sparse_data_from_vector(get_vector_meta(id));
-
-  return sparse_data.first;
+  const void *meta = get_vector_meta(id);
+  return meta == nullptr ? nullptr : get_sparse_data_from_vector(meta).first;
 }
 
 int HnswSparseStreamerEntity::get_sparse_data(
     node_id_t id, IndexStorage::MemoryBlock &block) const {
   IndexStorage::MemoryBlock meta_block;
-  get_vector_meta(id, meta_block);
+  const int ret = get_vector_meta(id, meta_block);
+  if (ret != 0) return ret;
   int sparse_length = 0;
   return get_sparse_data_from_vector(meta_block.data(), block, sparse_length);
 }
@@ -289,7 +289,7 @@ int HnswSparseStreamerEntity::get_sparse_data_from_vector(
     if (ailego_unlikely(ret != 0)) {
       LOG_ERROR("Get nullptr sparse, offset=%zu, len=%u", (size_t)offset,
                 sparse_vector_len);
-      return IndexError_ReadData;
+      return ret;
     }
     sparse_length = sparse_vector_len;
   }
@@ -990,7 +990,8 @@ int HnswSparseStreamerEntity::get_sparse_vector_by_id(
     node_id_t id, uint32_t *sparse_count, std::string *sparse_indices_buffer,
     std::string *sparse_values_buffer) const {
   IndexStorage::MemoryBlock block;
-  get_sparse_data(id, block);
+  const int ret = get_sparse_data(id, block);
+  if (ret != 0) return ret;
   const void *sparse_data = block.data();
   if (sparse_data == nullptr) {
     return IndexError_InvalidValue;

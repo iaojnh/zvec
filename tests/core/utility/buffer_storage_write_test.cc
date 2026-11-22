@@ -366,6 +366,82 @@ TEST_F(BufferStorageWriteTest, BudgetRefusedReopenPreservesPublishedState) {
   EXPECT_EQ(0, storage->close());
 }
 
+TEST_F(BufferStorageWriteTest, SameFileReopenKeepsExistingSegmentAndBorrow) {
+  auto storage = open_writable();
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->append("payload", 4096));
+  auto retained = storage->get("payload");
+  ASSERT_NE(nullptr, retained);
+  constexpr char value[] = "retained segment";
+  ASSERT_EQ(sizeof(value), retained->write(0, value, sizeof(value)));
+  retained->update_data_crc(123);
+  const auto offset = retained->data_offset();
+  IndexStorage::MemoryBlock before_reopen;
+  ASSERT_EQ(sizeof(value), retained->read_borrowed_immutable(
+                              0, before_reopen, sizeof(value)));
+  ASSERT_EQ(IndexStorage::MemoryBlock::MBT_BUFFERPOOL, before_reopen.type_);
+  EXPECT_EQ(nullptr, before_reopen.buffer_pool_handle_owner_);
+
+  ASSERT_EQ(0, storage->open(file_path_, false));
+  EXPECT_EQ(offset, retained->data_offset());
+  EXPECT_EQ(sizeof(value), retained->data_size());
+  EXPECT_EQ(123u, retained->data_crc());
+  char fetched[sizeof(value)]{};
+  ASSERT_EQ(sizeof(fetched), retained->fetch(0, fetched, sizeof(fetched)));
+  EXPECT_STREQ(value, fetched);
+  EXPECT_STREQ(value, static_cast<const char *>(before_reopen.data()));
+  IndexStorage::MemoryBlock after_reopen;
+  ASSERT_EQ(sizeof(value),
+            retained->read_borrowed(0, after_reopen, sizeof(value)));
+  EXPECT_EQ(IndexStorage::MemoryBlock::MBT_BUFFERPOOL, after_reopen.type_);
+  EXPECT_NE(nullptr, after_reopen.buffer_pool_handle_owner_);
+  EXPECT_STREQ(value, static_cast<const char *>(after_reopen.data()));
+  before_reopen.reset();
+  after_reopen.reset();
+  EXPECT_EQ(0, storage->close());
+}
+
+TEST_F(BufferStorageWriteTest, ReplacementInvalidatesRetainedSegment) {
+  auto storage = open_writable();
+  ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->append("payload", 4096));
+  auto stale = storage->get("payload");
+  ASSERT_NE(nullptr, stale);
+  constexpr char old_value[] = "old file";
+  ASSERT_EQ(sizeof(old_value), stale->write(0, old_value, sizeof(old_value)));
+
+  const std::string replacement_path = file_path_ + "-replacement";
+  AILEGO_DEFER([&] { ailego::File::Delete(replacement_path); });
+  auto replacement = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_NE(nullptr, replacement);
+  ASSERT_EQ(0, replacement->init(ailego::Params{}));
+  ASSERT_EQ(0, replacement->open(replacement_path, true));
+  ASSERT_EQ(0, replacement->append("payload", 4096));
+  auto new_segment = replacement->get("payload");
+  ASSERT_NE(nullptr, new_segment);
+  constexpr char new_value[] = "replacement file";
+  ASSERT_EQ(sizeof(new_value),
+            new_segment->write(0, new_value, sizeof(new_value)));
+  new_segment.reset();
+  ASSERT_EQ(0, replacement->close());
+
+  ASSERT_EQ(0, storage->open(replacement_path, false));
+  ASSERT_EQ(0u, stale->write(0, old_value, sizeof(old_value)));
+  EXPECT_EQ(0u, stale->data_size());
+  EXPECT_EQ(nullptr, stale->clone());
+  IndexStorage::MemoryBlock block;
+  EXPECT_EQ(0u, stale->read(0, block, sizeof(old_value)));
+  EXPECT_EQ(nullptr, block.data());
+  auto current = storage->get("payload");
+  ASSERT_NE(nullptr, current);
+  char actual[sizeof(new_value)]{};
+  ASSERT_EQ(sizeof(actual), current->fetch(0, actual, sizeof(actual)));
+  EXPECT_STREQ(new_value, actual);
+  current.reset();
+  storage.reset();
+  EXPECT_EQ(0u, stale->write(0, old_value, sizeof(old_value)));
+}
+
 TEST_F(BufferStorageWriteTest, PreparedWritesCommitAcrossSegmentsAtFullBudget) {
   auto storage = open_writable();
   ASSERT_NE(nullptr, storage);

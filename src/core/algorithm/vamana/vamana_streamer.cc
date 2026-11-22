@@ -814,6 +814,10 @@ int VamanaStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
   }
 
   ctx->clear();
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) ctx->clear();
+  });
   ctx->update_dist_calculator_distance(search_distance_,
                                        search_batch_distance_);
   ctx->resize_results(count);
@@ -833,6 +837,7 @@ int VamanaStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
   }
 
   if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
+  complete = true;
   return 0;
 } catch (const GraphStorageError &error) {
   return error.code;

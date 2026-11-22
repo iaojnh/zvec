@@ -718,6 +718,10 @@ int HnswSparseStreamer::search_impl(
   }
 
   ctx->clear();
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) ctx->clear();
+  });
   ctx->update_dist_caculator_distance(search_distance_);
   ctx->resize_results(count);
   if (!ctx->check_need_adjuct_ctx(entity_.doc_cnt()))
@@ -778,6 +782,7 @@ int HnswSparseStreamer::search_impl(
     return IndexError_Runtime;
   }
 
+  complete = true;
   return 0;
 } catch (const GraphStorageError &error) {
   return error.code;
