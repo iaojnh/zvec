@@ -1050,17 +1050,36 @@ char *VectorPageTable::set_block_acquired(block_id_t block_id, char *buffer,
   }
 }
 
-VecBufferPool::VecBufferPool(const std::string &filename, bool writable) {
+VecBufferPool::VecBufferPool(const std::string &filename, bool writable)
+    : VecBufferPool(filename, writable, false) {}
+
+VecBufferPool::VecBufferPool(const std::string &filename, bool writable,
+                             bool share_delete_for_publish) {
   file_name_ = filename;
   writable_ = writable;
   page_table_.set_adaptive_priority(!writable_);
 #if defined(_MSC_VER)
   int flags = writable_ ? (O_RDWR | _O_BINARY) : (O_RDONLY | _O_BINARY);
   const std::wstring wide_filename = FileHelper::Utf8ToWide(filename);
-  fd_ = wide_filename.empty() ? -1 : _wopen(wide_filename.c_str(), flags, 0644);
-  meta_fd_ =
-      wide_filename.empty() ? -1 : _wopen(wide_filename.c_str(), flags, 0644);
+  const auto open_descriptor = [&]() {
+    if (wide_filename.empty()) return -1;
+    if (!share_delete_for_publish)
+      return _wopen(wide_filename.c_str(), flags, 0644);
+    const HANDLE handle =
+        ::CreateFileW(wide_filename.c_str(),
+                      writable_ ? GENERIC_READ | GENERIC_WRITE : GENERIC_READ,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return -1;
+    const int descriptor =
+        _open_osfhandle(reinterpret_cast<intptr_t>(handle), flags);
+    if (descriptor < 0) ::CloseHandle(handle);
+    return descriptor;
+  };
+  fd_ = open_descriptor();
+  meta_fd_ = open_descriptor();
 #else
+  (void)share_delete_for_publish;
   int base_flags = writable_ ? O_RDWR : O_RDONLY;
   // Buffered channel for unaligned metadata I/O.
   meta_fd_ = ::open(filename.c_str(), base_flags, 0644);

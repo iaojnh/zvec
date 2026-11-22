@@ -600,6 +600,8 @@ class ZVEC_AILEGO_API VecBufferPool {
                                               bool writable = false);
 
   VecBufferPool(const std::string &filename, bool writable = false);
+  VecBufferPool(const std::string &filename, bool writable,
+                bool share_delete_for_publish);
   ~VecBufferPool();
 
   int init();

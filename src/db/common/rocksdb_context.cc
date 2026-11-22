@@ -58,8 +58,8 @@ ReserveRocksMetadata(size_t columns) try {
 }
 }  // namespace
 
-RocksdbContext::WriteAdmission::WriteAdmission() {
-  if (admitted_write_depth == 0) {
+RocksdbContext::WriteAdmission::WriteAdmission(Purpose purpose) {
+  if (admitted_write_depth == 0 && purpose == Purpose::kMutation) {
     const auto manager =
         GlobalResource::Instance().rocksdb_write_buffer_manager();
     if (manager && manager->enabled() && manager->IsStallThresholdExceeded())

@@ -176,6 +176,22 @@ TEST_F(BufferStorageWriteTest, ExplicitOpenRequiresImplementationSupport) {
   EXPECT_FALSE(ailego::File::IsExist(file_path_));
 }
 
+TEST_F(BufferStorageWriteTest, NewIdentityBelongsToThePublishedFile) {
+  for (const auto *backend : {"MMapFileStorage", "BufferStorage"}) {
+    SCOPED_TRACE(backend);
+    const auto path = file_path_ + backend;
+    AILEGO_DEFER([&] { ailego::File::Delete(path); });
+    auto storage = IndexFactory::CreateStorage(backend);
+    ASSERT_NE(nullptr, storage);
+    ASSERT_EQ(0, storage->init(ailego::Params{}));
+    ailego::File::Identity created;
+    EXPECT_EQ(0, storage->open(
+                     path, IndexStorage::OpenOptions{true, false, &created}));
+    EXPECT_TRUE(created == ailego::File::IdentifyPath(path));
+    EXPECT_EQ(0, storage->close());
+  }
+}
+
 TEST_F(BufferStorageWriteTest, WritableReopenNeedsCacheAndAllowsRetry) {
   {
     auto storage = open_writable();

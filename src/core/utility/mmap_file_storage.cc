@@ -243,12 +243,10 @@ class MMapFileStorage : public IndexStorage {
       }
     });
     if (!ailego::File::IsExist(path) && options.create_if_missing) {
-#if !defined(_WIN32) && !defined(_WIN64)
       if (ailego::StagedPath::supported()) {
         pending = std::make_unique<ailego::StagedPath>();
         if (!pending->prepare(path)) return IndexError_CreateFile;
       }
-#endif
       if (!pending) {
         const size_t last_slash = path.rfind('/');
         if (last_slash != std::string::npos) {
@@ -273,11 +271,13 @@ class MMapFileStorage : public IndexStorage {
     if (ret != 0) return ret;
     staged_file_ = std::move(pending);
     if (!options.defer_publication) {
+      const bool staged = static_cast<bool>(staged_file_);
       ret = publish_creation();
       if (ret != 0) {
         close_index();
         return ret;
       }
+      if (staged) created_file = mapping_.file_identity();
     }
     opened = true;
     if (options.created_file) *options.created_file = created_file;
@@ -286,10 +286,12 @@ class MMapFileStorage : public IndexStorage {
 
   int publish_creation() override {
     if (!staged_file_) return 0;
+    const bool was_dirty = is_dirty();
     const int ret = flush_index();
     if (ret != 0) return ret;
     if (!staged_file_->publish()) return IndexError_CreateFile;
     staged_file_.reset();
+    index_dirty_ = was_dirty;
     return 0;
   }
 

@@ -71,7 +71,9 @@ struct RocksdbContext {
   // Writes on that thread then finish the admitted row as one unit.
   class WriteAdmission {
    public:
-    WriteAdmission();
+    enum class Purpose { kMutation, kFlushMetadata };
+
+    explicit WriteAdmission(Purpose purpose = Purpose::kMutation);
     ~WriteAdmission();
     WriteAdmission(const WriteAdmission &) = delete;
     WriteAdmission &operator=(const WriteAdmission &) = delete;

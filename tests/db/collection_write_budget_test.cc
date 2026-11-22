@@ -124,6 +124,33 @@ TEST_F(CollectionWriteBudgetTest, FailedMmapCreateCanRetryAtTheSamePath) {
   EXPECT_TRUE(reopened.value()->close().ok());
 }
 
+TEST_F(CollectionWriteBudgetTest, PublishedCreateCanRetryFinalAttachment) {
+  if (!ailego::StagedPath::supported()) GTEST_SKIP();
+  const auto collection_path = path("published_create");
+  const auto marker =
+      ailego::FileHelper::PathJoin(collection_path, ".zvec-create-pending");
+  const CollectionOptions options{false, true, kMiB};
+  {
+    auto created = Collection::CreateAndOpen(collection_path, schema(), options);
+    ASSERT_TRUE(created.has_value()) << created.error().message();
+    ASSERT_TRUE(created.value()->close().ok());
+    ailego::File marker_file;
+    ASSERT_TRUE(marker_file.create_exclusive(marker.c_str()));
+  }
+  const CollectionSchema other("wrong_schema");
+  auto rejected = Collection::CreateAndOpen(collection_path, other, options);
+  ASSERT_FALSE(rejected.has_value());
+  EXPECT_EQ(StatusCode::INVALID_ARGUMENT, rejected.error().code());
+  EXPECT_TRUE(ailego::File::IsExist(marker));
+
+  auto retried = Collection::CreateAndOpen(collection_path, schema(), options);
+  ASSERT_TRUE(retried.has_value()) << retried.error().message();
+  EXPECT_FALSE(ailego::File::IsExist(marker));
+  auto competing = Collection::Open(collection_path, options);
+  EXPECT_FALSE(competing.has_value());
+  EXPECT_TRUE(retried.value()->close().ok());
+}
+
 TEST_F(CollectionWriteBudgetTest, LegacyUpsertReplayIgnoresAnAheadIdMap) {
   const CollectionOptions options{false, true, kMiB};
   for (const bool sealed : {false, true}) {

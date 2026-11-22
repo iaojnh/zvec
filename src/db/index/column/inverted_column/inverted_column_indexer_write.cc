@@ -193,6 +193,8 @@ Status InvertedColumnIndexer::flush_special_values() {
     return Status::PermissionDenied();
   }
 
+  RocksdbContext::WriteAdmission metadata(
+      RocksdbContext::WriteAdmission::Purpose::kFlushMetadata);
   std::string value;
   if (null_bitmap_.cardinality() != 0) {
     if (!null_bitmap_.serialize(&value).ok()) {

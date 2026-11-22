@@ -677,6 +677,8 @@ Result<void> FtsColumnIndexer::flush() {
     return {};
   }
 
+  RocksdbContext::WriteAdmission metadata(
+      RocksdbContext::WriteAdmission::Purpose::kFlushMetadata);
   // Write total_docs and total_tokens to $SEGMENT_STAT CF.
   // Use acquire ordering so we see all inserts that happened before flush().
   const uint64_t snapshot_total_docs =

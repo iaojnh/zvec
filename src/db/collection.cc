@@ -416,20 +416,77 @@ Result<Collection::Ptr> Collection::CreateAndOpen(
     const std::string &path, const CollectionSchema &schema,
     const CollectionOptions &options) {
   auto collection = std::make_shared<CollectionImpl>(path, schema);
+  const auto marker_path = [](const std::string &root) {
+    return ailego::FileHelper::PathJoin(root, ".zvec-create-pending");
+  };
+  const auto marker = marker_path(path);
+  const auto attach = [&](ailego::File lock,
+                          bool retry) -> Result<Collection::Ptr> {
+    auto opened = std::make_shared<CollectionImpl>(path);
+    opened->options_ = options;
+    opened->lock_file_ = std::move(lock);
+    if (retry) {
+      auto s = opened->acquire_file_lock(false);
+      CHECK_RETURN_STATUS_EXPECTED(s);
+      if (!ailego::File::IsExist(marker)) {
+        return tl::make_unexpected(
+            Status::InvalidArgument("Collection already exists: ", path));
+      }
+      if (GlobalResource::Instance().initialize() != 0) {
+        return tl::make_unexpected(
+            Status::InternalError("Failed to initialize shared memory budget"));
+      }
+      auto version = VersionManager::Recovery(path);
+      if (!version) return tl::make_unexpected(version.error());
+      const auto stored = (*version)->get_current_version();
+      if (stored.schema() != *collection->schema_ ||
+          stored.schema().max_doc_count_per_segment() !=
+              collection->schema_->max_doc_count_per_segment() ||
+          stored.enable_mmap() != options.enable_mmap_) {
+        return tl::make_unexpected(
+            Status::InvalidArgument("Pending collection uses another schema "
+                                    "or storage mode: ",
+                                    path));
+      }
+    }
+    auto s = opened->open(options);
+    CHECK_RETURN_STATUS_EXPECTED(s);
+    if (!ailego::File::Delete(marker)) {
+      return tl::make_unexpected(Status::InternalError(
+          "Failed to complete collection creation: ", path));
+    }
+    return opened;
+  };
+  if (!options.read_only_ && FileHelper::PathSimpleValidation(path) &&
+      ailego::File::IsExist(marker)) {
+    collection->closed_ = true;
+    return attach(ailego::File{}, true);
+  }
 
   auto s = collection->open(options);
   CHECK_RETURN_STATUS_EXPECTED(s);
 
   if (auto staged = std::move(collection->staged_creation_)) {
+    {
+      ailego::File marker_file;
+      const auto staged_marker = marker_path(staged->path());
+      if (!marker_file.create_exclusive(staged_marker.c_str()) ||
+          !marker_file.flush()) {
+        return tl::make_unexpected(Status::InternalError(
+            "Failed to record collection creation: ", path));
+      }
+    }
+    // The LOCK inode moves with the new directory. Keep its exclusive lock
+    // through publication and attach so no competing opener can take it.
+    auto lock = std::move(collection->lock_file_);
     s = collection->close();
     CHECK_RETURN_STATUS_EXPECTED(s);
-    collection.reset();
     if (!staged->publish()) {
       return tl::make_unexpected(
           Status::InternalError("Failed to publish collection ", path, ", ",
                                 ailego::FileHelper::GetLastErrorString()));
     }
-    return Open(path, options);
+    return attach(std::move(lock), false);
   }
   return collection;
 }
@@ -2773,8 +2830,11 @@ Status CollectionImpl::recovery() {
   }
 
   // get lock file
-  auto s = acquire_file_lock(false);
-  CHECK_RETURN_STATUS(s);
+  Status s;
+  if (!lock_file_.is_valid()) {
+    s = acquire_file_lock(false);
+    CHECK_RETURN_STATUS(s);
+  }
 
   // recovery version first
   auto version_manager = VersionManager::Recovery(path_);

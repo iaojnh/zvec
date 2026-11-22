@@ -5230,12 +5230,12 @@ TEST(IndexInterface, FailedCreationDiscardsOnlyTheNewIndex) {
    protected:
     int prepare_streamer_open(const StorageOptions &) override {
       if (!refuse) return 0;
+      candidate_is_published = zvec::ailego::File::IsExist(index_path);
       constexpr char meta_segment[] = "flat.linear_meta";
       if (storage_->has(meta_segment)) return zvec::core::IndexError_NoMemory;
       const int ret = storage_->append(meta_segment, 4096);
       if (ret != 0) return ret;
       if (!replacement.empty()) {
-        candidate_is_published = zvec::ailego::File::IsExist(index_path);
         if (!zvec::ailego::File::Rename(replacement, index_path)) {
           return zvec::core::IndexError_Runtime;
         }
@@ -5263,8 +5263,11 @@ TEST(IndexInterface, FailedCreationDiscardsOnlyTheNewIndex) {
     auto remove = zvec::ailego::ScopeGuard::Make(
         [&] { zvec::test_util::RemoveTestFiles(path); });
     FaultingIndex index;
+    index.index_path = path;
     ASSERT_EQ(0, index.init(*param));
     ASSERT_EQ(zvec::core::IndexError_NoMemory, index.open(path, {type, true}));
+    if (zvec::ailego::StagedPath::supported())
+      EXPECT_FALSE(index.candidate_is_published);
     EXPECT_FALSE(zvec::ailego::File::IsExist(path));
 
     index.refuse = false;
@@ -5279,7 +5282,6 @@ TEST(IndexInterface, FailedCreationDiscardsOnlyTheNewIndex) {
 #if !defined(_WIN32)
     // An atomic replacement can occur while POSIX file descriptors are live.
     ASSERT_TRUE(zvec::ailego::File::Delete(path));
-    index.index_path = path;
     index.replacement = path + ".replacement";
     auto remove_replacement = zvec::ailego::ScopeGuard::Make(
         [&] { zvec::test_util::RemoveTestFiles(index.replacement); });

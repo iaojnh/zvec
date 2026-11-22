@@ -650,17 +650,19 @@ int HnswSparseStreamerEntity::add_vector(level_t level, key_t key,
     std::lock_guard<ailego::SharedMutex> key_lock(*keys_map_lock_);
     keys_map_->resize(keys_map_->size() + 1);
   }
+  bool writing = false;
   bool complete = false;
   AILEGO_DEFER([&] {
-    if (!complete) mark_failed_build_unlocked();
+    if (writing && !complete) mark_failed_build_unlocked();
   });
   // write sparse vector
   if (sparse_vec.size() > 0) {
     size_t size = sparse_node_chunk->write(
         sparse_chunk_offset, sparse_vec.data(), sparse_vec.size());
+    writing = writing || size != 0;
     if (ailego_unlikely(size != sparse_vec.size())) {
       LOG_ERROR("SparseChunk write sparse vec failed, ret=%zu", size);
-      return IndexError_WriteData;
+      return sparse_node_chunk->write_error();
     }
   }
 
@@ -669,20 +671,23 @@ int HnswSparseStreamerEntity::add_vector(level_t level, key_t key,
 
   size_t size =
       node_chunk->write(chunk_offset, &sparse_offset, sizeof(uint64_t));
+  writing = writing || size != 0;
   if (ailego_unlikely(size != sizeof(uint64_t))) {
     LOG_ERROR("SparseChunk write sparse vec index failed, ret=%zu", size);
-    return IndexError_WriteData;
+    return node_chunk->write_error();
   }
 
   size = node_chunk->write(chunk_offset + sizeof(uint64_t), &sparse_vector_len,
                            sizeof(uint32_t));
+  writing = writing || size != 0;
   if (ailego_unlikely(size != sizeof(uint32_t))) {
     LOG_ERROR("SparseChunk write sparse vec len failed, ret=%zu", size);
-    return IndexError_WriteData;
+    return node_chunk->write_error();
   }
 
   size =
       node_chunk->write(chunk_offset + sparse_meta_size(), &key, sizeof(key_t));
+  writing = writing || size != 0;
   if (ailego_unlikely(size != sizeof(key_t))) {
     LOG_ERROR("SparseChunk write vec failed, ret=%zu", size);
     return node_chunk->write_error();
@@ -793,9 +798,9 @@ int HnswSparseStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
       LOG_ERROR("func_get_sparse_node_chunk_and_offset failed");
       return ret;
     }
-    writing = true;
     size_t size = node_chunk->write(chunk_offset + sparse_meta_size(),
                                     &kInvalidKey, sizeof(key_t));
+    writing = writing || size != 0;
     if (ailego_unlikely(size != sizeof(key_t))) {
       LOG_ERROR("SparseChunk write key failed, ret=%zu", size);
       return node_chunk->write_error();
@@ -838,15 +843,14 @@ int HnswSparseStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
     sparse_node_chunk = sparse_node_chunks_[sparse_chunk_index];
     sparse_chunk_offset = sparse_node_chunk->data_size();
   }
-
-  writing = true;
   // write sparse vector
   if (sparse_vec.size() > 0) {
     size_t size = sparse_node_chunk->write(
         sparse_chunk_offset, sparse_vec.data(), sparse_vec.size());
+    writing = writing || size != 0;
     if (ailego_unlikely(size != sparse_vec.size())) {
       LOG_ERROR("SparseChunk write sparse vec failed, ret=%zu", size);
-      return IndexError_WriteData;
+      return sparse_node_chunk->write_error();
     }
   }
 
@@ -855,20 +859,23 @@ int HnswSparseStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
 
   size_t size =
       node_chunk->write(chunk_offset, &sparse_offset, sizeof(uint64_t));
+  writing = writing || size != 0;
   if (ailego_unlikely(size != sizeof(uint64_t))) {
     LOG_ERROR("SparseChunk write sparse vec index failed, ret=%zu", size);
-    return IndexError_WriteData;
+    return node_chunk->write_error();
   }
 
   size = node_chunk->write(chunk_offset + sizeof(uint64_t), &sparse_vector_len,
                            sizeof(uint32_t));
+  writing = writing || size != 0;
   if (ailego_unlikely(size != sizeof(uint32_t))) {
     LOG_ERROR("SparseChunk write sparse vec len failed, ret=%zu", size);
-    return IndexError_WriteData;
+    return node_chunk->write_error();
   }
 
   size =
       node_chunk->write(chunk_offset + sparse_meta_size(), &key, sizeof(key_t));
+  writing = writing || size != 0;
   if (ailego_unlikely(size != sizeof(key_t))) {
     LOG_ERROR("SparseChunk write vec failed, ret=%zu", size);
     return node_chunk->write_error();

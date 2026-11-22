@@ -514,16 +514,19 @@ int HnswRabitqStreamerEntity::add_vector(level_t level, key_t key,
     std::lock_guard<ailego::SharedMutex> key_lock(*keys_map_lock_);
     keys_map_->resize(keys_map_->size() + 1);
   }
+  bool writing = false;
   bool complete = false;
   AILEGO_DEFER([&] {
-    if (!complete) mark_failed_build_unlocked();
+    if (writing && !complete) mark_failed_build_unlocked();
   });
   size_t size = node_chunk->write(chunk_offset, vec, vector_size());
+  writing = writing || size != 0;
   if (ailego_unlikely(size != vector_size())) {
     LOG_ERROR("Chunk write vec failed, ret=%zu", size);
     return node_chunk->write_error();
   }
   size = node_chunk->write(chunk_offset + vector_size(), &key, sizeof(key_t));
+  writing = writing || size != 0;
   if (ailego_unlikely(size != sizeof(key_t))) {
     LOG_ERROR("Chunk write vec failed, ret=%zu", size);
     return node_chunk->write_error();
@@ -608,9 +611,9 @@ int HnswRabitqStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
       LOG_ERROR("func_get_node_chunk_and_offset failed");
       return ret;
     }
-    writing = true;
     size_t size = node_chunk->write(chunk_offset + vector_size(), &kInvalidKey,
                                     sizeof(key_t));
+    writing = writing || size != 0;
     if (ailego_unlikely(size != sizeof(key_t))) {
       LOG_ERROR("Chunk write key failed, ret=%zu", size);
       return node_chunk->write_error();
@@ -627,15 +630,15 @@ int HnswRabitqStreamerEntity::add_vector_with_id(level_t level, node_id_t id,
     LOG_ERROR("func_get_node_chunk_and_offset failed");
     return ret;
   }
-
-  writing = true;
   size_t size = node_chunk->write(chunk_offset, vec, vector_size());
+  writing = writing || size != 0;
   if (ailego_unlikely(size != vector_size())) {
     LOG_ERROR("Chunk write vec failed, ret=%zu", size);
     return node_chunk->write_error();
   }
 
   size = node_chunk->write(chunk_offset + vector_size(), &key, sizeof(key_t));
+  writing = writing || size != 0;
   if (ailego_unlikely(size != sizeof(key_t))) {
     LOG_ERROR("Chunk write vec failed, ret=%zu", size);
     return node_chunk->write_error();

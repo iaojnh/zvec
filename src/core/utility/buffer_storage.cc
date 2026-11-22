@@ -1330,8 +1330,11 @@ class BufferStorage : public IndexStorage {
     ret = candidate.open_unpublished(path, options, &created_file);
     if (ret != 0) return ret;
     if (!options.defer_publication) {
+      const bool staged = static_cast<bool>(candidate.staged_file_);
       ret = candidate.publish_creation();
       if (ret != 0) return ret;
+      if (staged)
+        created_file = FileIdentity(candidate.buffer_pool_->file_descriptor());
     }
 
     const bool preserve_handles = can_preserve_handles(candidate);
@@ -1427,12 +1430,10 @@ class BufferStorage : public IndexStorage {
     const bool writable = !options.read_only;
     if (!ailego::File::IsExist(path) && options.create_if_missing) {
       ailego::File::Identity private_identity;
-#if !defined(_WIN32) && !defined(_WIN64)
       if (ailego::StagedPath::supported()) {
         staged_file_ = std::make_unique<ailego::StagedPath>();
         if (!staged_file_->prepare(path)) return IndexError_CreateFile;
       }
-#endif
       if (!staged_file_) {
         const size_t last_slash = path.rfind('/');
         if (last_slash != std::string::npos) {
@@ -1451,8 +1452,8 @@ class BufferStorage : public IndexStorage {
 
     try {
       const auto &io_path = staged_file_ ? staged_file_->path() : path;
-      auto candidate_pool =
-          std::make_shared<ailego::VecBufferPool>(io_path, writable);
+      auto candidate_pool = std::make_shared<ailego::VecBufferPool>(
+          io_path, writable, staged_file_ != nullptr);
       if (created_file->valid &&
           !(FileIdentity(candidate_pool->file_descriptor()) == *created_file)) {
         LOG_ERROR("Index file was replaced during creation %s", path.c_str());
