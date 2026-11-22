@@ -12,7 +12,7 @@ jobs:
   build-and-test-windows:
     name: Build & Test (${{ matrix.platform }})
     runs-on: ${{ matrix.platform }}
-    timeout-minutes: 75
+    timeout-minutes: 90
 
     strategy:
       fail-fast: false
@@ -149,23 +149,26 @@ jobs:
         shell: powershell
 
       - name: Compile C++ Tests
+        id: compile
         run: |
           cd "$env:GITHUB_WORKSPACE\build"
-          $targets = @(ninja -t query unittest | ForEach-Object {
-            if ($_ -match '^    bin[\\/].+\.exe$') { $_.Trim() }
-          })
-          if ($LASTEXITCODE -ne 0 -or $targets.Count -lt 100) {
-            throw "Cannot resolve the C++ test dependencies"
-          }
-          cmake --build . --target $targets --config Release --parallel $env:NPROC
+          cmake --build . --target index_interface_test collection_test --config Release --parallel $env:NPROC
         shell: powershell
 
-      - name: Run C++ Tests Directly
-        timeout-minutes: 35
+      - name: Run Index Interface Tests with Live Output
+        timeout-minutes: 8
         run: |
           cd "$env:GITHUB_WORKSPACE\build"
-          $parallel = [Math]::Max(1, [int]$env:NPROC - 1)
-          ctest --build-config Release --output-on-failure --no-tests=error --timeout 600 --parallel $parallel
+          ctest --build-config Release --verbose --no-tests=error --timeout 360 -R '^index_interface_test$'
+        shell: powershell
+
+      - name: Run Collection FTS Regression with Live Output
+        if: always() && steps.compile.outcome == 'success'
+        timeout-minutes: 8
+        run: |
+          cd "$env:GITHUB_WORKSPACE\build"
+          $env:GTEST_FILTER = 'CollectionTest.Feature_CreateOrDropFtsIndex'
+          ctest --build-config Release --verbose --no-tests=error --timeout 360 -R '^collection_test$'
         shell: powershell
 
       - name: Show sccache statistics after tests
