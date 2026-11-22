@@ -641,7 +641,7 @@ class BufferReadStorage : public IndexStorage {
     std::map<std::string, IndexStorage::Segment::Pointer> result;
     if (handle_) {
       for (const auto &it : segments_) {
-        result.emplace(it.first,
+        result.emplace(std::string(it.first.data(), it.first.size()),
                        std::make_shared<BufferReadStorage::Segment>(
                            handle_, cache_enabled_, index_offset_, it.second));
       }
@@ -681,7 +681,7 @@ class BufferReadStorage : public IndexStorage {
   size_t index_offset_{0};
   uint32_t magic_{0};
   std::string file_path_{};
-  std::map<std::string, IndexUnpacker::SegmentMeta> segments_{};
+  IndexUnpacker::SegmentMap segments_{};
   std::shared_ptr<ailego::VecBufferPool> buffer_pool_{nullptr};
   std::shared_ptr<ailego::VecBufferPoolHandle> handle_{nullptr};
   bool cache_enabled_{false};
