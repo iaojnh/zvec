@@ -20,10 +20,11 @@ HnswGraphLock::HnswGraphLock(HnswGraphMutex *mutex, Mode mode) : mode_(mode) {
     for (auto *guard = active_; guard; guard = guard->previous_) {
       if (guard->mutex_ == mutex) return;
     }
-    // Another index's callback may be waiting on a lock this thread holds.
-    // Join readers without waiting, and report an active write to the caller.
-    if (active_) {
-      if (!mutex->try_lock_shared_for_nested_read()) {
+    // Point reads can be dispatched to a worker by a callback. They must
+    // return even when that worker has no graph lock in its own TLS.
+    // Same-thread nested reads can also join ahead of a queued writer.
+    if (active_ || mode_ == Mode::kPointRead) {
+      if (!mutex->try_lock_shared(active_ != nullptr)) {
         blocked_ = true;
         return;
       }

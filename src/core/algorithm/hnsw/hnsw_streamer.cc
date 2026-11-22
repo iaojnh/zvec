@@ -911,7 +911,8 @@ IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
 }
 
 IndexProvider::Pointer HnswStreamer::create_provider() const try {
-  const HnswGraphLock guard(buffered_graph_mutex());
+  const HnswGraphLock guard(buffered_graph_mutex(),
+                            HnswGraphLock::Mode::kPointRead);
   if (guard.blocked() || state_ != STATE_OPENED ||
       entity_->mutation_error() != 0)
     return nullptr;
@@ -984,7 +985,8 @@ const void *HnswStreamer::get_vector(uint64_t key) const {
 
 int HnswStreamer::get_vector(uint64_t key,
                              IndexStorage::MemoryBlock &block) const {
-  const HnswGraphLock guard(buffered_graph_mutex());
+  const HnswGraphLock guard(buffered_graph_mutex(),
+                            HnswGraphLock::Mode::kPointRead);
   const int error = entity_ && !guard.blocked() ? entity_->mutation_error()
                                                 : IndexError_NoReady;
   if (error != 0) {
@@ -1011,7 +1013,8 @@ const void *HnswStreamer::get_vector_by_id(uint32_t id) const {
 
 int HnswStreamer::get_vector_by_id(uint32_t id,
                                    IndexStorage::MemoryBlock &block) const {
-  const HnswGraphLock guard(buffered_graph_mutex());
+  const HnswGraphLock guard(buffered_graph_mutex(),
+                            HnswGraphLock::Mode::kPointRead);
   const int error = entity_ && !guard.blocked() ? entity_->mutation_error()
                                                 : IndexError_NoReady;
   if (error != 0) {

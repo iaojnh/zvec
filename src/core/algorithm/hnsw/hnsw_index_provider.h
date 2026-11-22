@@ -86,7 +86,8 @@ class HnswIndexProvider : public IndexProvider, public StableVectorHolder {
   int get_vector(const uint64_t key,
                  IndexStorage::MemoryBlock &block) const override {
     block.reset();
-    const HnswGraphLock guard(entity_->buffered_graph_mutex());
+    const HnswGraphLock guard(entity_->buffered_graph_mutex(),
+                              HnswGraphLock::Mode::kPointRead);
     if (guard.blocked()) return IndexError_NoReady;
     if (const int error = entity_->provider_read_error(); error != 0)
       return error;
@@ -112,7 +113,8 @@ class HnswIndexProvider : public IndexProvider, public StableVectorHolder {
     //! NOTICE: the vec feature will be changed after iterating to next, so
     //! the caller need to keep a copy of it before iterator to next vector
     const void *data() const override {
-      const HnswGraphLock guard(entity_->buffered_graph_mutex());
+      const HnswGraphLock guard(entity_->buffered_graph_mutex(),
+                                HnswGraphLock::Mode::kPointRead);
       if (!check_graph(guard) || !is_valid()) return nullptr;
       status_ = snapshot_vectors_
                     ? entity_->get_vector_snapshot(cur_id_, block_)
@@ -131,7 +133,8 @@ class HnswIndexProvider : public IndexProvider, public StableVectorHolder {
 
     //! Retrieve primary key
     uint64_t key() const override {
-      const HnswGraphLock guard(entity_->buffered_graph_mutex());
+      const HnswGraphLock guard(entity_->buffered_graph_mutex(),
+                                HnswGraphLock::Mode::kPointRead);
       if (!check_graph(guard) || !is_valid()) return kInvalidKey;
       key_t key;
       status_ = entity_->read_key_snapshot(cur_id_, key);
@@ -140,7 +143,8 @@ class HnswIndexProvider : public IndexProvider, public StableVectorHolder {
 
     //! Next iterator
     void next() override {
-      const HnswGraphLock guard(entity_->buffered_graph_mutex());
+      const HnswGraphLock guard(entity_->buffered_graph_mutex(),
+                                HnswGraphLock::Mode::kPointRead);
       if (check_graph(guard) && is_valid()) {
         cur_id_ = get_next_valid_id(cur_id_ + 1);
       }

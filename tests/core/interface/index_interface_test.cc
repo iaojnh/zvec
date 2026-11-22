@@ -333,6 +333,14 @@ void RunHnswProviderFetchDuringAdd(size_t index_count) {
                       &scores));
         EXPECT_TRUE(keys.empty());
         EXPECT_TRUE(scores.empty());
+
+        auto worker_fetch = std::async(std::launch::async, [&] {
+          VectorDataBuffer worker_result;
+          return target.index->fetch(0, &worker_result);
+        });
+        if (worker_fetch.wait_for(5s) != std::future_status::ready)
+          std::_Exit(8);
+        EXPECT_EQ(core::IndexError_NoReady, worker_fetch.get());
       }
       VectorDataBuffer fetched;
       return target.index->fetch(0, &fetched);
@@ -452,6 +460,18 @@ void RunHnswFilterFetchWithQueuedWriters(size_t index_count) {
       if (target.index->fetch(key, &fetched) != 0) std::_Exit(4);
       EXPECT_EQ(bytes_of(target.original),
                 std::get<DenseVectorBuffer>(fetched.vector_buffer).data);
+      auto worker_fetch = std::async(std::launch::async, [&] {
+        VectorDataBuffer worker_result;
+        const int ret = target.index->fetch(key, &worker_result);
+        if (ret == 0) {
+          EXPECT_EQ(bytes_of(target.original),
+                    std::get<DenseVectorBuffer>(worker_result.vector_buffer).data);
+        }
+        return ret;
+      });
+      if (worker_fetch.wait_for(5s) != std::future_status::ready) std::_Exit(8);
+      const int worker_status = worker_fetch.get();
+      EXPECT_TRUE(worker_status == 0 || worker_status == core::IndexError_NoReady);
       const VectorData input{DenseVector{site.original.data()}};
       const auto nested_query = HNSWQueryParamBuilder().with_topk(1).build();
       SearchResult nested;
@@ -610,16 +630,15 @@ void RunHnswExportedProviderAcrossRollback() {
   if (writer_staged.wait_for(5s) != std::future_status::ready) std::_Exit(5);
   auto read = std::async(std::launch::async, [&] {
     entering_read.set_value();
-    const auto *data = static_cast<const char *>(iterator->data());
-    return data ? std::string(data, kDim * sizeof(float)) : std::string{};
+    core::IndexStorage::MemoryBlock contended;
+    return exported->get_vector(kOriginalKey, contended);
   });
   if (reader_started.wait_for(5s) != std::future_status::ready) std::_Exit(6);
-  EXPECT_EQ(std::future_status::timeout, read.wait_for(100ms));
+  if (read.wait_for(5s) != std::future_status::ready) std::_Exit(7);
+  EXPECT_EQ(core::IndexError_NoReady, read.get());
   resume_writer.set_value();
-  if (write.wait_for(5s) != std::future_status::ready ||
-      read.wait_for(5s) != std::future_status::ready) std::_Exit(7);
+  if (write.wait_for(5s) != std::future_status::ready) std::_Exit(9);
   EXPECT_NE(0, write.get());
-  EXPECT_EQ(expected, read.get());
   EXPECT_EQ(kOriginalKey, iterator->key());
   EXPECT_EQ(0, iterator->status());
 

@@ -33,9 +33,9 @@ class HnswGraphMutex {
     ++readers_;
   }
 
-  bool try_lock_shared_for_nested_read() {
+  bool try_lock_shared(bool nested) {
     std::lock_guard lock(state_mutex_);
-    if (writing_) return false;
+    if (writing_ || (!nested && waiting_writers_ != 0)) return false;
     ++readers_;
     return true;
   }
@@ -55,7 +55,7 @@ class HnswGraphMutex {
 
 class HnswGraphLock {
  public:
-  enum class Mode { kRead, kWrite };
+  enum class Mode { kRead, kPointRead, kWrite };
 
   explicit HnswGraphLock(HnswGraphMutex *mutex, Mode mode = Mode::kRead);
   ~HnswGraphLock();
