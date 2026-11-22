@@ -8,6 +8,7 @@
 #include <future>
 #include <iterator>
 #include <map>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <ailego/pattern/defer.h>
@@ -488,7 +489,9 @@ TEST_F(CollectionWriteBudgetTest, RocksWriteStatusReflectsCommittedMutation) {
   }
   EXPECT_EQ(std::future_status::ready, completion);
   const auto result = next.get();
-  EXPECT_TRUE(result.ok()) << result.ToString();
+  EXPECT_TRUE(result.IsMemoryLimit()) << result.ToString();
+  manager->SetBufferSize(original_limit);
+  EXPECT_TRUE(healthy.put("next", "healthy").ok());
   EXPECT_TRUE(healthy.close().ok());
 }
 
@@ -753,8 +756,6 @@ TEST_F(CollectionWriteBudgetTest, BufferedVectorRefusalPrecedesWalAndMutation) {
     auto refused = writer.value()->insert(next);
     ASSERT_TRUE(refused.has_value()) << refused.error().message();
     EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, refused->front().code());
-    EXPECT_NE(std::string::npos,
-              refused->front().message().find("Failed to prepare vector insert"));
     EXPECT_EQ(wal_size, std::filesystem::file_size(wal));
   }
   {
@@ -768,6 +769,54 @@ TEST_F(CollectionWriteBudgetTest, BufferedVectorRefusalPrecedesWalAndMutation) {
   ASSERT_TRUE(retried.has_value()) << retried.error().message();
   ASSERT_TRUE(retried->front().ok()) << retried->front().message();
   ASSERT_TRUE(writer.value()->flush().ok());
+}
+
+TEST_F(CollectionWriteBudgetTest, MmapSparseRefusalPrecedesWalAndMutation) {
+  const auto collection_path = path("mmap_sparse_admission");
+  auto sparse_schema = schema();
+  ASSERT_TRUE(sparse_schema.add_field(std::make_shared<FieldSchema>(
+      "emb", DataType::SPARSE_VECTOR_FP32, 0, true,
+      std::make_shared<FlatIndexParams>(MetricType::IP))).ok());
+  auto writer =
+      Collection::CreateAndOpen(collection_path, sparse_schema, {false, true, kMiB});
+  ASSERT_TRUE(writer.has_value()) << writer.error().message();
+
+  auto anchor = docs("anchor");
+  using SparseVector = std::pair<std::vector<uint32_t>, std::vector<float>>;
+  anchor.front().set("emb", SparseVector{{1}, {1.0f}});
+  auto inserted = writer.value()->insert(anchor);
+  ASSERT_TRUE(inserted.has_value() && inserted->front().ok());
+  auto version = VersionManager::Recovery(collection_path);
+  ASSERT_TRUE(version.has_value());
+  const auto meta = version.value()->get_current_version().writing_segment_meta();
+  const auto wal = FileHelper::MakeWalPath(
+      collection_path, meta->id(), meta->writing_forward_block()->id());
+  const auto wal_size = std::filesystem::file_size(wal);
+  SparseVector sparse{std::vector<uint32_t>(1024),
+                     std::vector<float>(1024, 1.0f)};
+  std::iota(sparse.first.begin(), sparse.first.end(), 1U);
+  auto next = docs("next");
+  next.front().set("emb", sparse);
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  {
+    constexpr size_t spare = 2048;
+    ailego::MemoryReservation pressure;
+    for (int i = 0; i < 8 && pool.available() > spare; ++i)
+      pressure.add(pool.available() - spare);
+    ASSERT_LT(pool.available(), 8192u);
+    const auto refused = writer.value()->insert(next);
+    ASSERT_TRUE(refused.has_value());
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, refused->front().code());
+    EXPECT_NE(std::string::npos,
+              refused->front().message().find("Failed to prepare vector insert"));
+    EXPECT_EQ(wal_size, std::filesystem::file_size(wal));
+  }
+  const auto retried = writer.value()->insert(next);
+  ASSERT_TRUE(retried.has_value() && retried->front().ok());
+  const auto fetched = writer.value()->fetch({"next"});
+  ASSERT_TRUE(fetched.has_value() && fetched->at("next"));
+  EXPECT_EQ(sparse, fetched->at("next")->get<SparseVector>("emb"));
+  EXPECT_TRUE(writer.value()->close().ok());
 }
 
 TEST_F(CollectionWriteBudgetTest, BufferedVectorWriteHandlesQuantizedNullableGaps) {
@@ -818,6 +867,73 @@ TEST_F(CollectionWriteBudgetTest, BufferedVectorWriteHandlesQuantizedNullableGap
   ASSERT_TRUE(matches.has_value()) << matches.error().message();
   ASSERT_EQ(1u, matches->size());
   EXPECT_EQ("both", matches->front()->pk_ref());
+}
+
+TEST_F(CollectionWriteBudgetTest, MultiQueryReportsReverseIdAdmissionFailure) {
+  auto fields = schema();
+  ASSERT_TRUE(fields.add_field(std::make_shared<FieldSchema>(
+      "dense", DataType::VECTOR_FP32, 2, false,
+      std::make_shared<FlatIndexParams>(MetricType::L2))).ok());
+  // mmap keeps recall payloads outside the managed pool. The compacted
+  // segment still reads its non-contiguous ID mapping via BufferStorage.
+  auto writer = Collection::CreateAndOpen(
+      path("reverse_id_pressure"), fields, {false, true, kMiB});
+  ASSERT_TRUE(writer.has_value()) << writer.error().message();
+  const std::vector<float> vector{1.0f, 2.0f};
+  std::vector<Doc> rows{docs("first").front(), docs("deleted").front(),
+                        docs("last").front()};
+  for (auto &doc : rows) doc.set("dense", vector);
+  auto inserted = writer.value()->insert(rows);
+  ASSERT_TRUE(inserted.has_value());
+  ASSERT_EQ(3u, inserted->size());
+  for (const auto &status : *inserted) ASSERT_TRUE(status.ok()) << status.message();
+  const auto deleted = writer.value()->delete_({"deleted"});
+  ASSERT_TRUE(deleted.has_value() && deleted->front().ok());
+  auto optimized = writer.value()->optimize();
+  ASSERT_TRUE(optimized.ok()) << optimized.message();
+
+  SubQuery sub;
+  sub.target_.field_name_ = "dense";
+  sub.target_.set_vector(std::string(
+      reinterpret_cast<const char *>(vector.data()), sizeof(float) * 2));
+  sub.num_candidates_ = 1;
+  MultiQuery query;
+  query.topk = 1;
+  query.queries = {sub, sub};
+  query.rerank = reranker::RrfParams{60};
+
+  // Earlier suites can leave reclaimable planner and writer allowances.
+  // Drain those before measuring the pressure needed at the reverse-ID read.
+  detail::SharedResultMemoryAllowance().reclaim_idle();
+  detail::SharedWriteBufferMemoryAllowance().reclaim_idle();
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(3);
+  while (pool.stats().page_used && std::chrono::steady_clock::now() < deadline) {
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(512);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(0u, pool.stats().page_used);
+  const size_t spare = ailego::kVectorPageSize / 8;
+  {
+    ailego::MemoryReservation held;
+    for (size_t attempt = 0; attempt < 8; ++attempt) {
+      const auto available = pool.available();
+      if (available <= spare) break;
+      // Admission may reclaim other caches while making this reservation.
+      held.add(available - spare);
+    }
+    ASSERT_LT(pool.available(), ailego::kVectorPageSize);
+    auto denied = writer.value()->query(query);
+    ASSERT_FALSE(denied.has_value());
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
+    EXPECT_NE(std::string::npos,
+              denied.error().message().find("document ID range"));
+  }
+  auto result = writer.value()->query(query);
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  EXPECT_EQ(1u, result->size());
+  EXPECT_TRUE(writer.value()->close().ok());
 }
 
 TEST_F(CollectionWriteBudgetTest, WalRecoveryRemovesTornTailBeforeAppend) {

@@ -1329,6 +1329,10 @@ class BufferStorage : public IndexStorage {
     });
     ret = candidate.open_unpublished(path, options, &created_file);
     if (ret != 0) return ret;
+    if (!options.defer_publication) {
+      ret = candidate.publish_creation();
+      if (ret != 0) return ret;
+    }
 
     const bool preserve_handles = can_preserve_handles(candidate);
     read_scratch_.clear();
@@ -1342,6 +1346,7 @@ class BufferStorage : public IndexStorage {
       directory_generation_ = std::move(candidate.directory_generation_);
     }
     file_name_.swap(candidate.file_name_);
+    staged_file_.swap(candidate.staged_file_);
     buffer_pool_.swap(candidate.buffer_pool_);
     buffer_pool_handle_.swap(candidate.buffer_pool_handle_);
     segments_.swap(candidate.segments_);
@@ -1353,6 +1358,18 @@ class BufferStorage : public IndexStorage {
     return 0;
   } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;
+  }
+
+  int publish_creation() override {
+    if (!staged_file_) return 0;
+    const int ret = flush_index();
+    if (ret != 0) return ret;
+    if (!staged_file_->publish()) {
+      LOG_ERROR("Failed to publish new index %s", file_name_.c_str());
+      return IndexError_CreateFile;
+    }
+    staged_file_.reset();
+    return 0;
   }
 
  private:
@@ -1409,11 +1426,22 @@ class BufferStorage : public IndexStorage {
                        ailego::File::Identity *created_file) {
     const bool writable = !options.read_only;
     if (!ailego::File::IsExist(path) && options.create_if_missing) {
-      size_t last_slash = path.rfind('/');
-      if (last_slash != std::string::npos) {
-        ailego::File::MakePath(path.substr(0, last_slash));
+      ailego::File::Identity private_identity;
+#if !defined(_WIN32) && !defined(_WIN64)
+      if (ailego::StagedPath::supported()) {
+        staged_file_ = std::make_unique<ailego::StagedPath>();
+        if (!staged_file_->prepare(path)) return IndexError_CreateFile;
       }
-      int error_code = this->init_index(path, created_file);
+#endif
+      if (!staged_file_) {
+        const size_t last_slash = path.rfind('/');
+        if (last_slash != std::string::npos) {
+          ailego::File::MakePath(path.substr(0, last_slash));
+        }
+      }
+      int error_code = staged_file_ ? this->init_index(staged_file_->path(),
+                                                       &private_identity)
+                                    : this->init_index(path, created_file);
       if (error_code != 0) {
         LOG_ERROR("init_index failed for %s, errno=%d", path.c_str(),
                   error_code);
@@ -1422,8 +1450,9 @@ class BufferStorage : public IndexStorage {
     }
 
     try {
+      const auto &io_path = staged_file_ ? staged_file_->path() : path;
       auto candidate_pool =
-          std::make_shared<ailego::VecBufferPool>(path, writable);
+          std::make_shared<ailego::VecBufferPool>(io_path, writable);
       if (created_file->valid &&
           !(FileIdentity(candidate_pool->file_descriptor()) == *created_file)) {
         LOG_ERROR("Index file was replaced during creation %s", path.c_str());
@@ -1919,6 +1948,7 @@ class BufferStorage : public IndexStorage {
     decltype(meta_chains_)().swap(meta_chains_);
     buffer_pool_handle_.reset();
     buffer_pool_.reset();
+    staged_file_.reset();
     cache_enabled_ = false;
     prepared_writes_.reset();
     pending_check_point_.store(0, std::memory_order_relaxed);
@@ -2264,6 +2294,7 @@ class BufferStorage : public IndexStorage {
 
   // buffer manager
   std::string file_name_;
+  std::unique_ptr<ailego::StagedPath> staged_file_;
   using SegmentMap = std::unordered_map<
       std::string_view, IndexMapping::SegmentInfo, std::hash<std::string_view>,
       std::equal_to<std::string_view>,

@@ -1116,10 +1116,8 @@ Result<SegmentImpl::PreparedForward> SegmentImpl::prepare_forward_write(
   auto forward = memory_store_->prepare_insert(doc, next_id);
   if (!forward) return tl::make_unexpected(forward.error());
   prepared.forward = std::move(*forward);
-  if (uses_buffer_storage()) {
-    status = write_vector_indexes(doc, &prepared.vectors);
-    if (!status.ok()) return tl::make_unexpected(status);
-  }
+  status = write_vector_indexes(doc, &prepared.vectors);
+  if (!status.ok()) return tl::make_unexpected(status);
   return prepared;
 } catch (const std::bad_alloc &) {
   return tl::make_unexpected(
@@ -1149,12 +1147,7 @@ Status SegmentImpl::internal_insert(Doc &doc,
   s = insert_fts_indexer(doc, admission);
   CHECK_RETURN_STATUS(s);
   // write vector index
-  if (uses_buffer_storage()) {
-    for (auto &vector : prepared.vectors) vector->commit();
-  } else {
-    s = write_vector_indexes(doc, nullptr);
-    if (!s.ok() && s != Status::AlreadyExists()) return s;
-  }
+  for (auto &vector : prepared.vectors) vector->commit();
 
   auto &mem_block = segment_meta_->writing_forward_block().value();
   mem_block.max_doc_id_ = g_doc_id;
@@ -1208,6 +1201,8 @@ Status SegmentImpl::insert(Doc &doc) {
   auto prepared = prepare_forward_write(doc);
   if (!prepared) return prepared.error();
 
+  RocksdbContext::WriteAdmission rocks_admission;
+  CHECK_RETURN_STATUS(rocks_admission.status());
   // append WAL
   auto s = append_wal(doc);
   CHECK_RETURN_STATUS(s);
@@ -1234,6 +1229,8 @@ Status SegmentImpl::update(Doc &doc) {
   auto prepared = prepare_forward_write(doc);
   if (!prepared) return prepared.error();
 
+  RocksdbContext::WriteAdmission rocks_admission;
+  CHECK_RETURN_STATUS(rocks_admission.status());
   // append WAL
   auto s = append_wal(doc);
   CHECK_RETURN_STATUS(s);
@@ -1256,6 +1253,8 @@ Status SegmentImpl::upsert(Doc &doc) {
   auto prepared = prepare_forward_write(doc);
   if (!prepared) return prepared.error();
 
+  RocksdbContext::WriteAdmission rocks_admission;
+  CHECK_RETURN_STATUS(rocks_admission.status());
   // Record the mutation we resolved before writing. RocksDB may flush the
   // new ID before the collection manifest advances, so replay must not need
   // that mutable mapping to identify the row an upsert replaced.
@@ -1297,6 +1296,8 @@ Status SegmentImpl::Delete(const std::string &pk) {
   mutable_doc.set_operator(Operator::DELETE);
   CHECK_RETURN_STATUS(delete_store_->prepare_mark_deleted(g_doc_id));
 
+  RocksdbContext::WriteAdmission rocks_admission;
+  CHECK_RETURN_STATUS(rocks_admission.status());
   // append WAL
   auto s = append_wal(mutable_doc);
   CHECK_RETURN_STATUS(s);
@@ -1316,6 +1317,8 @@ Status SegmentImpl::Delete(uint64_t g_doc_id) {
   mutable_doc.set_operator(Operator::DELETE);
   CHECK_RETURN_STATUS(delete_store_->prepare_mark_deleted(g_doc_id));
 
+  RocksdbContext::WriteAdmission rocks_admission;
+  CHECK_RETURN_STATUS(rocks_admission.status());
   // append WAL
   auto s = append_wal(mutable_doc);
   CHECK_RETURN_STATUS(s);
@@ -5651,6 +5654,8 @@ Status SegmentImpl::recover(
       if (!result) return result.error();
       prepared = std::move(*result);
     }
+    RocksdbContext::WriteAdmission rocks_admission;
+    CHECK_RETURN_STATUS(rocks_admission.status());
     Status status;
     switch (doc->get_operator()) {
       case Operator::INSERT: {

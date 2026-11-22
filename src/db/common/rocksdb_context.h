@@ -67,21 +67,47 @@ struct RocksdbContext {
 
 
  public:
+  // A row admits shared write-buffer pressure before publishing its WAL.
+  // Writes on that thread then finish the admitted row as one unit.
+  class WriteAdmission {
+   public:
+    WriteAdmission();
+    ~WriteAdmission();
+    WriteAdmission(const WriteAdmission &) = delete;
+    WriteAdmission &operator=(const WriteAdmission &) = delete;
+
+    explicit operator bool() const {
+      return admitted_;
+    }
+    Status status() const;
+
+   private:
+    bool admitted_{false};
+  };
+
   // Drain the writer's own memtables after crossing the shared WBM threshold.
   // Another DB must not be the next writer left waiting for this DB to flush.
   template <typename... Args>
   rocksdb::Status put(Args &&...args) {
+    WriteAdmission admission;
+    if (!admission) return rocksdb::Status::MemoryLimit("Shared write buffer");
     return finish_write(db_->Put(write_opts_, std::forward<Args>(args)...));
   }
   template <typename... Args>
   rocksdb::Status merge(Args &&...args) {
+    WriteAdmission admission;
+    if (!admission) return rocksdb::Status::MemoryLimit("Shared write buffer");
     return finish_write(db_->Merge(write_opts_, std::forward<Args>(args)...));
   }
   template <typename... Args>
   rocksdb::Status remove(Args &&...args) {
+    WriteAdmission admission;
+    if (!admission) return rocksdb::Status::MemoryLimit("Shared write buffer");
     return finish_write(db_->Delete(write_opts_, std::forward<Args>(args)...));
   }
   rocksdb::Status write(rocksdb::WriteBatch *batch) {
+    WriteAdmission admission;
+    if (!admission) return rocksdb::Status::MemoryLimit("Shared write buffer");
     return finish_write(db_->Write(write_opts_, batch));
   }
 

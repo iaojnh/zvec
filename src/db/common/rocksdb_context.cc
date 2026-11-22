@@ -34,6 +34,8 @@
 namespace zvec {
 
 namespace {
+
+thread_local size_t admitted_write_depth = 0;
 constexpr size_t kRocksDbInstanceMetadata = 256 * 1024;
 constexpr size_t kRocksDbColumnMetadata = 64 * 1024;
 
@@ -55,6 +57,27 @@ ReserveRocksMetadata(size_t columns) try {
                                     "Insufficient RocksDB metadata budget"));
 }
 }  // namespace
+
+RocksdbContext::WriteAdmission::WriteAdmission() {
+  if (admitted_write_depth == 0) {
+    const auto manager =
+        GlobalResource::Instance().rocksdb_write_buffer_manager();
+    if (manager && manager->enabled() && manager->IsStallThresholdExceeded())
+      return;
+  }
+  ++admitted_write_depth;
+  admitted_ = true;
+}
+
+RocksdbContext::WriteAdmission::~WriteAdmission() {
+  if (admitted_) --admitted_write_depth;
+}
+
+Status RocksdbContext::WriteAdmission::status() const {
+  return admitted_ ? Status::OK()
+                   : Status(StatusCode::RESOURCE_EXHAUSTED,
+                            "Shared RocksDB write buffer is full");
+}
 
 rocksdb::Status RocksdbContext::finish_write(rocksdb::Status status) {
   if (!status.ok()) return status;

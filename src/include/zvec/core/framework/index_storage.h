@@ -41,6 +41,8 @@ class IndexStorage : public IndexModule {
     bool read_only{true};
     // Set only after this open exclusively creates and opens a new file.
     ailego::File::Identity *created_file{nullptr};
+    // Let an owning Index finish algorithm initialization before publishing.
+    bool defer_publication{false};
   };
 
   struct MemoryBlock {
@@ -894,6 +896,11 @@ class IndexStorage : public IndexModule {
   //! Separate dispatch keeps legacy open() overrides source-compatible.
   virtual int open_with_options(const std::string &, const OpenOptions &) {
     return IndexError_Unsupported;
+  }
+
+ public:
+  virtual int publish_creation() {
+    return 0;
   }
 };
 

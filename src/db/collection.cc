@@ -339,6 +339,7 @@ class CollectionImpl : public Collection {
 
  private:
   std::string path_;
+  std::unique_ptr<ailego::StagedPath> staged_creation_;
 
   bool destroyed_{false};
 
@@ -394,6 +395,8 @@ class CollectionImpl : public Collection {
   // The replacement must appear in the on-disk manifest before it accepts
   // writes. Guarded by write_mtx_ or the exclusive schema lock.
   bool rotation_manifest_pending_{false};
+  // The retired segment is sealed only after its replacement is durable.
+  Segment::Ptr pending_segment_seal_;
   // non-writing segments, sort by doc_id range
   SegmentManager::Ptr segment_manager_;
 
@@ -417,6 +420,17 @@ Result<Collection::Ptr> Collection::CreateAndOpen(
   auto s = collection->open(options);
   CHECK_RETURN_STATUS_EXPECTED(s);
 
+  if (auto staged = std::move(collection->staged_creation_)) {
+    s = collection->close();
+    CHECK_RETURN_STATUS_EXPECTED(s);
+    collection.reset();
+    if (!staged->publish()) {
+      return tl::make_unexpected(
+          Status::InternalError("Failed to publish collection ", path, ", ",
+                                ailego::FileHelper::GetLastErrorString()));
+    }
+    return Open(path, options);
+  }
   return collection;
 }
 
@@ -551,6 +565,7 @@ Status CollectionImpl::close_unsafe() {
 }
 
 void CollectionImpl::release_write_resources() {
+  pending_segment_seal_.reset();
   writing_segment_.reset();
   version_manager_.reset();
   id_map_.reset();
@@ -612,10 +627,17 @@ Status CollectionImpl::flush_unsafe(bool for_close) {
 }
 
 Status CollectionImpl::publish_pending_rotation() {
-  if (!rotation_manifest_pending_) return Status::OK();
-  auto status = version_manager_->flush();
-  if (status.ok()) rotation_manifest_pending_ = false;
-  return status;
+  if (rotation_manifest_pending_) {
+    auto status = version_manager_->flush();
+    CHECK_RETURN_STATUS(status);
+    rotation_manifest_pending_ = false;
+  }
+  if (pending_segment_seal_) {
+    auto status = pending_segment_seal_->dump();
+    CHECK_RETURN_STATUS(status);
+    pending_segment_seal_.reset();
+  }
+  return Status::OK();
 }
 
 Status CollectionImpl::acquire_write_buffer() {
@@ -1821,8 +1843,6 @@ Status CollectionImpl::switch_to_new_segment_for_writing(
     if (!keep_replacement) (void)new_segment.value()->destroy();
   });
 
-  s = writing_segment_->dump();
-  CHECK_RETURN_STATUS(s);
   s = segment_manager_->add_segment(writing_segment_);
   CHECK_RETURN_STATUS(s);
 
@@ -1832,6 +1852,7 @@ Status CollectionImpl::switch_to_new_segment_for_writing(
   s = version.add_persisted_segment_meta(writing_segment_meta);
   CHECK_RETURN_STATUS(s);
 
+  pending_segment_seal_ = writing_segment_;
   writing_segment_ = new_segment.value();
   keep_replacement = true;
   version.reset_writing_segment_meta(writing_segment_->meta());
@@ -3003,6 +3024,15 @@ Status CollectionImpl::create() {
   if (!options_.enable_mmap_) {
     s = write_buffer_reservation_.acquire(options_.max_buffer_size_);
     CHECK_RETURN_STATUS(s);
+  }
+
+  if (ailego::StagedPath::supported()) {
+    staged_creation_ = std::make_unique<ailego::StagedPath>();
+    if (!staged_creation_->prepare(path_)) {
+      return Status::InvalidArgument("Failed to stage collection ", path_, ", ",
+                                     ailego::FileHelper::GetLastErrorString());
+    }
+    path_ = staged_creation_->path();
   }
 
   namespace fs = std::filesystem;

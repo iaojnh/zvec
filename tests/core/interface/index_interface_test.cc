@@ -5223,6 +5223,7 @@ TEST(IndexInterface, FailedCreationDiscardsOnlyTheNewIndex) {
    public:
     using FlatIndex::init;
     bool refuse{true};
+    bool candidate_is_published{false};
     std::string replacement;
     std::string index_path;
 
@@ -5233,9 +5234,11 @@ TEST(IndexInterface, FailedCreationDiscardsOnlyTheNewIndex) {
       if (storage_->has(meta_segment)) return zvec::core::IndexError_NoMemory;
       const int ret = storage_->append(meta_segment, 4096);
       if (ret != 0) return ret;
-      if (!replacement.empty() &&
-          !zvec::ailego::File::Rename(replacement, index_path)) {
-        return zvec::core::IndexError_Runtime;
+      if (!replacement.empty()) {
+        candidate_is_published = zvec::ailego::File::IsExist(index_path);
+        if (!zvec::ailego::File::Rename(replacement, index_path)) {
+          return zvec::core::IndexError_Runtime;
+        }
       }
       return zvec::core::IndexError_NoMemory;
     }
@@ -5287,6 +5290,9 @@ TEST(IndexInterface, FailedCreationDiscardsOnlyTheNewIndex) {
     }
     index.refuse = true;
     EXPECT_EQ(zvec::core::IndexError_NoMemory, index.open(path, {type, true}));
+#if defined(__APPLE__) || defined(__linux__)
+    EXPECT_FALSE(index.candidate_is_published);
+#endif
     std::ifstream replacement(path);
     std::string content;
     replacement >> content;

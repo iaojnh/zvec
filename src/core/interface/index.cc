@@ -613,9 +613,9 @@ int Index::open(const std::string &file_path,
       if (reformer_) reformer_->unload();
       if (streamer_) streamer_->cleanup();
       if (storage_) storage_->close();
+      streamer_.reset();
+      storage_.reset();
       if (created_file.valid) {
-        streamer_.reset();
-        storage_.reset();
         if (!ailego::File::DeleteIfSame(file_path, created_file)) {
           LOG_ERROR("Failed to remove incomplete index file %s",
                     file_path.c_str());
@@ -680,7 +680,8 @@ int Index::open(const std::string &file_path,
   }
 
   const core::IndexStorage::OpenOptions open_options{
-      storage_options.create_new, storage_options.read_only, &created_file};
+      storage_options.create_new, storage_options.read_only, &created_file,
+      /*defer_publication=*/true};
   const bool read_only_mmap =
       storage_options.type == StorageOptions::StorageType::kMMAP &&
       storage_options.read_only;
@@ -758,6 +759,8 @@ int Index::open(const std::string &file_path,
     return core::IndexError_Runtime;
   }
 
+  ret = storage_->publish_creation();
+  if (ret != 0) return ret;
   opened = true;
   is_open_ = true;
   is_read_only_ = storage_options.read_only;
@@ -1206,18 +1209,24 @@ int Index::_dense_add(
                              &new_meta);
     if (ret != 0) {
       LOG_ERROR("Failed to convert vector");
-      return prepared ? ret : core::IndexError_Runtime;
+      return prepared || ret == core::IndexError_NoMemory
+                 ? ret
+                 : core::IndexError_Runtime;
     }
     ret = write(new_vector->data(), new_meta);
     if (ret != 0) {
       LOG_ERROR("Failed to add vector");
-      return prepared ? ret : core::IndexError_Runtime;
+      return prepared || ret == core::IndexError_NoMemory
+                 ? ret
+                 : core::IndexError_Runtime;
     }
   } else {
     int ret = write(dense_vector.data, input_vector_meta_);
     if (ret != 0) {
       LOG_ERROR("Failed to add vector");
-      return prepared ? ret : core::IndexError_Runtime;
+      return prepared || ret == core::IndexError_NoMemory
+                 ? ret
+                 : core::IndexError_Runtime;
     }
   }
   return 0;
@@ -1258,18 +1267,24 @@ int Index::_sparse_add(
                              &converted_sparse_values_buffer, &new_meta);
     if (ret != 0) {
       LOG_ERROR("Failed to convert vector");
-      return prepared ? ret : core::IndexError_Runtime;
+      return prepared || ret == core::IndexError_NoMemory
+                 ? ret
+                 : core::IndexError_Runtime;
     }
     ret = write(converted_sparse_values_buffer.data(), new_meta);
     if (ret != 0) {
       LOG_ERROR("Failed to add vector");
-      return prepared ? ret : core::IndexError_Runtime;
+      return prepared || ret == core::IndexError_NoMemory
+                 ? ret
+                 : core::IndexError_Runtime;
     }
   } else {
     int ret = write(sparse_vector.get_values(), input_vector_meta_);
     if (ret != 0) {
       LOG_ERROR("Failed to add vector");
-      return prepared ? ret : core::IndexError_Runtime;
+      return prepared || ret == core::IndexError_NoMemory
+                 ? ret
+                 : core::IndexError_Runtime;
     }
   }
   return 0;

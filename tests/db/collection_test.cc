@@ -54,7 +54,6 @@
 #include "db/common/constants.h"
 #include "db/common/file_helper.h"
 #include "db/common/result_memory_allowance.h"
-#include "db/common/write_buffer_reservation.h"
 #include "db/index/common/type_helper.h"
 #include "db/index/common/version_manager.h"
 #include "db/sqlengine/planner/plan_info.h"
@@ -5886,67 +5885,6 @@ TEST_F(CollectionTest, MultiQueryOmitsEmptySparseVector) {
     ASSERT_TRUE(collection_->destroy().ok());
     collection_.reset();
   }
-}
-
-TEST_F(CollectionTest, MultiQueryReportsReverseIdAdmissionFailure) {
-  auto schema = make_schema();
-  ASSERT_TRUE(schema.add_field(std::make_shared<FieldSchema>(
-      "dense", DataType::VECTOR_FP32, 2, false,
-      std::make_shared<FlatIndexParams>(MetricType::L2))).ok());
-  // mmap keeps recall payloads outside the managed pool. The compacted
-  // segment still reads its non-contiguous ID mapping via BufferStorage.
-  options_.enable_mmap_ = true;
-  ASSERT_NO_FATAL_FAILURE(create(schema));
-  const std::vector<float> vector{1.0f, 2.0f};
-  std::vector<Doc> docs{make_doc("first", 0), make_doc("deleted", 1),
-                        make_doc("last", 2)};
-  for (auto &doc : docs) doc.set("dense", vector);
-  ASSERT_NO_FATAL_FAILURE(expect_write(collection_->insert(docs), 3));
-  ASSERT_NO_FATAL_FAILURE(expect_write(collection_->delete_({"deleted"}), 1));
-  auto optimized = collection_->optimize();
-  ASSERT_TRUE(optimized.ok()) << optimized.message();
-
-  SubQuery sub;
-  sub.target_.field_name_ = "dense";
-  sub.target_.set_vector(std::string(
-      reinterpret_cast<const char *>(vector.data()), sizeof(float) * 2));
-  sub.num_candidates_ = 1;
-  MultiQuery query;
-  query.topk = 1;
-  query.queries = {sub, sub};
-  query.rerank = reranker::RrfParams{60};
-
-  // Earlier suites can leave reclaimable planner and writer allowances.
-  // Drain those before measuring the pressure needed at the reverse-ID read.
-  detail::SharedResultMemoryAllowance().reclaim_idle();
-  detail::SharedWriteBufferMemoryAllowance().reclaim_idle();
-  auto &pool = ailego::MemoryLimitPool::get_instance();
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::seconds(3);
-  while (pool.stats().page_used && std::chrono::steady_clock::now() < deadline) {
-    ailego::BlockEvictionQueue::get_instance().batch_recycle(512);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-  ASSERT_EQ(0u, pool.stats().page_used);
-  const size_t spare = ailego::kVectorPageSize / 8;
-  {
-    ailego::MemoryReservation held;
-    for (size_t attempt = 0; attempt < 8; ++attempt) {
-      const auto available = pool.available();
-      if (available <= spare) break;
-      // Admission may reclaim other caches while making this reservation.
-      held.add(available - spare);
-    }
-    ASSERT_LT(pool.available(), ailego::kVectorPageSize);
-    auto denied = collection_->query(query);
-    ASSERT_FALSE(denied.has_value());
-    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
-    EXPECT_NE(std::string::npos,
-              denied.error().message().find("document ID range"));
-  }
-  auto result = collection_->query(query);
-  ASSERT_TRUE(result.has_value()) << result.error().message();
-  EXPECT_EQ(1u, result->size());
 }
 
 TEST_F(CollectionTest, Feature_MultiQuery_CallbackReranker) {

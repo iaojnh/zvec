@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include <limits>
 #include <mutex>
 #include <ailego/pattern/defer.h>
 #include <zvec/core/framework/index_error.h>
@@ -105,6 +106,37 @@ class MMapFileStorage : public IndexStorage {
       return len;
     }
 
+    int prepare_write_batch(const SegmentData *writes, size_t count,
+                            std::unique_ptr<PreparedWrite> *out) override try {
+      if (!out || *out || (!writes && count)) return IndexError_InvalidArgument;
+      size_t bytes = 0;
+      for (size_t i = 0; i < count; ++i) {
+        const auto &write = writes[i];
+        if (write.offset > capacity_ ||
+            write.length > capacity_ - write.offset ||
+            (write.length && !write.data) ||
+            write.length > std::numeric_limits<size_t>::max() - bytes) {
+          return IndexError_InvalidArgument;
+        }
+        bytes += write.length;
+      }
+      auto pending = std::make_unique<PreparedBatch>(shared_from_this());
+      pending->payload = MemoryBlock::AllocateOwned(bytes);
+      pending->writes.reserve(count);
+      auto *cursor = static_cast<char *>(pending->payload.data_);
+      for (size_t i = 0; i < count; ++i) {
+        const auto &write = writes[i];
+        if (!write.length) continue;
+        std::memcpy(cursor, write.data, write.length);
+        pending->writes.push_back({write.offset, write.length, cursor});
+        cursor += write.length;
+      }
+      *out = std::move(pending);
+      return 0;
+    } catch (const std::bad_alloc &) {
+      return IndexError_NoMemory;
+    }
+
     //! Resize size of data
     size_t resize(size_t size) override {
       auto meta = segment_->meta();
@@ -135,6 +167,26 @@ class MMapFileStorage : public IndexStorage {
     }
 
    private:
+    class PreparedBatch final : public PreparedWrite {
+     public:
+      explicit PreparedBatch(std::shared_ptr<Segment> segment)
+          : segment_(std::move(segment)) {}
+
+      void commit() noexcept override {
+        for (const auto &write : writes) {
+          segment_->write(write.offset, write.data, write.length);
+        }
+        writes.clear();
+        payload.reset();
+      }
+
+      MemoryBlock payload;
+      ailego::BudgetedVector<SegmentData> writes;
+
+     private:
+      std::shared_ptr<Segment> segment_;
+    };
+
     IndexMapping::Segment *segment_{};
     MMapFileStorage *owner_{nullptr};
     size_t capacity_{};
@@ -166,12 +218,20 @@ class MMapFileStorage : public IndexStorage {
 
   //! Open storage
   int open(const std::string &path, bool create_if_missing) override {
-    return open_with_options(path, OpenOptions{create_if_missing, false});
+    return open_index(path, OpenOptions{create_if_missing, false});
   }
 
   int open_with_options(const std::string &path,
                         const OpenOptions &options) override {
-    if (options.read_only) return IndexError_Unsupported;
+    if (options.read_only ||
+        (!options.created_file && !options.defer_publication)) {
+      return IndexError_Unsupported;
+    }
+    return open_index(path, options);
+  }
+
+  int open_index(const std::string &path, const OpenOptions &options) {
+    std::unique_ptr<ailego::StagedPath> pending;
     ailego::File::Identity created_file;
     bool opened = false;
     AILEGO_DEFER([&] {
@@ -183,25 +243,54 @@ class MMapFileStorage : public IndexStorage {
       }
     });
     if (!ailego::File::IsExist(path) && options.create_if_missing) {
-      size_t last_slash = path.rfind('/');
-      if (last_slash != std::string::npos) {
-        ailego::File::MakePath(path.substr(0, last_slash));
+#if !defined(_WIN32) && !defined(_WIN64)
+      if (ailego::StagedPath::supported()) {
+        pending = std::make_unique<ailego::StagedPath>();
+        if (!pending->prepare(path)) return IndexError_CreateFile;
       }
-
-      int error_code = this->init_index(path, &created_file);
+#endif
+      if (!pending) {
+        const size_t last_slash = path.rfind('/');
+        if (last_slash != std::string::npos) {
+          ailego::File::MakePath(path.substr(0, last_slash));
+        }
+      }
+      ailego::File::Identity private_identity;
+      int error_code =
+          pending ? this->init_index(pending->path(), &private_identity)
+                  : this->init_index(path, &created_file);
       if (error_code != 0) {
         return error_code;
       }
     }
-    const int ret = mapping_.open(path, copy_on_write_, force_flush_);
+    int ret = mapping_.open(pending ? pending->path() : path, copy_on_write_,
+                            force_flush_);
     if (ret == 0 && created_file.valid &&
         !(mapping_.file_identity() == created_file)) {
       LOG_ERROR("Index file was replaced during creation %s", path.c_str());
       return IndexError_OpenFile;
     }
-    opened = ret == 0;
-    if (opened && options.created_file) *options.created_file = created_file;
-    return ret;
+    if (ret != 0) return ret;
+    staged_file_ = std::move(pending);
+    if (!options.defer_publication) {
+      ret = publish_creation();
+      if (ret != 0) {
+        close_index();
+        return ret;
+      }
+    }
+    opened = true;
+    if (options.created_file) *options.created_file = created_file;
+    return 0;
+  }
+
+  int publish_creation() override {
+    if (!staged_file_) return 0;
+    const int ret = flush_index();
+    if (ret != 0) return ret;
+    if (!staged_file_->publish()) return IndexError_CreateFile;
+    staged_file_.reset();
+    return 0;
   }
 
   //! Flush storage
@@ -332,6 +421,7 @@ class MMapFileStorage : public IndexStorage {
     }
     std::lock_guard<std::mutex> latch(mapping_mutex_);
     mapping_.close();
+    staged_file_.reset();
   }
 
   //! Append a segment into storage
@@ -359,6 +449,7 @@ class MMapFileStorage : public IndexStorage {
   bool memory_locked_{false};
   bool memory_warmup_{false};
   bool index_dirty_{false};
+  std::unique_ptr<ailego::StagedPath> staged_file_;
   mutable IndexMapping mapping_{};
   mutable std::mutex mapping_mutex_{};
 };
