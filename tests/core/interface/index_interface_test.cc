@@ -227,83 +227,126 @@ TEST(IndexInterface, FailedHnswRollbackMakesDocCountUnavailable) {
 
 #if GTEST_HAS_DEATH_TEST && !defined(__ANDROID__) && \
     (!defined(__APPLE__) || !TARGET_OS_IPHONE)
-TEST(IndexInterface, HnswProviderCanFetchFromTheIndexDuringAdd) {
-  // Keep a regressed lock from blocking the entire test suite.
-  const auto run = [] {
-    using namespace std::chrono_literals;
-    using namespace zvec;
-    using Provider = core::MultiPassIndexProvider<core::IndexMeta::DT_FP32>;
-    class FetchingProvider : public Provider {
-     public:
-      using Provider::Provider;
+namespace {
 
-      int get_vector(uint64_t key,
-                     core::IndexStorage::MemoryBlock &block) const override {
-        if (const auto owner = index.lock()) {
-          VectorDataBuffer fetched;
-          const int ret = owner->fetch(0, &fetched);
-          if (ret != 0) return ret;
-          ++reads;
-        }
-        return Provider::get_vector(key, block);
+void RunHnswProviderFetchDuringAdd(size_t index_count) {
+  using namespace std::chrono_literals;
+  using namespace zvec;
+  using Provider = core::MultiPassIndexProvider<core::IndexMeta::DT_FP32>;
+  class FetchingProvider : public Provider {
+   public:
+    using Provider::Provider;
+
+    int get_vector(uint64_t key,
+                   core::IndexStorage::MemoryBlock &block) const override {
+      if (read_index) {
+        const int ret = read_index();
+        if (ret != 0) return ret;
+        ++reads;
       }
-
-      std::weak_ptr<Index> index;
-      mutable size_t reads{0};
-    };
-
-    ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(64UL << 20));
-    const std::string path = "hnsw_provider_fetch.index";
-    test_util::RemoveTestFiles(path + "*");
-    const auto cleanup = ailego::ScopeGuard::Make(
-        [&] { test_util::RemoveTestFiles(path + "*"); });
-    constexpr uint32_t kDim = 16;
-    core::IndexMeta meta(core::IndexMeta::DT_FP32, kDim);
-    meta.set_metric("SquaredEuclidean", 0, ailego::Params{});
-    auto provider = std::make_shared<FetchingProvider>(kDim);
-    ailego::NumericalVector<float> original(kDim), next(kDim);
-    for (uint32_t i = 0; i < kDim; ++i) {
-      original[i] = 0.0f;
-      next[i] = 1.0f;
+      return Provider::get_vector(key, block);
     }
-    ASSERT_TRUE(provider->emplace(0, original));
-    ASSERT_TRUE(provider->emplace(1, next));
+
+    std::function<int()> read_index;
+    mutable size_t reads{0};
+  };
+
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(64UL << 20));
+  const std::string path = "hnsw_provider_fetch_";
+  test_util::RemoveTestFiles(path + "*");
+  const auto cleanup =
+      ailego::ScopeGuard::Make([&] { test_util::RemoveTestFiles(path + "*"); });
+  constexpr uint32_t kDim = 16;
+  core::IndexMeta meta(core::IndexMeta::DT_FP32, kDim);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params{});
+  ailego::NumericalVector<float> original(kDim), next(kDim);
+  for (uint32_t i = 0; i < kDim; ++i) {
+    original[i] = 0.0f;
+    next[i] = 1.0f;
+  }
+  struct IndexTestState {
+    Index::Pointer index;
+    std::shared_ptr<FetchingProvider> provider;
+    std::promise<void> provider_entered, write_finished;
+    std::future<void> provider_started{provider_entered.get_future()};
+    std::future<void> write_done{write_finished.get_future()};
+    std::thread writer;
+    size_t read_calls{0};
+    int status{core::IndexError_Runtime};
+  };
+  std::array<IndexTestState, 2> sites;
+  for (size_t i = 0; i < index_count; ++i) {
+    auto &site = sites[i];
+    site.provider = std::make_shared<FetchingProvider>(kDim);
+    ASSERT_TRUE(site.provider->emplace(0, original));
+    ASSERT_TRUE(site.provider->emplace(1, next));
     const auto param = HNSWIndexParamBuilder()
                            .with_dimension(kDim)
                            .with_metric_type(MetricType::kL2sq)
                            .with_data_type(DataType::DT_FP32)
-                           .with_provider(provider, meta)
+                           .with_provider(site.provider, meta)
                            .build();
-    auto index = IndexFactory::CreateAndInitIndex(*param);
-    ASSERT_TRUE(index);
+    site.index = IndexFactory::CreateAndInitIndex(*param);
+    ASSERT_TRUE(site.index);
     ASSERT_EQ(
-        0, index->open(path, {StorageOptions::StorageType::kBufferPool, true}));
-    ASSERT_EQ(0, index->add(VectorData{DenseVector{original.data()}}, 0));
-    provider->index = index;
-    std::promise<void> completed;
-    auto done = completed.get_future();
-    std::thread writer([&] {
-      EXPECT_EQ(0, index->add(VectorData{DenseVector{next.data()}}, 1));
-      completed.set_value();
+        0, site.index->open(path + std::to_string(i) + ".index",
+                            {StorageOptions::StorageType::kBufferPool, true}));
+    ASSERT_EQ(0, site.index->add(VectorData{DenseVector{original.data()}}, 0));
+  }
+  for (size_t i = 0; i < index_count; ++i) {
+    auto &site = sites[i];
+    site.provider->read_index = [&, i] {
+      auto &target = sites[(i + 1) % index_count];
+      if (index_count == 2) {
+        // Let the build query through. Force the cross-read during traversal,
+        // after the new node has been staged, so failure must roll it back.
+        ++site.read_calls;
+        if (site.read_calls == 1) return 0;
+        if (site.read_calls == 2) {
+          site.provider_entered.set_value();
+          if (target.provider_started.wait_for(5s) != std::future_status::ready)
+            std::_Exit(2);
+        }
+      }
+      VectorDataBuffer fetched;
+      return target.index->fetch(0, &fetched);
+    };
+    site.writer = std::thread([&site, &next] {
+      site.status = site.index->add(VectorData{DenseVector{next.data()}}, 1);
+      site.write_finished.set_value();
     });
-    if (done.wait_for(10s) != std::future_status::ready) std::_Exit(2);
-    writer.join();
-    // One call reads the insertion query, and graph traversal also calls
-    // the provider for existing nodes while the mutation is in progress.
-    EXPECT_GT(provider->reads, 1u);
-    EXPECT_EQ(2u, index->get_doc_count());
+  }
+  for (size_t i = 0; i < index_count; ++i) {
+    auto &site = sites[i];
+    if (site.write_done.wait_for(10s) != std::future_status::ready)
+      std::_Exit(3);
+    site.writer.join();
+  }
+
+  if (index_count == 1) {
+    EXPECT_EQ(0, sites[0].status);
+    // Cover the build query and reads of existing neighbors during mutation.
+    EXPECT_GT(sites[0].provider->reads, 1u);
+  } else {
+    EXPECT_TRUE(sites[0].status != 0 || sites[1].status != 0);
+  }
+  for (size_t i = 0; i < index_count; ++i) {
+    auto &site = sites[i];
+    if (site.status != 0) {
+      EXPECT_EQ(core::IndexError_Runtime, site.status);
+      ASSERT_EQ(1u, site.index->get_doc_count());
+      ASSERT_EQ(0, site.index->add(VectorData{DenseVector{next.data()}}, 1));
+    }
+    EXPECT_EQ(2u, site.index->get_doc_count());
     VectorDataBuffer fetched;
-    ASSERT_EQ(0, index->fetch(1, &fetched));
+    ASSERT_EQ(0, site.index->fetch(1, &fetched));
     EXPECT_EQ(std::string(reinterpret_cast<const char *>(next.data()),
                           kDim * sizeof(float)),
               std::get<DenseVectorBuffer>(fetched.vector_buffer).data);
-    EXPECT_EQ(0, index->close());
-  };
-  ASSERT_EXIT((run(), std::_Exit(::testing::Test::HasFailure() ? 1 : 0)),
-              ::testing::ExitedWithCode(0), "");
+  }
+  for (size_t i = 0; i < index_count; ++i)
+    EXPECT_EQ(0, sites[i].index->close());
 }
-
-namespace {
 
 void RunHnswFilterFetchWithQueuedWriters(size_t index_count) {
   using namespace std::chrono_literals;
@@ -426,6 +469,18 @@ void RunHnswFilterFetchWithQueuedWriters(size_t index_count) {
 }
 
 }  // namespace
+
+TEST(IndexInterface, HnswProviderCanFetchFromTheIndexDuringAdd) {
+  ASSERT_EXIT((RunHnswProviderFetchDuringAdd(1),
+               std::_Exit(::testing::Test::HasFailure() ? 1 : 0)),
+              ::testing::ExitedWithCode(0), "");
+}
+
+TEST(IndexInterface, HnswProvidersDoNotDeadlockAcrossActiveWrites) {
+  ASSERT_EXIT((RunHnswProviderFetchDuringAdd(2),
+               std::_Exit(::testing::Test::HasFailure() ? 1 : 0)),
+              ::testing::ExitedWithCode(0), "");
+}
 
 TEST(IndexInterface, HnswFilterCanFetchWhileAnOverwriteWaits) {
   ASSERT_EXIT((RunHnswFilterFetchWithQueuedWriters(1),

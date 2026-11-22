@@ -82,10 +82,16 @@ class BufferedGraphLock {
       for (auto *guard = active_; guard; guard = guard->previous_) {
         if (guard->mutex_ == mutex) return;
       }
-      // A nested read of another index can join its active readers. Waiting
-      // behind a queued writer could make two read callbacks wait on each
-      // other.
-      mutex->lock_shared(/*nested=*/active_ != nullptr);
+      // Another index's callback may be waiting on a lock this thread holds.
+      // Join readers without waiting, and report an active write to the caller.
+      if (active_) {
+        if (!mutex->try_lock_shared_for_nested_read()) {
+          blocked_ = true;
+          return;
+        }
+      } else {
+        mutex->lock_shared();
+      }
     }
     mutex_ = mutex;
     previous_ = active_;
@@ -109,11 +115,16 @@ class BufferedGraphLock {
     return mutex_ != nullptr;
   }
 
+  bool blocked() const {
+    return blocked_;
+  }
+
  private:
   static inline thread_local const BufferedGraphLock *active_{nullptr};
   const BufferedGraphLock *previous_{nullptr};
   HnswGraphMutex *mutex_{nullptr};
   const Mode mode_;
+  bool blocked_{false};
 };
 
 }  // namespace
@@ -512,6 +523,7 @@ size_t HnswStreamer::packed_segment_count() const {
 
 int HnswStreamer::dump_with_vectors(const IndexDumper::Pointer &dumper) {
   const BufferedGraphLock guard(buffered_graph_mutex());
+  if (guard.blocked()) return IndexError_NoReady;
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   if (state_ != STATE_OPENED || !build_vector_source_) {
@@ -902,7 +914,8 @@ int HnswStreamer::dump(const IndexDumper::Pointer &dumper) {
 
 IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
   const BufferedGraphLock guard(buffered_graph_mutex());
-  if (entity_ && entity_->mutation_error() != 0) return nullptr;
+  if (guard.blocked() || (entity_ && entity_->mutation_error() != 0))
+    return nullptr;
   if (ailego_unlikely(state_ != STATE_OPENED)) {
     LOG_ERROR("Create context failed, open storage first!");
     return Context::Pointer();
@@ -952,7 +965,8 @@ IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
 
 IndexProvider::Pointer HnswStreamer::create_provider() const {
   const BufferedGraphLock guard(buffered_graph_mutex());
-  if (entity_ && entity_->mutation_error() != 0) return nullptr;
+  if (guard.blocked() || (entity_ && entity_->mutation_error() != 0))
+    return nullptr;
   LOG_DEBUG("HnswStreamer create provider");
 
   auto entity = entity_->clone();
@@ -1006,14 +1020,16 @@ HnswGraphMutex *HnswStreamer::buffered_graph_mutex() const {
 
 const void *HnswStreamer::get_vector(uint64_t key) const {
   const BufferedGraphLock guard(buffered_graph_mutex());
-  if (!entity_ || entity_->mutation_error() != 0) return nullptr;
+  if (guard.blocked() || !entity_ || entity_->mutation_error() != 0)
+    return nullptr;
   return entity_->get_vector_by_key(key);
 }
 
 int HnswStreamer::get_vector(uint64_t key,
                              IndexStorage::MemoryBlock &block) const {
   const BufferedGraphLock guard(buffered_graph_mutex());
-  const int error = entity_ ? entity_->mutation_error() : IndexError_NoReady;
+  const int error = entity_ && !guard.blocked() ? entity_->mutation_error()
+                                                : IndexError_NoReady;
   if (error != 0) {
     block.reset();
     return error;
@@ -1031,14 +1047,16 @@ int HnswStreamer::get_vector(uint64_t key,
 
 const void *HnswStreamer::get_vector_by_id(uint32_t id) const {
   const BufferedGraphLock guard(buffered_graph_mutex());
-  if (!entity_ || entity_->mutation_error() != 0) return nullptr;
+  if (guard.blocked() || !entity_ || entity_->mutation_error() != 0)
+    return nullptr;
   return entity_->get_vector(id);
 }
 
 int HnswStreamer::get_vector_by_id(uint32_t id,
                                    IndexStorage::MemoryBlock &block) const {
   const BufferedGraphLock guard(buffered_graph_mutex());
-  const int error = entity_ ? entity_->mutation_error() : IndexError_NoReady;
+  const int error = entity_ && !guard.blocked() ? entity_->mutation_error()
+                                                : IndexError_NoReady;
   if (error != 0) {
     block.reset();
     return error;
@@ -1274,6 +1292,7 @@ int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
                               uint32_t count,
                               IndexStreamer::Context::Pointer &context) const {
   const BufferedGraphLock guard(buffered_graph_mutex());
+  if (guard.blocked()) return IndexError_NoReady;
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   int ret = check_params(query, qmeta, true);
@@ -1336,10 +1355,11 @@ int HnswStreamer::search_candidates_impl(
     IndexStreamer::Context::Pointer &context,
     std::vector<float> *scores) const {
   const BufferedGraphLock guard(buffered_graph_mutex());
-  if (entity_ && entity_->mutation_error() != 0)
-    return entity_->mutation_error();
   keys.clear();
   if (scores) scores->clear();
+  if (guard.blocked()) return IndexError_NoReady;
+  if (entity_ && entity_->mutation_error() != 0)
+    return entity_->mutation_error();
   int ret = check_params(query, qmeta, true);
   if (ailego_unlikely(ret != 0)) {
     return ret;
@@ -1391,7 +1411,7 @@ int HnswStreamer::search_candidates_impl(
 
 void HnswStreamer::print_debug_info() {
   const BufferedGraphLock guard(buffered_graph_mutex());
-  if (entity_->mutation_error() != 0) return;
+  if (guard.blocked() || entity_->mutation_error() != 0) return;
   for (node_id_t id = 0; id < entity_->doc_cnt(); ++id) {
     if (entity_->get_key(id) == kInvalidKey) {
       continue;
@@ -1423,6 +1443,7 @@ int HnswStreamer::search_bf_impl(
     const void *query, const IndexQueryMeta &qmeta, uint32_t count,
     IndexStreamer::Context::Pointer &context) const {
   const BufferedGraphLock guard(buffered_graph_mutex());
+  if (guard.blocked()) return IndexError_NoReady;
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   int ret = check_params(query, qmeta, true);
@@ -1529,6 +1550,7 @@ int HnswStreamer::search_bf_by_p_keys_impl(
     const IndexQueryMeta &qmeta, uint32_t count,
     Context::Pointer &context) const {
   const BufferedGraphLock guard(buffered_graph_mutex());
+  if (guard.blocked()) return IndexError_NoReady;
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   int ret = check_params(query, qmeta, true);
