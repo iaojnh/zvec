@@ -279,11 +279,11 @@ jobs:
           "
         shell: bash
 
-      - name: Run DiskAnn and libaio storage C++ tests
+      - name: Run DiskAnn C++ Tests
         if: matrix.platform != 'macos-x64'
         run: |
           cd "$GITHUB_WORKSPACE/build"
-          ctest -R "diskann|vector_page_table_bypass_aio|chunk_read_prefetch" --output-on-failure --parallel $NPROC
+          ctest -R diskann --output-on-failure --parallel $NPROC
           "$GITHUB_WORKSPACE/examples/c++/build/diskann-core-example"
         shell: bash
 

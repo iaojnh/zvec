@@ -14,9 +14,7 @@
 #pragma once
 
 #include <cstdint>
-#include <memory>
 #include <string>
-#include <zvec/ailego/buffer/process_rss_allocation.h>
 #include <zvec/ailego/container/heap.h>
 #include <zvec/core/framework/index_storage.h>
 
@@ -70,31 +68,6 @@ class IndexSparseDocument {
  */
 class IndexDocument {
  public:
-  // Immutable after publication. Candidate heaps and returned documents share
-  // one payload and one reservation, including copies retained by the caller.
-  struct VectorPayload {
-    VectorPayload(const void *src, size_t size) {
-      if (size <= data.capacity()) {
-        data.assign(static_cast<const char *>(src), size);
-        return;
-      }
-      if (size >= SIZE_MAX / 2) throw std::bad_alloc();
-      rss_memory_.allocate(2 * (size + 1), [&] {
-        data.assign(static_cast<const char *>(src), size);
-        return data.capacity() + 1;
-      });
-    }
-    VectorPayload(const VectorPayload &) = delete;
-    VectorPayload &operator=(const VectorPayload &) = delete;
-
-   private:
-    // The string must be destroyed before its reservation is released.
-    ailego::ProcessRssReservation rss_memory_;
-
-   public:
-    std::string data;
-  };
-
   //! Constructor
   IndexDocument() = default;
 
@@ -132,10 +105,6 @@ class IndexDocument {
         index_(i),
         vector_string_(std::move(vector_string)) {}
 
-  IndexDocument(uint64_t k, float v, uint32_t i,
-                std::shared_ptr<const VectorPayload> payload)
-      : key_(k), score_(v), index_(i), vector_payload_(std::move(payload)) {}
-
   //! Constructor
   IndexDocument(uint64_t k, float v, uint32_t i, std::string vector_string,
                 IndexSparseDocument sparse_doc)
@@ -165,7 +134,6 @@ class IndexDocument {
         index_(rhs.index_),
         vector_(rhs.vector_),
         vector_string_(std::move(rhs.vector_string_)),
-        vector_payload_(rhs.vector_payload_),
         sparse_doc_{rhs.sparse_doc_} {
     if (rhs.has_vec_mem_block_) {
       vec_mem_block_ = rhs.vec_mem_block_;
@@ -182,7 +150,6 @@ class IndexDocument {
       index_ = rhs.index_;
       vector_ = rhs.vector_;
       vector_string_ = rhs.vector_string_;
-      vector_payload_ = rhs.vector_payload_;
       if (rhs.has_vec_mem_block_) {
         vec_mem_block_ = rhs.vec_mem_block_;
         has_vec_mem_block_ = true;
@@ -223,14 +190,12 @@ class IndexDocument {
 
   //! Retrieve vec
   const void *vector() const {
-    if (vector_) return vector_;
-    const auto &bytes = vector_string();
-    return bytes.empty() ? nullptr : bytes.data();
+    return vector_;
   }
 
   //! Retrieve vec string
   const std::string &vector_string() const {
-    return vector_payload_ ? vector_payload_->data : vector_string_;
+    return vector_string_;
   }
 
   //! Retrieve vec
@@ -275,7 +240,6 @@ class IndexDocument {
   uint32_t index_{0u};
   const void *vector_{nullptr};
   std::string vector_string_{};
-  std::shared_ptr<const VectorPayload> vector_payload_;
   bool has_vec_mem_block_{false};
   mutable IndexStorage::MemoryBlock vec_mem_block_{};
   IndexSparseDocument sparse_doc_{};

@@ -102,9 +102,8 @@ void ExpectLegacyPqChunkWidths(IndexMeta::DataType data_type) {
 
   IndexMeta meta(data_type, kDimension);
   meta.set_metric("SquaredEuclidean", 0, ailego::Params());
-  turbo::Quantizer::Pointer quantizer;
-  ASSERT_EQ(0, DiskAnnUtil::create_quantizer_from_meta_buffer(
-                   payload, meta, kChunkCount, true, quantizer));
+  auto quantizer = DiskAnnUtil::create_quantizer_from_meta_buffer(
+      payload, meta, kChunkCount, true);
   ASSERT_NE(quantizer, nullptr);
   ASSERT_EQ(quantizer->quantized_datapoint_vector_length(), kChunkCount);
 
