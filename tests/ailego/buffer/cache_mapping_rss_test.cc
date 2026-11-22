@@ -1304,10 +1304,10 @@ TEST_F(CacheMappingRssTest, DeniedAdmissionPacesRetriesAndHonorsDeadline) {
   const auto start = std::chrono::steady_clock::now();
   EXPECT_FALSE(pool_.try_charge_metadata(12 * kMiB, 12 * kMiB));
   const auto elapsed = std::chrono::steady_clock::now() - start;
-  EXPECT_GE(elapsed, std::chrono::seconds(4));
-  EXPECT_LT(elapsed, std::chrono::seconds(7));
-  EXPECT_GE(pool_.stats().capacity_waits - waits, 40u);
-  EXPECT_LE(pool_.stats().capacity_waits - waits, 60u);
+  EXPECT_GE(elapsed, std::chrono::milliseconds(950));
+  EXPECT_LT(elapsed, std::chrono::milliseconds(1500));
+  EXPECT_GE(pool_.stats().capacity_waits - waits, 8u);
+  EXPECT_LE(pool_.stats().capacity_waits - waits, 12u);
   EXPECT_EQ(used, pool_.used());
   EXPECT_EQ(committed, pool_.committed());
   EXPECT_EQ(0u, MemoryLimitPoolTestPeer::waiters(pool_));

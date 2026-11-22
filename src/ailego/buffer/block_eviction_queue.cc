@@ -2611,7 +2611,7 @@ bool MemoryLimitPool::try_admit(AdmissionRequest request, Admit &&admit,
   // One deadline covers inline retries and sleeps. Ready hints and spurious
   // notifications cannot turn a bounded wait into unbounded retry work.
   if (admit()) return true;
-  const auto deadline = Clock::now() + 5s;
+  const auto deadline = Clock::now() + (wait ? 1s : 5s);
   // Maintenance can release idle backing and prove residency itself, but
   // cannot wait for its own worker or recursively invoke eviction owners.
   const bool maintenance = refresh_residency_on_background_thread();
