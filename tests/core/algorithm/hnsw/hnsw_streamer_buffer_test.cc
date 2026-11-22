@@ -2,6 +2,7 @@
 #include <future>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 #include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/math_helper.h>
@@ -13,6 +14,7 @@
 #include <algorithm/hnsw/hnsw_streamer_entity.h>
 #include <gtest/gtest.h>
 #include <zvec/core/framework/index_framework.h>
+#include <zvec/core/framework/index_segment_storage.h>
 #include <zvec/core/framework/index_streamer.h>
 #include "tests/test_util.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
@@ -232,6 +234,142 @@ TEST_F(HnswStreamerTest, FailedFirstInsertLeavesAnOpenableEmptyIndex) {
   EXPECT_EQ(1u, reopened.doc_cnt());
   ASSERT_EQ(0, reopened.close());
   ASSERT_EQ(0, storage->close());
+}
+
+TEST_F(HnswStreamerTest, FailedChunkMetadataWriteCanBeRetriedAfterReopen) {
+  class FailingMetadata : public IndexSegmentStorage::Segment {
+   public:
+    FailingMetadata(const IndexStorage::Segment::Pointer &segment,
+                    bool &fail_next_write)
+        : IndexSegmentStorage::Segment(segment, 0, segment->data_size(),
+                                       segment->padding_size(), 0),
+          segment_(segment),
+          fail_next_write_(fail_next_write) {}
+
+    size_t write(size_t offset, const void *data, size_t len) override {
+      if (std::exchange(fail_next_write_, false)) return 0;
+      return segment_->write(offset, data, len);
+    }
+
+    int write_error() const override {
+      return IndexError_NoMemory;
+    }
+
+   private:
+    IndexStorage::Segment::Pointer segment_;
+    bool &fail_next_write_;
+  };
+
+  class FailingStorage : public IndexStorage {
+   public:
+    int init(const Params &params) override {
+      return backing->init(params);
+    }
+    int cleanup() override {
+      return backing->cleanup();
+    }
+    int open(const std::string &path, bool create) override {
+      return backing->open(path, OpenOptions{create, false});
+    }
+    int flush() override {
+      return backing->flush();
+    }
+    int close() override {
+      return backing->close();
+    }
+    int append(const std::string &id, size_t size) override {
+      return backing->append(id, size);
+    }
+    void refresh(uint64_t checkpoint) override {
+      backing->refresh(checkpoint);
+    }
+    uint64_t check_point() const override {
+      return backing->check_point();
+    }
+    Segment::Pointer get(const std::string &id, int level) override {
+      auto segment = backing->get(id, level);
+      if (segment &&
+          id == ChunkBroker::make_segment_id(ChunkBroker::CHUNK_TYPE_META, 0)) {
+        return std::make_shared<FailingMetadata>(segment, fail_next_write);
+      }
+      return segment;
+    }
+    bool has(const std::string &id) const override {
+      return backing->has(id);
+    }
+    uint32_t magic() const override {
+      return backing->magic();
+    }
+
+    Pointer backing = IndexFactory::CreateStorage("BufferStorage");
+    bool fail_next_write = false;
+  };
+
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
+  auto storage = std::make_shared<FailingStorage>();
+  ASSERT_TRUE(storage->backing);
+  ASSERT_EQ(0, storage->init(Params()));
+  uint32_t chunk_size = MemoryHelper::PageSize();
+  constexpr int node = ChunkBroker::CHUNK_TYPE_NODE;
+  constexpr char payload[] = "vector bytes";
+
+  for (bool reopen : {false, true}) {
+    SCOPED_TRACE(reopen);
+    const std::string path = dir_ + (reopen ? "ReopenedChunk" : "RetriedChunk");
+    ASSERT_EQ(0, storage->open(path, true));
+    IndexStreamer::Stats stats;
+    auto broker = std::make_unique<ChunkBroker>(stats);
+    ASSERT_EQ(0, broker->open(storage, chunk_size, false));
+    broker->set_max_chunks_size(8UL << 20);
+    storage->fail_next_write = true;
+    auto failed = broker->alloc_chunk(node, 0);
+    ASSERT_EQ(IndexError_NoMemory, failed.first);
+    ASSERT_FALSE(failed.second);
+    EXPECT_EQ(0u, broker->get_chunk_cnt(node));
+    auto empty = broker->get_chunk(node, 0);
+    ASSERT_TRUE(empty);
+    ASSERT_EQ(0u, empty->data_size());
+    empty.reset();
+
+    if (reopen) {
+      // Drop the broker without flushing its in-memory metadata. The backing
+      // storage still persists the segment appended before the failed write.
+      broker.reset();
+      ASSERT_EQ(0, storage->close());
+      ASSERT_EQ(0, storage->open(path, false));
+      broker = std::make_unique<ChunkBroker>(stats);
+      ASSERT_EQ(0, broker->open(storage, chunk_size, false));
+      ASSERT_EQ(0u, broker->get_chunk_cnt(node));
+      broker->set_max_chunks_size(8UL << 20);
+    }
+
+    const auto size_before_retry = stats.index_size();
+    auto [status, chunk] = broker->alloc_chunk(node, 0);
+    ASSERT_EQ(0, status);
+    ASSERT_TRUE(chunk);
+    EXPECT_EQ(1u, broker->get_chunk_cnt(node));
+    EXPECT_EQ(size_before_retry + chunk_size, stats.index_size());
+    ASSERT_EQ(0, broker->alloc_chunk(node, 0).first);
+    EXPECT_EQ(1u, broker->get_chunk_cnt(node));
+    EXPECT_EQ(size_before_retry + chunk_size, stats.index_size());
+    ASSERT_EQ(sizeof(payload), chunk->write(0, payload, sizeof(payload)));
+    chunk.reset();
+    ASSERT_EQ(0, broker->flush(0));
+    ASSERT_EQ(0, broker->close());
+    ASSERT_EQ(0, storage->close());
+
+    ASSERT_EQ(0, storage->open(path, false));
+    ASSERT_EQ(0, broker->open(storage, chunk_size, false));
+    EXPECT_EQ(1u, broker->get_chunk_cnt(node));
+    chunk = broker->get_chunk(node, 0);
+    ASSERT_TRUE(chunk);
+    char actual[sizeof(payload)]{};
+    ASSERT_EQ(sizeof(actual), chunk->fetch(0, actual, sizeof(actual)));
+    EXPECT_STREQ(payload, actual);
+    chunk.reset();
+    ASSERT_EQ(0, broker->close());
+    ASSERT_EQ(0, storage->close());
+  }
 }
 
 TEST_F(HnswStreamerTest, BufferedWideVectorWriteAndRollbackWithLimitedCache) {

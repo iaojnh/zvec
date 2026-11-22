@@ -14,10 +14,13 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -215,6 +218,97 @@ TEST(IndexInterface, FailedHnswRollbackMakesDocCountUnavailable) {
   });
   worker.join();
 }
+
+#if GTEST_HAS_DEATH_TEST && !defined(__ANDROID__) && \
+    (!defined(__APPLE__) || !TARGET_OS_IPHONE)
+TEST(IndexInterface, HnswFilterCanFetchWhileAnOverwriteWaits) {
+  // Bound a deadlock to the child process so it cannot stall the test suite.
+  const auto run = [] {
+    using namespace std::chrono_literals;
+    using namespace zvec;
+    ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(64UL << 20));
+    const std::string path = "hnsw_filter_fetch.index";
+    test_util::RemoveTestFiles(path + "*");
+    const auto cleanup = ailego::ScopeGuard::Make(
+        [&] { test_util::RemoveTestFiles(path + "*"); });
+    constexpr uint32_t kDim = 16;
+    const auto param = HNSWIndexParamBuilder()
+                           .with_dimension(kDim)
+                           .with_metric_type(MetricType::kL2sq)
+                           .with_data_type(DataType::DT_FP32)
+                           .build();
+    auto index = IndexFactory::CreateAndInitIndex(*param);
+    ASSERT_TRUE(index);
+    ASSERT_EQ(
+        0, index->open(path, {StorageOptions::StorageType::kBufferPool, true}));
+    auto streamer = index->index_searcher();
+    auto write_context = streamer->create_context();
+    ASSERT_TRUE(write_context);
+    std::array<float, kDim> original{};
+    std::array<float, kDim> replacement;
+    replacement.fill(1.0f);
+    core::IndexQueryMeta meta(core::IndexMeta::DT_FP32, kDim);
+    ASSERT_EQ(
+        0, streamer->add_with_id_impl(0, original.data(), meta, write_context));
+
+    std::promise<void> in_filter, writer_entered, write_finished,
+        search_finished;
+    auto filter_entered = in_filter.get_future();
+    auto writer_started = writer_entered.get_future();
+    auto write_done = write_finished.get_future();
+    auto search_done = search_finished.get_future();
+    int write_status = core::IndexError_Runtime;
+    std::thread writer([&] {
+      if (filter_entered.wait_for(5s) != std::future_status::ready)
+        std::_Exit(2);
+      writer_entered.set_value();
+      write_status = streamer->add_with_id_impl(0, replacement.data(), meta,
+                                                write_context);
+      write_finished.set_value();
+    });
+
+    auto query = std::make_shared<HNSWQueryParam>();
+    query->topk = 1;
+    query->is_linear = true;
+    query->filter = std::make_shared<IndexFilter>();
+    query->filter->set([&](uint64_t key) {
+      in_filter.set_value();
+      if (writer_started.wait_for(5s) != std::future_status::ready)
+        std::_Exit(3);
+      EXPECT_EQ(std::future_status::timeout, write_done.wait_for(100ms));
+      VectorDataBuffer fetched;
+      if (index->fetch(key, &fetched) != 0) std::_Exit(4);
+      const auto &bytes =
+          std::get<DenseVectorBuffer>(fetched.vector_buffer).data;
+      EXPECT_EQ(std::string(reinterpret_cast<const char *>(original.data()),
+                            sizeof(original)),
+                bytes);
+      return false;
+    });
+    std::thread reader([&] {
+      SearchResult result;
+      EXPECT_EQ(0, index->search(VectorData{DenseVector{original.data()}},
+                                 query, &result));
+      EXPECT_EQ(1u, result.doc_list_.size());
+      search_finished.set_value();
+    });
+    if (search_done.wait_for(10s) != std::future_status::ready) std::_Exit(5);
+    if (write_done.wait_for(5s) != std::future_status::ready) std::_Exit(6);
+    reader.join();
+    writer.join();
+    EXPECT_EQ(0, write_status);
+    VectorDataBuffer updated;
+    ASSERT_EQ(0, index->fetch(0, &updated));
+    const auto &bytes = std::get<DenseVectorBuffer>(updated.vector_buffer).data;
+    ASSERT_EQ(sizeof(replacement), bytes.size());
+    EXPECT_EQ(0, std::memcmp(replacement.data(), bytes.data(), bytes.size()));
+    write_context.reset();
+    EXPECT_EQ(0, index->close());
+  };
+  ASSERT_EXIT((run(), std::_Exit(::testing::Test::HasFailure() ? 1 : 0)),
+              ::testing::ExitedWithCode(0), "");
+}
+#endif
 
 TEST(IndexInterface, GraphRefineKeepsLegacyDefaultCandidateCount) {
   constexpr uint32_t kTopk = 10;

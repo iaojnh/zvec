@@ -145,6 +145,42 @@ int HnswStreamer::RestoreQuantizer(
   return 0;
 }
 
+class HnswStreamer::BufferedReadGuard {
+ public:
+  explicit BufferedReadGuard(std::shared_mutex *mutex)
+      : protects_graph_(mutex != nullptr) {
+    if (!mutex) return;
+    // A search callback can call another read API on the same streamer.
+    // Retain the outer lock and avoid reacquiring it behind a waiting writer.
+    for (auto *guard = active_; guard; guard = guard->previous_) {
+      if (guard->lock_.mutex() == mutex) return;
+    }
+    lock_ = std::shared_lock(*mutex);
+    previous_ = active_;
+    active_ = this;
+  }
+
+  ~BufferedReadGuard() {
+    if (lock_.owns_lock()) active_ = previous_;
+  }
+
+  bool protects_graph() const {
+    return protects_graph_;
+  }
+
+  BufferedReadGuard(const BufferedReadGuard &) = delete;
+  BufferedReadGuard &operator=(const BufferedReadGuard &) = delete;
+
+ private:
+  static thread_local const BufferedReadGuard *active_;
+  const bool protects_graph_;
+  const BufferedReadGuard *previous_{nullptr};
+  std::shared_lock<std::shared_mutex> lock_;
+};
+
+thread_local const HnswStreamer::BufferedReadGuard
+    *HnswStreamer::BufferedReadGuard::active_ = nullptr;
+
 HnswStreamer::HnswStreamer() = default;
 
 HnswStreamer::~HnswStreamer() {
@@ -949,12 +985,11 @@ void HnswStreamer::bind_search_dist_space(HnswContext *ctx) const {
                        meta_.element_size(), extra_values_size);
 }
 
-std::shared_lock<std::shared_mutex> HnswStreamer::lock_buffered_reads() const {
-  std::shared_lock<std::shared_mutex> lock(buffered_graph_mutex_,
-                                           std::defer_lock);
-  if (entity_ && entity_->storage_mode() == HnswStorageMode::kBufferPool)
-    lock.lock();
-  return lock;
+HnswStreamer::BufferedReadGuard HnswStreamer::lock_buffered_reads() const {
+  return BufferedReadGuard(entity_ && entity_->storage_mode() ==
+                                          HnswStorageMode::kBufferPool
+                               ? &buffered_graph_mutex_
+                               : nullptr);
 }
 
 std::unique_lock<std::shared_mutex> HnswStreamer::lock_buffered_writes() {
@@ -979,7 +1014,7 @@ int HnswStreamer::get_vector(uint64_t key,
     block.reset();
     return error;
   }
-  if (!guard.owns_lock() || read_only_) {
+  if (!guard.protects_graph() || read_only_) {
     return entity_->get_vector_by_key(key, block);
   }
   const auto id = entity_->get_id(key);
@@ -1005,7 +1040,7 @@ int HnswStreamer::get_vector_by_id(uint32_t id,
     return error;
   }
   // The caller can retain the block after the read lock is released.
-  return guard.owns_lock() && !read_only_
+  return guard.protects_graph() && !read_only_
              ? entity_->get_vector_snapshot(id, block)
              : entity_->get_vector(id, block);
 }
@@ -1232,7 +1267,7 @@ int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
 int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
                               uint32_t count,
                               IndexStreamer::Context::Pointer &context) const {
-  auto guard = lock_buffered_reads();
+  const auto guard = lock_buffered_reads();
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   int ret = check_params(query, qmeta, true);
@@ -1246,7 +1281,6 @@ int HnswStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
   }
 
   if (entity_->doc_cnt() <= ctx->get_bruteforce_threshold()) {
-    if (guard.owns_lock()) guard.unlock();
     return search_bf_impl(query, qmeta, count, context);
   }
 
@@ -1295,7 +1329,7 @@ int HnswStreamer::search_candidates_impl(
     const void *query, const IndexQueryMeta &qmeta, std::vector<uint64_t> &keys,
     IndexStreamer::Context::Pointer &context,
     std::vector<float> *scores) const {
-  auto guard = lock_buffered_reads();
+  const auto guard = lock_buffered_reads();
   if (entity_ && entity_->mutation_error() != 0)
     return entity_->mutation_error();
   keys.clear();
@@ -1314,7 +1348,6 @@ int HnswStreamer::search_candidates_impl(
   }
 
   if (entity_->doc_cnt() <= ctx->get_bruteforce_threshold()) {
-    if (guard.owns_lock()) guard.unlock();
     return IndexRunner::search_candidates_impl(query, qmeta, keys, context,
                                                scores);
   }
