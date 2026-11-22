@@ -130,7 +130,7 @@ const Neighbors HnswSparseStreamerEntity::get_neighbors(level_t level,
   size_t size = chunk->read(offset, neighbor_block, neighbor_size);
   if (ailego_unlikely(size != neighbor_size)) {
     LOG_ERROR("Read neighbor header failed, ret=%zu", size);
-    return Neighbors();
+    return Neighbors(chunk->read_error());
   }
   return Neighbors(std::move(neighbor_block));
 }
@@ -158,7 +158,9 @@ int HnswSparseStreamerEntity::get_vector_meta(
   if (ailego_unlikely(ret != read_size)) {
     LOG_ERROR("Read vector failed, offset=%u, read size=%zu, ret=%zu",
               loc.second, read_size, ret);
-    return IndexError_ReadData;
+    const int error = node_chunks_[loc.first]->read_error();
+    block.reset();
+    return error;
   }
 
   return 0;
@@ -185,20 +187,11 @@ int HnswSparseStreamerEntity::get_vector_metas(
     const node_id_t *ids, uint32_t count,
     std::vector<IndexStorage::MemoryBlock> &block_vecs) const {
   block_vecs.resize(count);
-  for (auto i = 0U; i < count; ++i) {
-    auto loc = get_vector_chunk_loc(ids[i]);
-    ailego_assert_with(loc.first < node_chunks_.size(), "invalid chunk idx");
-    ailego_assert_with(loc.second < node_chunks_[loc.first]->data_size(),
-                       "invalid chunk offset");
-
-    size_t read_size = sparse_meta_size();
-
-    size_t ret =
-        node_chunks_[loc.first]->read(loc.second, block_vecs[i], read_size);
-    if (ailego_unlikely(ret != read_size)) {
-      LOG_ERROR("Read vector failed, offset=%u, read size=%zu, ret=%zu",
-                loc.second, read_size, ret);
-      return IndexError_ReadData;
+  for (uint32_t i = 0; i < count; ++i) {
+    const int ret = get_vector_meta(ids[i], block_vecs[i]);
+    if (ret != 0) {
+      block_vecs.clear();
+      return ret;
     }
   }
 
@@ -230,7 +223,9 @@ int HnswSparseStreamerEntity::get_sparse_data(
   if (ailego_unlikely(ret != len)) {
     LOG_ERROR("Read sparse vector failed, offset=%zu, read size=%u, ret=%zu",
               (size_t)offset, len, ret);
-    return IndexError_ReadData;
+    const int error = sparse_node_chunks_[loc.first]->read_error();
+    block.reset();
+    return error;
   }
   return 0;
 }
@@ -245,7 +240,11 @@ const void *HnswSparseStreamerEntity::get_sparse_data(node_id_t id) const {
 int HnswSparseStreamerEntity::get_sparse_data(
     node_id_t id, IndexStorage::MemoryBlock &block) const {
   IndexStorage::MemoryBlock meta_block;
-  get_vector_meta(id, meta_block);
+  const int ret = get_vector_meta(id, meta_block);
+  if (ret != 0) {
+    block.reset();
+    return ret;
+  }
   int sparse_length = 0;
   return get_sparse_data_from_vector(meta_block.data(), block, sparse_length);
 }
@@ -253,6 +252,7 @@ int HnswSparseStreamerEntity::get_sparse_data(
 //! Get sparse data from vector
 std::pair<const void *, uint32_t>
 HnswSparseStreamerEntity::get_sparse_data_from_vector(const void *vec) const {
+  if (!vec) return {nullptr, 0};
   const char *vec_ptr = reinterpret_cast<const char *>(vec);
 
   uint64_t offset = *((uint64_t *)(vec_ptr));
@@ -276,6 +276,9 @@ HnswSparseStreamerEntity::get_sparse_data_from_vector(const void *vec) const {
 int HnswSparseStreamerEntity::get_sparse_data_from_vector(
     const void *vec, IndexStorage::MemoryBlock &block,
     int &sparse_length) const {
+  block.reset();
+  sparse_length = 0;
+  if (!vec) return IndexError_ReadData;
   const char *vec_ptr = reinterpret_cast<const char *>(vec);
 
   uint64_t offset = *((uint64_t *)(vec_ptr));
@@ -286,7 +289,7 @@ int HnswSparseStreamerEntity::get_sparse_data_from_vector(
     if (ailego_unlikely(ret != 0)) {
       LOG_ERROR("Get nullptr sparse, offset=%zu, len=%u", (size_t)offset,
                 sparse_vector_len);
-      return IndexError_ReadData;
+      return ret;
     }
     sparse_length = sparse_vector_len;
   }
@@ -958,8 +961,10 @@ int HnswSparseStreamerEntity::get_sparse_vector_by_key(
 int HnswSparseStreamerEntity::get_sparse_vector_by_id(
     node_id_t id, uint32_t *sparse_count, std::string *sparse_indices_buffer,
     std::string *sparse_values_buffer) const {
+  if (id >= doc_cnt()) return IndexError_NoExist;
   IndexStorage::MemoryBlock block;
-  get_sparse_data(id, block);
+  const int ret = get_sparse_data(id, block);
+  if (ret != 0) return ret;
   const void *sparse_data = block.data();
   if (sparse_data == nullptr) {
     return IndexError_InvalidValue;

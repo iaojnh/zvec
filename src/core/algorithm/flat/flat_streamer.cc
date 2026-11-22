@@ -429,7 +429,8 @@ int FlatStreamer<BATCH_SIZE>::search_bf_impl(const void *query,
       return ret;
     }
     heap->sort();
-    bf_context->topk_to_result(q);
+    if (const int status = bf_context->topk_to_result(q); status != 0)
+      return status;
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
   return 0;
@@ -482,7 +483,8 @@ int FlatStreamer<BATCH_SIZE>::search_bf_by_p_keys_impl(
                 IndexError::What(ret));
       return ret;
     }
-    bf_context->take_topk_result(q);
+    if (const int status = bf_context->take_topk_result(q); status != 0)
+      return status;
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
   return 0;
@@ -673,7 +675,7 @@ int FlatStreamer<BATCH_SIZE>::search_external(
       }
     }
     clear_batch();
-    ctx->take_topk_result(q);
+    if (const int status = ctx->take_topk_result(q); status != 0) return status;
     if (ctx->fetch_vector()) {
       // Match HNSW's borrowed random-access result contract. Scan pages have
       // already been released, so result pointers must come from the source.
@@ -752,7 +754,9 @@ int FlatStreamer<BATCH_SIZE>::group_by_search_impl(
       if (!bf_context->filter().is_valid() || !bf_context->filter()(key)) {
         dist_t dist = 0;
         IndexStorage::MemoryBlock block;
-        if (entity_->get_vector_by_key(key, block) != 0) continue;
+        const int status = entity_->get_vector_by_key(key, block);
+        if (status == IndexError_NoExist) continue;
+        if (status != 0) return status;
         entity_->row_major_distance(query, block.data(), 1, &dist);
 
         std::string group_id = group_by(key);
@@ -763,7 +767,8 @@ int FlatStreamer<BATCH_SIZE>::group_by_search_impl(
         topk_heap.emplace(key, dist);
       }
     }
-    bf_context->topk_to_group_result(q);
+    if (const int status = bf_context->topk_to_group_result(q); status != 0)
+      return status;
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
   return 0;
@@ -802,7 +807,9 @@ int FlatStreamer<BATCH_SIZE>::group_by_search_p_keys_impl(
       if (!bf_context->filter().is_valid() || !bf_context->filter()(key)) {
         dist_t dist = 0;
         IndexStorage::MemoryBlock block;
-        if (entity_->get_vector_by_key(key, block) != 0) continue;
+        const int status = entity_->get_vector_by_key(key, block);
+        if (status == IndexError_NoExist) continue;
+        if (status != 0) return status;
         entity_->row_major_distance(query, block.data(), 1, &dist);
 
         std::string group_id = group_by(key);
@@ -813,7 +820,8 @@ int FlatStreamer<BATCH_SIZE>::group_by_search_p_keys_impl(
         topk_heap.emplace(key, dist);
       }
     }
-    bf_context->topk_to_group_result(q);
+    if (const int status = bf_context->topk_to_group_result(q); status != 0)
+      return status;
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
   return 0;

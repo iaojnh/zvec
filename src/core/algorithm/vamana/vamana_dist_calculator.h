@@ -73,14 +73,14 @@ class VamanaDistCalculator {
   }
 
   inline void reset_query(const void *query) {
-    error_ = false;
+    error_ = 0;
     query_ = query;
   }
 
   inline dist_t dist(const void *vec_lhs, const void *vec_rhs) {
     if (ailego_unlikely(vec_lhs == nullptr || vec_rhs == nullptr)) {
       LOG_ERROR("Nullptr of dense vector");
-      error_ = true;
+      error_ = IndexError_Runtime;
       return 0.0f;
     }
     float score{0.0f};
@@ -96,9 +96,10 @@ class VamanaDistCalculator {
   inline dist_t dist(node_id_t id) {
     compare_cnt_++;
     IndexStorage::MemoryBlock feat_block;
-    if (ailego_unlikely(entity_->get_vector(id, feat_block) != 0)) {
-      LOG_ERROR("Get nullptr vector, id=%u", id);
-      error_ = true;
+    const int status = entity_->get_vector(id, feat_block);
+    if (ailego_unlikely(status != 0)) {
+      LOG_ERROR("Failed to read vector, id=%u", id);
+      error_ = status;
       return 0.0f;
     }
     return dist(feat_block.data(), query_);
@@ -111,7 +112,7 @@ class VamanaDistCalculator {
     if (ailego_unlikely(entity_->get_vector(lhs, feat_block) != 0 ||
                         entity_->get_vector(rhs, query_block) != 0)) {
       LOG_ERROR("Get nullptr vector");
-      error_ = true;
+      error_ = IndexError_Runtime;
       return 0.0f;
     }
     return dist(feat_block.data(), query_block.data());
@@ -128,9 +129,10 @@ class VamanaDistCalculator {
   inline dist_t batch_dist(node_id_t id) {
     compare_cnt_++;
     IndexStorage::MemoryBlock feat_block;
-    if (ailego_unlikely(entity_->get_vector(id, feat_block) != 0)) {
-      LOG_ERROR("Get nullptr vector, id=%u", id);
-      error_ = true;
+    const int status = entity_->get_vector(id, feat_block);
+    if (ailego_unlikely(status != 0)) {
+      LOG_ERROR("Failed to read vector, id=%u", id);
+      error_ = status;
       return 0.0f;
     }
     const void *feat = feat_block.data();
@@ -156,14 +158,20 @@ class VamanaDistCalculator {
 
   inline void clear() {
     compare_cnt_ = 0;
-    error_ = false;
+    error_ = 0;
   }
 
   inline void clear_compare_cnt() {
     compare_cnt_ = 0;
   }
   inline bool error() const {
+    return error_ != 0;
+  }
+  int error_code() const {
     return error_;
+  }
+  void set_error(int error) {
+    error_ = error;
   }
   inline uint32_t compare_cnt() const {
     return compare_cnt_;
@@ -182,7 +190,7 @@ class VamanaDistCalculator {
   const void *query_;
   uint32_t dim_;
   uint32_t compare_cnt_;
-  bool error_{false};
+  int error_{0};
 };
 
 }  // namespace core

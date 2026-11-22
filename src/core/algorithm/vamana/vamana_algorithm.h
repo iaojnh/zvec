@@ -87,7 +87,7 @@ class VamanaAlgorithm : public VamanaAlgorithmBase {
   // unvisited candidate until the search list is exhausted or scan limit
   // is reached. Results accumulate in topk_heap.
   int greedy_search(node_id_t entry_point, VamanaContext *ctx,
-                    bool use_pool) const;
+                    bool building) const;
 
   // RobustPrune: given a candidate set (topk_heap), select up to max_degree
   // diverse neighbors using alpha-based distance comparison.

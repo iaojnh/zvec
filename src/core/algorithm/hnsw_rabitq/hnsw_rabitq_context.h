@@ -137,26 +137,23 @@ class HnswRabitqContext : public IndexContext {
     }
   }
 
-  inline void topk_to_result() {
+  inline int topk_to_result() {
     return topk_to_result(0);
   }
 
   //! Construct result from topk heap, result will be normalized
-  inline void topk_to_result(uint32_t idx) {
-    if (group_by_search()) {
-      topk_to_group_result(idx);
-    } else {
-      topk_to_single_result(idx);
-    }
+  inline int topk_to_result(uint32_t idx) {
+    return group_by_search() ? topk_to_group_result(idx)
+                             : topk_to_single_result(idx);
   }
 
-  inline void topk_to_single_result(uint32_t idx) {
+  inline int topk_to_single_result(uint32_t idx) {
     if (force_padding_topk_ && !topk_heap_.full() &&
         topk_heap_.size() < entity_->doc_cnt()) {
       this->fill_random_to_topk_full();
     }
     if (ailego_unlikely(topk_heap_.size() == 0)) {
-      return;
+      return 0;
     }
 
     ailego_assert_with(idx < results_.size(), "invalid idx");
@@ -173,7 +170,11 @@ class HnswRabitqContext : public IndexContext {
       node_id_t id = topk_heap_[i].first;
       if (fetch_vector_) {
         IndexStorage::MemoryBlock block;
-        entity_->get_vector(id, block);
+        const int status = entity_->get_vector(id, block);
+        if (status != 0) {
+          results_[idx].clear();
+          return status;
+        }
         results_[idx].emplace_back(entity_->get_key(id), score.est_dist, id,
                                    std::move(block));
       } else {
@@ -181,11 +182,11 @@ class HnswRabitqContext : public IndexContext {
       }
     }
 
-    return;
+    return 0;
   }
 
   //! Construct result from topk heap, result will be normalized
-  inline void topk_to_group_result(uint32_t idx) {
+  inline int topk_to_group_result(uint32_t idx) {
     ailego_assert_with(idx < group_results_.size(), "invalid idx");
 
     group_results_[idx].clear();
@@ -239,7 +240,11 @@ class HnswRabitqContext : public IndexContext {
         if (fetch_vector_) {
           IndexStorage::MemoryBlock block;
 
-          entity_->get_vector(id, block);
+          const int status = entity_->get_vector(id, block);
+          if (status != 0) {
+            group_results_[idx].clear();
+            return status;
+          }
           group_results_[idx][i].mutable_docs()->emplace_back(
               entity_->get_key(id), score.est_dist, id, std::move(block));
         } else {
@@ -248,6 +253,7 @@ class HnswRabitqContext : public IndexContext {
         }
       }
     }
+    return 0;
   }
 
   inline void reset_query(const void *query) {
@@ -413,6 +419,11 @@ class HnswRabitqContext : public IndexContext {
 
   inline bool error() const {
     return dc().error();
+  }
+
+  void clear_insert_heaps() noexcept {
+    for (auto &heap : level_topks_) heap.clear();
+    update_heap_.clear();
   }
 
   inline void clear() {

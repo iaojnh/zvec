@@ -124,10 +124,13 @@ const void *HnswSparseSearcherEntity::get_vector_meta(node_id_t id) const {
 
 int HnswSparseSearcherEntity::get_vector_meta(
     const node_id_t id, IndexStorage::MemoryBlock &block) const {
+  block.reset();
   const size_t size = sparse_meta_size();
   if (sparse_vector_meta_->read(size * id, block, size) != size) {
     LOG_ERROR("Read vector from segment failed");
-    return IndexError_ReadData;
+    const int error = sparse_vector_meta_->read_error();
+    block.reset();
+    return error;
   }
   return 0;
 }
@@ -186,7 +189,7 @@ const Neighbors HnswSparseSearcherEntity::get_neighbors(level_t level,
                             sizeof(SparseGraphNeighborMeta)) !=
                         sizeof(SparseGraphNeighborMeta))) {
       LOG_ERROR("Read neighbors meta from segment failed");
-      return {0, nullptr};
+      return Neighbors(neighbors_meta_->read_error());
     }
 
     const auto *m =
@@ -196,7 +199,7 @@ const Neighbors HnswSparseSearcherEntity::get_neighbors(level_t level,
                                          m->neighbor_cnt * sizeof(node_id_t)) !=
                         m->neighbor_cnt * sizeof(node_id_t))) {
       LOG_ERROR("Read neighbors from segment failed");
-      return {0, nullptr};
+      return Neighbors(neighbors_->read_error());
     }
     Neighbors result(static_cast<uint32_t>(m->neighbor_cnt),
                      static_cast<const node_id_t *>(data.data()));
@@ -211,7 +214,7 @@ const Neighbors HnswSparseSearcherEntity::get_neighbors(level_t level,
                           sizeof(HnswSparseNeighborMeta)) !=
                       sizeof(HnswSparseNeighborMeta))) {
     LOG_ERROR("Read neighbors meta from segment failed");
-    return {0, nullptr};
+    return Neighbors(upper_neighbors_meta_->read_error());
   }
 
   const auto *m =
@@ -224,7 +227,7 @@ const Neighbors HnswSparseSearcherEntity::get_neighbors(level_t level,
           upper_neighbors_->read(offset, data, upper_neighbors_size()) !=
           upper_neighbors_size())) {
     LOG_ERROR("Read neighbors from segment failed");
-    return {0, nullptr};
+    return Neighbors(upper_neighbors_->read_error());
   }
 
   return Neighbors(std::move(data));
@@ -579,7 +582,9 @@ int HnswSparseSearcherEntity::get_sparse_data(
     uint64_t offset, uint32_t len, IndexStorage::MemoryBlock &block) const {
   if (sparse_vectors_->read(offset, block, len) != len) {
     LOG_ERROR("Read sparse data from segment failed");
-    return IndexError_ReadData;
+    const int error = sparse_vectors_->read_error();
+    block.reset();
+    return error;
   }
   return 0;
 }

@@ -1280,23 +1280,26 @@ int FlatSearcherContext<BATCH_SIZE>::group_by_search_impl(
   };
 
   auto provider = owner_->create_provider();
+  if (!provider) return IndexError_NoReady;
 
   for (size_t q = 0; q < count; ++q) {
     this->group_topk_heaps().clear();
 
     for (node_id_t id = 0; id < provider->count(); ++id) {
-      if (!this->filter().is_valid() || !this->filter()(owner_->key(id))) {
+      const auto key = owner_->key(id);
+      if (!this->filter().is_valid() || !this->filter()(key)) {
+        IndexStorage::MemoryBlock block;
+        const int status = provider->get_vector(key, block);
+        if (status != 0) return status;
         dist_t dist = 0;
         if (quantizer_) {
-          dist = quantizer_->calc_distance_dp_query(
-              provider->get_vector(owner_->key(id)), query);
+          dist = quantizer_->calc_distance_dp_query(block.data(), query);
         } else {
           owner_->distance_matrix().template distance<1>(
-              query, provider->get_vector(owner_->key(id)),
-              provider->dimension(), &dist);
+              query, block.data(), provider->dimension(), &dist);
         }
 
-        std::string group_id = group_by(owner_->key(id));
+        std::string group_id = group_by(key);
         auto &topk_heap = this->group_topk_heaps()[group_id];
         if (topk_heap.empty()) {
           topk_heap.limit(this->group_topk());
@@ -1316,6 +1319,7 @@ int FlatSearcherContext<BATCH_SIZE>::search_bf_by_p_keys_impl(
     const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
     const IndexQueryMeta &qmeta, uint32_t count) {
   auto provider = owner_->create_provider();
+  if (!provider) return IndexError_NoReady;
   if (this->group_by_search()) {
     this->resize_group_results(count);
     if (!this->group_by().is_valid()) {
@@ -1332,13 +1336,16 @@ int FlatSearcherContext<BATCH_SIZE>::search_bf_by_p_keys_impl(
       for (size_t idx = 0; idx < p_keys[q].size(); ++idx) {
         uint64_t pk = p_keys[q][idx];
         if (!this->filter().is_valid() || !this->filter()(pk)) {
+          IndexStorage::MemoryBlock block;
+          const int status = provider->get_vector(pk, block);
+          if (status == IndexError_NoExist) continue;
+          if (status != 0) return status;
           dist_t dist = 0;
           if (quantizer_) {
-            dist = quantizer_->calc_distance_dp_query(provider->get_vector(pk),
-                                                      query);
+            dist = quantizer_->calc_distance_dp_query(block.data(), query);
           } else {
             owner_->distance_matrix().template distance<1>(
-                query, provider->get_vector(pk), provider->dimension(), &dist);
+                query, block.data(), provider->dimension(), &dist);
           }
 
           std::string group_id = group_by(pk);
@@ -1364,13 +1371,16 @@ int FlatSearcherContext<BATCH_SIZE>::search_bf_by_p_keys_impl(
       for (size_t idx = 0; idx < p_keys[q].size(); ++idx) {
         uint64_t pk = p_keys[q][idx];
         if (!this->filter().is_valid() || !this->filter()(pk)) {
+          IndexStorage::MemoryBlock block;
+          const int status = provider->get_vector(pk, block);
+          if (status == IndexError_NoExist) continue;
+          if (status != 0) return status;
           dist_t dist = 0;
           if (quantizer_) {
-            dist = quantizer_->calc_distance_dp_query(provider->get_vector(pk),
-                                                      query);
+            dist = quantizer_->calc_distance_dp_query(block.data(), query);
           } else {
             owner_->distance_matrix().template distance<1>(
-                query, provider->get_vector(pk), provider->dimension(), &dist);
+                query, block.data(), provider->dimension(), &dist);
           }
           result_heaps_[q].emplace(pk, dist, owner_->get_id(pk));
         }

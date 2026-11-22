@@ -272,7 +272,7 @@ int HnswSparseSearcher::search_impl(const uint32_t *sparse_count,
       ctx->recal_topk_dist();
     }
 
-    ctx->topk_to_result(q);
+    if (const int status = ctx->topk_to_result(q); status != 0) return status;
 
     sparse_indices_tmp += sparse_count[q];
     sparse_query_tmp = reinterpret_cast<const char *>(sparse_query_tmp) +
@@ -351,7 +351,7 @@ int HnswSparseSearcher::search_bf_impl(
           topk_heap.emplace(id, dist);
         }
       }
-      ctx->topk_to_result(q);
+      if (const int status = ctx->topk_to_result(q); status != 0) return status;
 
       sparse_indices_tmp += sparse_count[q];
       sparse_query_tmp = reinterpret_cast<const char *>(sparse_query_tmp) +
@@ -377,7 +377,7 @@ int HnswSparseSearcher::search_bf_impl(
           ctx->topk_heap().emplace(id, dist);
         }
       }
-      ctx->topk_to_result(q);
+      if (const int status = ctx->topk_to_result(q); status != 0) return status;
 
       sparse_indices_tmp += sparse_count[q];
       sparse_query_tmp = reinterpret_cast<const char *>(sparse_query_tmp) +
@@ -463,7 +463,7 @@ int HnswSparseSearcher::search_bf_by_p_keys_impl(
           }
         }
       }
-      ctx->topk_to_result(q);
+      if (const int status = ctx->topk_to_result(q); status != 0) return status;
 
       sparse_indices_tmp += sparse_count[q];
       sparse_query_tmp = reinterpret_cast<const char *>(sparse_query_tmp) +
@@ -488,7 +488,7 @@ int HnswSparseSearcher::search_bf_by_p_keys_impl(
           }
         }
       }
-      ctx->topk_to_result(q);
+      if (const int status = ctx->topk_to_result(q); status != 0) return status;
 
       sparse_indices_tmp += sparse_count[q];
       sparse_query_tmp = reinterpret_cast<const char *>(sparse_query_tmp) +

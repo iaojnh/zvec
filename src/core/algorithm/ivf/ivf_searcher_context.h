@@ -194,16 +194,18 @@ class IVFSearcherContext : public IndexSearcher::Context {
     return stats_vec_[idx];
   }
 
-  void topk_to_result(uint32_t idx) {
+  int topk_to_result(uint32_t idx) try {
     if (ailego_unlikely(result_heap_.size() == 0)) {
-      return;
+      return 0;
     }
 
     ailego_assert_with(idx < results_.size(), "invalid idx");
-    int size = std::min(topk_, static_cast<uint32_t>(result_heap_.size()));
+    const size_t size = std::min<size_t>(topk_, result_heap_.size());
     result_heap_.sort();
-    results_[idx].clear();
-    for (int i = 0; i < size; ++i) {
+    auto &result = results_[idx];
+    result.clear();
+    if (fetch_vector_) result.reserve(size);
+    for (size_t i = 0; i < size; ++i) {
       auto score = result_heap_[i].score();
       if (score > this->threshold()) {
         break;
@@ -212,12 +214,20 @@ class IVFSearcherContext : public IndexSearcher::Context {
       key_t key = result_heap_[i].key();
       if (fetch_vector_) {
         IndexStorage::MemoryBlock block;
-        entity_->get_vector_by_key(key, block);
-        results_[idx].emplace_back(key, score, key, block);
+        const int ret = entity_->get_vector_by_key(key, block);
+        if (ret != 0) {
+          result.clear();
+          return ret;
+        }
+        result.emplace_back(key, score, key, std::move(block));
       } else {
-        results_[idx].emplace_back(key, score);
+        result.emplace_back(key, score);
       }
     }
+    return 0;
+  } catch (const std::bad_alloc &) {
+    results_[idx].clear();
+    return IndexError_NoMemory;
   }
 
  private:

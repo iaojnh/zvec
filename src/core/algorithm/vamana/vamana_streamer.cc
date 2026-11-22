@@ -746,7 +746,7 @@ int VamanaStreamer::search_impl(const void *query, const IndexQueryMeta &qmeta,
       LOG_ERROR("Vamana search failed");
       return ret;
     }
-    ctx->topk_to_result(q);
+    if (const int status = ctx->topk_to_result(q); status != 0) return status;
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
 
@@ -864,7 +864,7 @@ int VamanaStreamer::search_bf_impl(const void *query,
         topk.emplace(id, dist);
       }
     }
-    ctx->topk_to_result(q);
+    if (const int status = ctx->topk_to_result(q); status != 0) return status;
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
 
@@ -909,7 +909,7 @@ int VamanaStreamer::search_bf_by_p_keys_impl(
         topk.emplace(id, dist);
       }
     }
-    ctx->topk_to_result(q);
+    if (const int status = ctx->topk_to_result(q); status != 0) return status;
     query = static_cast<const char *>(query) + qmeta.element_size();
   }
 

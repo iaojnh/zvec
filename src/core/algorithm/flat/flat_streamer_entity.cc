@@ -333,7 +333,8 @@ int FlatStreamerEntity::add(uint64_t key, const void *vec, size_t size) {
   }
 
   IndexStorage::MemoryBlock head_block;
-  this->get_head_block(head_block);
+  const int head_ret = this->get_head_block(head_block);
+  if (head_ret != 0) return head_ret;
   BlockLocation block;
   {
     const BlockLocation *bl =
@@ -404,7 +405,8 @@ int FlatStreamerEntity::search(const void *query, const IndexFilter &filter,
                              &local_scratch, batch_size);
   }
   IndexStorage::MemoryBlock head_block;
-  this->get_head_block(head_block);
+  const int head_status = this->get_head_block(head_block);
+  if (head_status != 0) return head_status;
   const BlockLocation *bl =
       reinterpret_cast<const BlockLocation *>(head_block.data());
   if (ailego_unlikely(bl == nullptr)) {
@@ -416,7 +418,8 @@ int FlatStreamerEntity::search(const void *query, const IndexFilter &filter,
 
   while (this->is_valid_block(block)) {
     IndexStorage::MemoryBlock block_header_block;
-    this->get_block_header(block, block_header_block);
+    const int header_status = this->get_block_header(block, block_header_block);
+    if (header_status != 0) return header_status;
     const BlockHeader *hd =
         reinterpret_cast<const BlockHeader *>(block_header_block.data());
     if (ailego_unlikely(hd == nullptr)) {
@@ -427,16 +430,20 @@ int FlatStreamerEntity::search(const void *query, const IndexFilter &filter,
     if (hd->vector_count > 0) {
       *scan_count += hd->vector_count;
       IndexStorage::MemoryBlock deletion_map_block;
-      this->get_block_deletion_map(block, deletion_map_block);
+      const int deletion_status =
+          this->get_block_deletion_map(block, deletion_map_block);
+      if (deletion_status != 0) return deletion_status;
       const DeletionMap *deletion_map =
           reinterpret_cast<const DeletionMap *>(deletion_map_block.data());
+      int status;
       if (filter.is_valid() || deletion_map->is_dirty()) {
-        this->search_block(query, block, hd, 1.0, filter, deletion_map, heap,
-                           context_stats);
+        status = this->search_block(query, block, hd, 1.0, filter, deletion_map,
+                                    heap, context_stats);
       } else {
         *(context_stats->mutable_dist_calced_count()) += hd->vector_count;
-        this->search_block(query, block, hd, 1.0, heap);
+        status = this->search_block(query, block, hd, 1.0, heap);
       }
+      if (status != 0) return status;
     }
     block = hd->next;
   }
@@ -459,7 +466,9 @@ int FlatStreamerEntity::search_batch_rows(
   BlockLocation block;
   {
     IndexStorage::MemoryBlock head;
-    if (get_head_block(head) != 0 || !head.data()) return IndexError_ReadData;
+    const int status = get_head_block(head);
+    if (status != 0) return status;
+    if (!head.data()) return IndexError_ReadData;
     std::memcpy(&block, head.data(), sizeof(block));
   }
   if (!is_valid_block(block)) return 0;
@@ -526,8 +535,9 @@ int FlatStreamerEntity::search_batch_rows(
     IndexStorage::MemoryBlock data;
     const uint8_t *body = base ? base + offset : nullptr;
     if (!body) {
-      if (segment->read(offset, data, block_size) != block_size || !data.data())
-        return IndexError_ReadData;
+      if (segment->read(offset, data, block_size) != block_size)
+        return segment->read_error();
+      if (!data.data()) return IndexError_ReadData;
       body = static_cast<const uint8_t *>(data.data());
     }
     BlockHeader header;
@@ -578,9 +588,9 @@ int FlatStreamerEntity::search_by_p_keys(const void *query,
       continue;
     }
     IndexStorage::MemoryBlock block;
-    if (get_vector_by_key(key, block) != 0) {
-      continue;
-    }
+    const int ret = get_vector_by_key(key, block);
+    if (ret == IndexError_NoExist) continue;
+    if (ret != 0) return ret;
     dist_t distance = 0;
     row_major_distance(query, block.data(), 1, &distance);
     heap->emplace(key, distance);
@@ -589,16 +599,17 @@ int FlatStreamerEntity::search_by_p_keys(const void *query,
 }
 
 //! Search in a block
-void FlatStreamerEntity::search_block(const void *query,
-                                      const BlockLocation &bl,
-                                      const BlockHeader *hd, float norm_val,
-                                      IndexDocumentHeap *heap) const {
+int FlatStreamerEntity::search_block(const void *query, const BlockLocation &bl,
+                                     const BlockHeader *hd, float norm_val,
+                                     IndexDocumentHeap *heap) const {
   std::vector<float> distances(block_vector_count());
   IndexStorage::MemoryBlock vecs_block;
-  this->get_block_vectors(bl, vecs_block);
+  const int vec_status = this->get_block_vectors(bl, vecs_block);
+  if (vec_status != 0) return vec_status;
   const char *vecs = reinterpret_cast<const char *>(vecs_block.data());
   IndexStorage::MemoryBlock keys_block;
-  this->get_block_keys(bl, keys_block);
+  const int key_status = this->get_block_keys(bl, keys_block);
+  if (key_status != 0) return key_status;
   const uint64_t *keys = reinterpret_cast<const uint64_t *>(keys_block.data());
   row_major_distance(query, vecs, hd->vector_count, distances.data());
   for (size_t k = 0; k < hd->vector_count; ++k) {
@@ -606,20 +617,25 @@ void FlatStreamerEntity::search_block(const void *query,
       heap->emplace(keys[k], distances[k] * norm_val);
     }
   }
+  return 0;
 }
 
 //! Search in a block with filter
-void FlatStreamerEntity::search_block(
-    const void *query, const BlockLocation &bl, const BlockHeader *hd,
-    float norm_val, const IndexFilter &filter, const DeletionMap *deletion_map,
-    IndexDocumentHeap *heap, IndexContext::Stats *context_stats) const {
+int FlatStreamerEntity::search_block(const void *query, const BlockLocation &bl,
+                                     const BlockHeader *hd, float norm_val,
+                                     const IndexFilter &filter,
+                                     const DeletionMap *deletion_map,
+                                     IndexDocumentHeap *heap,
+                                     IndexContext::Stats *context_stats) const {
   std::vector<float> distances(block_vector_count());
 
   IndexStorage::MemoryBlock vecs_block;
-  this->get_block_vectors(bl, vecs_block);
+  const int vec_status = this->get_block_vectors(bl, vecs_block);
+  if (vec_status != 0) return vec_status;
   const char *vecs = reinterpret_cast<const char *>(vecs_block.data());
   IndexStorage::MemoryBlock keys_block;
-  this->get_block_keys(bl, keys_block);
+  const int key_status = this->get_block_keys(bl, keys_block);
+  if (key_status != 0) return key_status;
   const uint64_t *keys = reinterpret_cast<const uint64_t *>(keys_block.data());
 
   DeletionMap keeps;
@@ -633,7 +649,7 @@ void FlatStreamerEntity::search_block(
   }
   if (!keeps.is_dirty()) {
     (*context_stats->mutable_filtered_count()) += hd->vector_count;
-    return;
+    return 0;
   }
   for (size_t k = 0; k < hd->vector_count; ++k) {
     if (keeps.test(k)) {
@@ -649,6 +665,7 @@ void FlatStreamerEntity::search_block(
       ++(*context_stats->mutable_filtered_count());
     }
   }
+  return 0;
 }
 
 int FlatStreamerEntity::search_bf(const void *query, const IndexFilter &filter,
@@ -697,6 +714,7 @@ FlatStreamerEntity::Pointer FlatStreamerEntity::clone() const {
 
 int FlatStreamerEntity::get_vector_by_position(
     uint32_t id, IndexStorage::MemoryBlock &block) const {
+  block.reset();
   if (id >= withid_key_info_map_.size()) {
     return -1;
   }
@@ -707,7 +725,9 @@ int FlatStreamerEntity::get_vector_by_position(
           index_meta_.element_size()) {
     LOG_ERROR("Failed to read vector by position, id=%u size=%u", id,
               index_meta_.element_size());
-    return -1;
+    const int error = segment ? segment->read_error() : IndexError_ReadData;
+    block.reset();
+    return error;
   }
   return 0;
 }
@@ -985,6 +1005,7 @@ const void *FlatStreamerEntity::get_vector_by_key(uint64_t key) const {
 
 int FlatStreamerEntity::get_vector_by_key(
     const uint64_t key, IndexStorage::MemoryBlock &block) const {
+  block.reset();
   if (use_external_vector_) return IndexError_Unsupported;
   VectorLocation loc{};
   key_info_map_lock_->lock_shared();
@@ -992,7 +1013,7 @@ int FlatStreamerEntity::get_vector_by_key(
     auto iterator = key_info_map_.find(key);
     if (iterator == key_info_map_.end()) {
       key_info_map_lock_->unlock_shared();
-      return -1;
+      return IndexError_NoExist;
     }
     loc = iterator->second;
   } else {
@@ -1000,23 +1021,27 @@ int FlatStreamerEntity::get_vector_by_key(
       loc = withid_key_info_map_[key];
     } else {
       key_info_map_lock_->unlock_shared();
-      return -1;
+      return IndexError_NoExist;
     }
   }
   key_info_map_lock_->unlock_shared();
 
   auto segment = this->get_segment(loc.segment_id);
-  if (segment->read(loc.offset, block, index_meta_.element_size()) !=
-      index_meta_.element_size()) {
+  if (!segment ||
+      segment->read(loc.offset, block, index_meta_.element_size()) !=
+          index_meta_.element_size()) {
     LOG_ERROR("Failed to read segment, size=%u", index_meta_.element_size());
-    return -1;
+    const int error = segment ? segment->read_error() : IndexError_ReadData;
+    block.reset();
+    return error;
   }
   return 0;
 }
 
 int FlatStreamerEntity::get_vectors_by_key(
     const uint64_t *keys, uint32_t count,
-    std::vector<IndexStorage::MemoryBlock> &blocks) const {
+    std::vector<IndexStorage::MemoryBlock> &blocks) const try {
+  blocks.clear();
   if (use_external_vector_) return IndexError_Unsupported;
   std::vector<VectorLocation> locations(count);
   key_info_map_lock_->lock_shared();
@@ -1067,10 +1092,15 @@ int FlatStreamerEntity::get_vectors_by_key(
         segment->read(loc.offset, blocks[i], index_meta_.element_size()) !=
             index_meta_.element_size()) {
       LOG_ERROR("Failed to read segment, size=%u", index_meta_.element_size());
-      return -1;
+      const int error = segment ? segment->read_error() : IndexError_ReadData;
+      blocks.clear();
+      return error;
     }
   }
   return 0;
+} catch (const std::bad_alloc &) {
+  blocks.clear();
+  return IndexError_NoMemory;
 }
 
 int FlatStreamerEntity::retain_stable_data(
@@ -1554,15 +1584,12 @@ int FlatStreamerEntity::alloc_block(const BlockLocation &next,
 int FlatStreamerEntity::add_to_block(const BlockLocation &block, uint64_t key,
                                      const void *data, size_t size) {
   IndexStorage::MemoryBlock block_header_block;
-  this->get_block_header(block, block_header_block);
-  const BlockHeader *header =
-      reinterpret_cast<const BlockHeader *>(block_header_block.data());
-  if (ailego_unlikely(header == nullptr)) {
-    LOG_ERROR("Failed to get header");
-    return IndexError_ReadData;
-  }
+  const int header_ret = this->get_block_header(block, block_header_block);
+  if (header_ret != 0) return header_ret;
+  BlockHeader hd = *static_cast<const BlockHeader *>(block_header_block.data());
+  block_header_block.reset();
 
-  if (header->vector_count == block_vector_count()) {
+  if (hd.vector_count == block_vector_count()) {
     return IndexError_IndexFull;
   }
 
@@ -1571,26 +1598,25 @@ int FlatStreamerEntity::add_to_block(const BlockLocation &block, uint64_t key,
     return IndexError_WriteData;
   }
 
-  size_t vector_off =
-      get_block_vector_offset(block.block_index, header->vector_count);
+  const size_t vector_off =
+      get_block_vector_offset(block.block_index, hd.vector_count);
+  const size_t key_off =
+      get_block_key_offset(block.block_index, hd.vector_count);
   if (!use_external_vector_ && segment->write(vector_off, data, size) != size) {
     LOG_ERROR("Failed to write vector, off=%zu size=%zu", vector_off, size);
-    return IndexError_WriteData;
+    return segment->write_error();
   }
-
-  size_t key_off =
-      get_block_key_offset(block.block_index, header->vector_count);
   if (segment->write(key_off, &key, sizeof(key)) != sizeof(key)) {
     LOG_ERROR("Failed to write key, off=%zu", key_off);
-    return IndexError_WriteData;
+    return segment->write_error();
   }
 
-  BlockHeader hd = *header;
-  hd.vector_count += 1;
-  size_t hd_off = get_block_header_offset(block.block_index);
+  // Publish the count only after the vector and key have been written.
+  ++hd.vector_count;
+  const size_t hd_off = get_block_header_offset(block.block_index);
   if (segment->write(hd_off, &hd, sizeof(hd)) != sizeof(hd)) {
     LOG_ERROR("Failed to write block header, off=%zu", hd_off);
-    return IndexError_WriteData;
+    return segment->write_error();
   }
 
   VectorLocation loc(block.segment_id, false, vector_off);
@@ -1633,7 +1659,8 @@ int FlatStreamerEntity::add_vector_with_id(const uint32_t id, const void *query,
   meta_dirty_ = true;
   if (id >= vector_count()) {
     IndexStorage::MemoryBlock head_block;
-    this->get_head_block(head_block);
+    const int head_ret = this->get_head_block(head_block);
+    if (head_ret != 0) return head_ret;
     BlockLocation block =
         *reinterpret_cast<const BlockLocation *>(head_block.data());
     // Release buffer-pool pin before any alloc_block() call that may trigger

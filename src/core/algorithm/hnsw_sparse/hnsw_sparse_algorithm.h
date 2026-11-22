@@ -78,8 +78,8 @@ class HnswSparseAlgorithm {
 
  private:
   //! Select in upper layer to get entry point for next layer search
-  void select_entry_point(level_t level, node_id_t *entry_point, dist_t *dist,
-                          HnswSparseContext *ctx) const;
+  int select_entry_point(level_t level, node_id_t *entry_point, dist_t *dist,
+                         HnswSparseContext *ctx, bool strict_reads) const;
 
   //! update node id neighbors from topkHeap, and reverse link is also updated
   void add_neighbors(node_id_t id, level_t level, TopkHeap &topk_heap,
@@ -88,8 +88,9 @@ class HnswSparseAlgorithm {
   //! Given a node id and level, search the nearest neighbors in graph
   //! Note: the nearest neighbors result keeps in topk, and entry_point and
   //! dist will be updated to current level nearest node id and distance
-  void search_neighbors(level_t level, node_id_t *entry_point, dist_t *dist,
-                        TopkHeap &topk, HnswSparseContext *ctx) const;
+  int search_neighbors(level_t level, node_id_t *entry_point, dist_t *dist,
+                       TopkHeap &topk, HnswSparseContext *ctx,
+                       bool strict_reads) const;
 
   //! Update the node's neighbors
   void update_neighbors(HnswSparseDistCalculator &dc, node_id_t id,
@@ -103,7 +104,7 @@ class HnswSparseAlgorithm {
                                 TopkHeap &update_heap);
 
   //! expand neighbors until group nums are reached
-  void expand_neighbors_by_group(TopkHeap &topk, HnswSparseContext *ctx) const;
+  int expand_neighbors_by_group(TopkHeap &topk, HnswSparseContext *ctx) const;
 
  public:
   HnswSparseAlgorithm(const HnswSparseAlgorithm &) = delete;

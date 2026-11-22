@@ -54,7 +54,7 @@ class HnswSparseDistCalculator {
 
   //! Reset query vector data
   inline void reset_query(const void *query) {
-    error_ = false;
+    error_ = 0;
     query_ = query;
   }
 
@@ -65,7 +65,7 @@ class HnswSparseDistCalculator {
     if (ailego_unlikely(sparse_data_lhs == nullptr ||
                         sparse_data_rhs == nullptr)) {
       // LOG_WARN("Nullptr of sparse vector. Return dense score only");
-      // error_ = true;
+      // error_ = IndexError_Runtime;
       return score;
     }
 
@@ -78,33 +78,30 @@ class HnswSparseDistCalculator {
   inline dist_t dist(const void *vec) {
     compare_cnt_++;
 
-    auto sparse_data = entity_->get_sparse_data_from_vector(vec);
-    if (sparse_data.first == nullptr) {
-      error_ = true;
+    IndexStorage::MemoryBlock feat;
+    int length = 0;
+    const int status = entity_->get_sparse_data_from_vector(vec, feat, length);
+    if (ailego_unlikely(status != 0 || !feat.data())) {
+      error_ = status != 0 ? status : IndexError_ReadData;
       return 0.0f;
     }
 
-    return dist(sparse_data.first, query_);
+    return dist(feat.data(), query_);
   }
 
   //! Return distance between query and node id.
   inline dist_t dist(node_id_t id) {
     compare_cnt_++;
 
-    const void *feat = entity_->get_vector_meta(id);
-    if (ailego_unlikely(feat == nullptr)) {
-      LOG_ERROR("Get nullptr vector, id=%u", id);
-      error_ = true;
+    IndexStorage::MemoryBlock feat;
+    const int status = entity_->get_sparse_data(id, feat);
+    if (ailego_unlikely(status != 0 || !feat.data())) {
+      LOG_ERROR("Failed to read sparse vector, id=%u", id);
+      error_ = status != 0 ? status : IndexError_ReadData;
       return 0.0f;
     }
 
-    auto sparse_data = entity_->get_sparse_data_from_vector(feat);
-    if (sparse_data.first == nullptr) {
-      error_ = true;
-      return 0.0f;
-    }
-
-    return dist(sparse_data.first, query_);
+    return dist(feat.data(), query_);
   }
 
   //! Return dist node lhs between node rhs
@@ -112,11 +109,11 @@ class HnswSparseDistCalculator {
     compare_cnt_++;
     IndexStorage::MemoryBlock feat;
     IndexStorage::MemoryBlock query;
-    if (ailego_unlikely(entity_->get_sparse_data(lhs, feat) != 0 ||
-                        entity_->get_sparse_data(rhs, query) != 0 ||
-                        feat.data() == nullptr || query.data() == nullptr)) {
-      LOG_ERROR("Get nullptr sparse vector");
-      error_ = true;
+    int status = entity_->get_sparse_data(lhs, feat);
+    if (status == 0) status = entity_->get_sparse_data(rhs, query);
+    if (ailego_unlikely(status != 0 || !feat.data() || !query.data())) {
+      LOG_ERROR("Failed to read sparse vector");
+      error_ = status != 0 ? status : IndexError_ReadData;
       return 0.0f;
     }
     return dist(feat.data(), query.data());
@@ -136,7 +133,7 @@ class HnswSparseDistCalculator {
 
   inline void clear() {
     compare_cnt_ = 0;
-    error_ = false;
+    error_ = 0;
   }
 
   inline void clear_compare_cnt() {
@@ -144,6 +141,10 @@ class HnswSparseDistCalculator {
   }
 
   inline bool error() const {
+    return error_ != 0;
+  }
+
+  int error_code() const {
     return error_;
   }
 
@@ -164,7 +165,7 @@ class HnswSparseDistCalculator {
   const void *query_;
 
   uint32_t compare_cnt_;  // record distance compute times
-  bool error_{false};
+  int error_{0};
 };
 
 }  // namespace core

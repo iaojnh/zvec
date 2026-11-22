@@ -250,6 +250,7 @@ int64_t HnswRabitqEntity::dump_graph_neighbors(
   for (node_id_t id = 0; id < doc_cnt(); ++id) {
     const Neighbors neighbors =
         get_neighbors(0, reorder_mapping.empty() ? id : reorder_mapping[id]);
+    if (neighbors.status != 0) return neighbors.status;
     ailego_assert_with(!!neighbors.data, "invalid neighbors");
     ailego_assert_with(neighbors.size() <= l0_neighbor_cnt(),
                        "invalid neighbors");
@@ -333,6 +334,7 @@ int64_t HnswRabitqEntity::dump_upper_neighbors(
     ailego_assert_with((size_t)level < kMaxGraphLayers, "invalid level");
     for (level_t cur_level = 1; cur_level <= level; ++cur_level) {
       const Neighbors neighbors = get_neighbors(cur_level, new_id);
+      if (neighbors.status != 0) return neighbors.status;
       ailego_assert_with(!!neighbors.data, "invalid neighbors");
       ailego_assert_with(neighbors.size() <= neighbor_cnt(cur_level),
                          "invalid neighbors");

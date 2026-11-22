@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 #include <gtest/gtest.h>
+#include "ivf_searcher_context.h"
 
 using namespace zvec::core;
 
@@ -49,6 +50,7 @@ class TestSegment : public IndexStorage::Segment {
   }
   size_t fetch(size_t offset, void *buffer, size_t length) const override {
     ++fetch_calls_;
+    if (offset == denied_read_offset_) return 0;
     if (offset > data_size() || length > data_size() - offset) {
       return 0;
     }
@@ -64,12 +66,24 @@ class TestSegment : public IndexStorage::Segment {
   }
   size_t read(size_t offset, IndexStorage::MemoryBlock &block,
               size_t length) override {
+    if (offset == denied_read_offset_) {
+      block.reset();
+      return 0;
+    }
     if (offset > data_size() || length > data_size() - offset) {
       block.reset();
       return 0;
     }
     block.reset(reinterpret_cast<uint8_t *>(values_.data()) + offset);
     return length;
+  }
+  int read_error() const override {
+    return denied_read_offset_ != std::numeric_limits<size_t>::max()
+               ? IndexError_NoMemory
+               : IndexError_ReadData;
+  }
+  void deny_read_at(size_t offset) {
+    denied_read_offset_ = offset;
   }
   size_t write(size_t, const void *, size_t) override {
     return 0;
@@ -99,6 +113,7 @@ class TestSegment : public IndexStorage::Segment {
  private:
   std::vector<Value> values_;
   size_t failed_offset_{std::numeric_limits<size_t>::max()};
+  size_t denied_read_offset_{std::numeric_limits<size_t>::max()};
   bool short_read_{false};
   mutable size_t fetch_calls_{0};
 };
@@ -215,6 +230,66 @@ struct MappingProvider {
 };
 
 }  // namespace
+
+TEST(IVFIndexProviderTest, KeyLookupPreservesBudgetFailureAndClearsResult) {
+  MappingProvider fixture;
+  ASSERT_EQ(0, fixture.load_status);
+  IndexStorage::MemoryBlock output;
+  ASSERT_EQ(0, fixture.provider->get_vector(1, output));
+  ASSERT_NE(nullptr, output.data());
+
+  fixture.mapping->deny_read_at((kVectorCount / 2) * sizeof(uint32_t));
+  EXPECT_EQ(IndexError_NoMemory, fixture.provider->get_vector(1, output));
+  EXPECT_EQ(nullptr, output.data());
+
+  fixture.mapping->deny_read_at(std::numeric_limits<size_t>::max());
+  ASSERT_EQ(0, fixture.provider->get_vector(1, output));
+  EXPECT_EQ(1.0f, *static_cast<const float *>(output.data()));
+}
+
+TEST(IVFIndexProviderTest, ColumnMajorEntityReadsOwnTheirResults) {
+  MappingProvider fixture(/*column_major=*/true);
+  ASSERT_EQ(0, fixture.load_status);
+  IndexStorage::MemoryBlock first, second;
+  ASSERT_EQ(0, fixture.entity->get_vector(0, first));
+  ASSERT_EQ(0, fixture.entity->get_vector(1, second));
+  ASSERT_NE(first.data(), second.data());
+  EXPECT_EQ(static_cast<float>(kVectorCount),
+            *static_cast<const float *>(first.data()));
+  fixture.provider.reset();
+  fixture.entity.reset();
+  EXPECT_EQ(static_cast<float>(kVectorCount - 1),
+            *static_cast<const float *>(second.data()));
+}
+
+TEST(IVFIndexProviderTest, FetchVectorResultClearsPartialOutputOnReadDenial) {
+  MappingProvider fixture(/*column_major=*/true);
+  ASSERT_EQ(0, fixture.load_status);
+  IndexSearcher::Context::Pointer centroid_context;
+  IVFSearcherContext context(fixture.entity, centroid_context);
+  context.set_topk(2);
+  context.set_fetch_vector(true);
+  const auto candidates = [&] {
+    context.reset_results(1);
+    context.mutable_result_heap().emplace(kVectorCount, 0.0f);
+    context.mutable_result_heap().emplace(1, 1.0f);
+  };
+
+  fixture.mapping->deny_read_at(0);  // Only the second candidate needs it.
+  candidates();
+  EXPECT_EQ(IndexError_NoMemory, context.topk_to_result(0));
+  EXPECT_TRUE(context.result().empty());
+
+  fixture.mapping->deny_read_at(std::numeric_limits<size_t>::max());
+  candidates();
+  ASSERT_EQ(0, context.topk_to_result(0));
+  ASSERT_EQ(2, context.result().size());
+  ASSERT_NE(nullptr, context.result()[0].vector());
+  ASSERT_NE(nullptr, context.result()[1].vector());
+  EXPECT_EQ(static_cast<float>(kVectorCount),
+            *static_cast<const float *>(context.result()[0].vector()));
+  EXPECT_EQ(1.0f, *static_cast<const float *>(context.result()[1].vector()));
+}
 
 TEST(IVFIndexProviderTest, MappingFetchFailuresAreStickyAndNotNormalEof) {
   for (size_t failed_rank : {size_t{0}, kMappingChunkEntries}) {

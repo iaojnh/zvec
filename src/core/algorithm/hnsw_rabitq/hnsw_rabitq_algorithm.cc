@@ -13,6 +13,7 @@
 // limitations under the License.
 #include "hnsw_rabitq_algorithm.h"
 #include <chrono>
+#include <ailego/pattern/scope_guard.h>
 #include "hnsw_rabitq_entity.h"
 
 namespace zvec {
@@ -29,6 +30,8 @@ int HnswRabitqAlgorithm::cleanup() {
 
 int HnswRabitqAlgorithm::add_node(node_id_t id, level_t level,
                                   HnswRabitqContext *ctx) {
+  const auto clear_heaps =
+      ailego::ScopeGuard::Make([ctx] { ctx->clear_insert_heaps(); });
   spin_lock_.lock();
 
   // std::cout << "id: " << id << ", level: " << level << std::endl;
@@ -42,18 +45,21 @@ int HnswRabitqAlgorithm::add_node(node_id_t id, level_t level,
   }
   spin_lock_.unlock();
 
+  std::unique_lock level_lock(mutex_, std::defer_lock);
   if (ailego_unlikely(level > cur_max_level)) {
-    mutex_.lock();
+    level_lock.lock();
     // re-check max level
     cur_max_level = entity_.cur_max_level();
     entry_point = entity_.entry_point();
     if (level <= cur_max_level) {
-      mutex_.unlock();
+      level_lock.unlock();
     }
   }
 
   level_t cur_level = cur_max_level;
   ResultRecord dist = ctx->dist_calculator()(entry_point);
+  // Keep the candidates construction can read. The vector is already stored,
+  // and the streamer still handles errors recorded by the distance calculator.
   for (; cur_level > level; --cur_level) {
     select_entry_point(cur_level, &entry_point, &dist, ctx);
   }
@@ -67,14 +73,12 @@ int HnswRabitqAlgorithm::add_node(node_id_t id, level_t level,
   // to knn_search but the under layer level not ready
   for (cur_level = 0; cur_level <= level; ++cur_level) {
     add_neighbors(id, cur_level, ctx->level_topk(cur_level), ctx);
-    ctx->level_topk(cur_level).clear();
   }
 
   if (ailego_unlikely(level > cur_max_level)) {
     spin_lock_.lock();
     entity_.update_ep_and_level(id, level);
     spin_lock_.unlock();
-    mutex_.unlock();
   }
 
   return 0;
@@ -89,6 +93,7 @@ void HnswRabitqAlgorithm::select_entry_point(level_t level,
   HnswRabitqAddDistCalculator &dc = ctx->dist_calculator();
   while (true) {
     const Neighbors neighbors = entity.get_neighbors(level, *entry_point);
+    if (ailego_unlikely(neighbors.status != 0)) return;
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_neighbors())++;
     }
@@ -103,7 +108,7 @@ void HnswRabitqAlgorithm::select_entry_point(level_t level,
       (*ctx->mutable_stats_get_vector())++;
     }
     if (ailego_unlikely(ret != 0)) {
-      break;
+      return;
     }
 
     bool find_closer = false;
@@ -130,8 +135,6 @@ void HnswRabitqAlgorithm::select_entry_point(level_t level,
       break;
     }
   }
-
-  return;
 }
 
 void HnswRabitqAlgorithm::add_neighbors(node_id_t id, level_t level,
@@ -150,8 +153,6 @@ void HnswRabitqAlgorithm::add_neighbors(node_id_t id, level_t level,
     reverse_update_neighbors(dc, topk_heap[i].first, level, id,
                              topk_heap[i].second, ctx->update_heap());
   }
-
-  return;
 }
 
 void HnswRabitqAlgorithm::search_neighbors(level_t level,
@@ -186,6 +187,7 @@ void HnswRabitqAlgorithm::search_neighbors(level_t level,
 
     candidates.pop();
     const Neighbors neighbors = entity.get_neighbors(level, main_node);
+    if (ailego_unlikely(neighbors.status != 0)) continue;
     ailego_prefetch(neighbors.data);
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_neighbors())++;
@@ -214,7 +216,7 @@ void HnswRabitqAlgorithm::search_neighbors(level_t level,
       (*ctx->mutable_stats_get_vector())++;
     }
     if (ailego_unlikely(ret != 0)) {
-      break;
+      return;
     }
 
     // do prefetch
@@ -251,8 +253,6 @@ void HnswRabitqAlgorithm::search_neighbors(level_t level,
       }  // end if
     }  // end for
   }  // while
-
-  return;
 }
 
 void HnswRabitqAlgorithm::update_neighbors(HnswRabitqAddDistCalculator &dc,
@@ -375,13 +375,13 @@ void HnswRabitqAlgorithm::reverse_update_neighbors(
   const size_t max_neighbor_cnt = entity_.neighbor_cnt(level);
 
   uint32_t lock_idx = id & kLockMask;
-  lock_pool_[lock_idx].lock();
+  std::lock_guard lock(lock_pool_[lock_idx]);
   const Neighbors neighbors = entity_.get_neighbors(level, id);
+  if (ailego_unlikely(neighbors.status != 0)) return;
   size_t size = neighbors.size();
   ailego_assert_with(size <= max_neighbor_cnt, "invalid neighbor size");
   if (size < max_neighbor_cnt) {
     entity_.add_neighbor(level, id, size, link_id);
-    lock_pool_[lock_idx].unlock();
     return;
   }
 
@@ -419,12 +419,7 @@ void HnswRabitqAlgorithm::reverse_update_neighbors(
 
   update_heap.truncate(cur_size);
   entity_.update_neighbors(level, id, update_heap.container());
-
-  lock_pool_[lock_idx].unlock();
-
   update_heap.clear();
-
-  return;
 }
 
 }  // namespace core

@@ -216,7 +216,7 @@ class HnswRabitqStreamerEntity : public HnswRabitqEntity {
   using HashSetPointer = std::shared_ptr<HashSet<Key>>;
 
   //! upper neighbor index hashmap
-  using NIHashMap = HnswIndexHashMap<node_id_t, uint32_t>;
+  using NIHashMap = HnswRabitqIndexHashMap<node_id_t, uint32_t>;
   using NIHashMapPointer = std::shared_ptr<NIHashMap>;
 
   //! Private construct, only be called by clone method
@@ -293,8 +293,8 @@ class HnswRabitqStreamerEntity : public HnswRabitqEntity {
       level_t level, node_id_t id) const {
     // Shared lock: concurrent readers are fine, but must synchronize with
     // add_upper_neighbor's exclusive lock to avoid data-race on
-    // slots_.size() inside HnswIndexHashMap (the emplace_back in alloc_slot
-    // is not atomic and concurrent find() may see a stale size value).
+    // the hash table's slots_.size() (emplace_back in alloc_slot is not atomic,
+    // so concurrent find() may see a stale size).
     std::shared_lock<std::shared_mutex> lk(*upper_neighbor_rw_mutex_);
     auto it = upper_neighbor_index_->find(id);
     ailego_assert_abort(it != upper_neighbor_index_->end(),

@@ -199,7 +199,7 @@ class FlatSearcherProvider : public IndexProvider {
           block_size) {
         LOG_ERROR("Failed to read data (%u bytes) from features segment",
                   block_size);
-        return IndexError_ReadData;
+        return features_segment_->read_error();
       }
 
       const size_t align_size =
@@ -221,7 +221,7 @@ class FlatSearcherProvider : public IndexProvider {
         LOG_ERROR("Failed to read data (%u bytes) from features segment",
                   feature_size_);
         block.reset();
-        return IndexError_ReadData;
+        return features_segment_->read_error();
       }
     }
     return 0;

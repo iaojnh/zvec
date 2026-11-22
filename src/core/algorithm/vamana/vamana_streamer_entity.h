@@ -362,7 +362,7 @@ VamanaStreamerEntity::get_neighbors_typed<MmapMemoryBlock>(node_id_t id) const {
   size_t ret = node_chunks_[chunk_idx]->read(offset, ptr, neighbor_size_);
   if (ailego_unlikely(ret != neighbor_size_)) {
     LOG_ERROR("Read neighbor header failed, ret=%zu", ret);
-    return NeighborsT<MmapMemoryBlock>();
+    return NeighborsT<MmapMemoryBlock>(node_chunks_[chunk_idx]->read_error());
   }
   MmapMemoryBlock block(const_cast<void *>(ptr.data()));
   return NeighborsT<MmapMemoryBlock>(std::move(block));
@@ -382,7 +382,8 @@ VamanaStreamerEntity::get_neighbors_typed<BufferPoolMemoryBlock>(
       node_chunks_[chunk_idx]->read_borrowed(offset, mem_block, neighbor_size_);
   if (ailego_unlikely(ret != neighbor_size_)) {
     LOG_ERROR("Read neighbor header failed, ret=%zu", ret);
-    return NeighborsT<BufferPoolMemoryBlock>();
+    return NeighborsT<BufferPoolMemoryBlock>(
+        node_chunks_[chunk_idx]->read_error());
   }
   return NeighborsT<BufferPoolMemoryBlock>(std::move(mem_block));
 }
@@ -399,7 +400,7 @@ inline int VamanaStreamerEntity::get_vector_typed<MmapMemoryBlock>(
     size_t ret = node_chunks_[loc.first]->read(loc.second, ptr, vector_size());
     if (ailego_unlikely(ret != vector_size())) {
       LOG_ERROR("Read vector failed, ret=%zu", ret);
-      return IndexError_ReadData;
+      return node_chunks_[loc.first]->read_error();
     }
     vec_blocks[i].reset(const_cast<void *>(ptr.data()));
   }
@@ -419,7 +420,7 @@ inline int VamanaStreamerEntity::get_vector_typed<BufferPoolMemoryBlock>(
                                                         vector_size());
     if (ailego_unlikely(ret != vector_size())) {
       LOG_ERROR("Read vector failed, ret=%zu", ret);
-      return IndexError_ReadData;
+      return node_chunks_[loc.first]->read_error();
     }
     vec_blocks[i] = std::move(mem_block);
   }
