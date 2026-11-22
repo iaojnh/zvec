@@ -34,6 +34,7 @@
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/core/framework/index_framework.h>
+#include <zvec/core/framework/index_segment_storage.h>
 #include <zvec/core/interface/index.h>
 #include <zvec/core/interface/index_factory.h>
 #include <zvec/core/interface/index_param_builders.h>
@@ -608,6 +609,189 @@ void BuildLegacyInt8Hnsw(const std::string &path, MetricType metric,
 }
 
 }  // namespace
+
+TEST(HnswTurboQuantizerIndex, ReadErrorsReachAllSupportedInterfaces) {
+  using namespace zvec;
+  constexpr uint32_t kDim = 16;
+  struct ReadFault {
+    int error{0};
+  };
+
+  class FaultSegment : public core::IndexSegmentStorage::Segment {
+   public:
+    FaultSegment(const core::IndexStorage::Segment::Pointer &backing,
+                 std::shared_ptr<ReadFault> fault)
+        : core::IndexSegmentStorage::Segment(backing, 0, backing->data_size(),
+                                              backing->padding_size(), 0),
+          backing_(backing),
+          fault_(std::move(fault)) {}
+
+    size_t data_size() const override { return backing_->data_size(); }
+    size_t capacity() const override { return backing_->capacity(); }
+    size_t padding_size() const override { return backing_->padding_size(); }
+    size_t data_offset() const override { return backing_->data_offset(); }
+
+    size_t read(size_t offset, core::IndexStorage::MemoryBlock &block,
+                size_t count) override {
+      if (offset == 0 && count == kDim * sizeof(float) && fault_->error) {
+        block.reset();
+        return 0;
+      }
+      return backing_->read(offset, block, count);
+    }
+
+    int read_error() const override {
+      return fault_->error ? fault_->error : backing_->read_error();
+    }
+
+    size_t write(size_t offset, const void *data, size_t count) override {
+      return backing_->write(offset, data, count);
+    }
+
+    bool write_batch(const core::IndexStorage::SegmentData *writes,
+                     size_t count) override {
+      return backing_->write_batch(writes, count);
+    }
+
+    size_t resize(size_t count) override { return backing_->resize(count); }
+
+    void update_data_crc(uint32_t crc) override {
+      backing_->update_data_crc(crc);
+    }
+
+    core::IndexStorage::Segment::Pointer clone() override {
+      return std::make_shared<FaultSegment>(backing_->clone(), fault_);
+    }
+
+   private:
+    core::IndexStorage::Segment::Pointer backing_;
+    std::shared_ptr<ReadFault> fault_;
+  };
+
+  class FaultStorage : public core::IndexStorage {
+   public:
+    int init(const ailego::Params &params) override {
+      return backing_->init(params);
+    }
+    int cleanup() override { return backing_->cleanup(); }
+    int open(const std::string &path, bool create) override {
+      return backing_->open(path, OpenOptions{create, false});
+    }
+    int flush() override { return backing_->flush(); }
+    int close() override { return backing_->close(); }
+    int append(const std::string &id, size_t size) override {
+      return backing_->append(id, size);
+    }
+    void refresh(uint64_t checkpoint) override { backing_->refresh(checkpoint); }
+    uint64_t check_point() const override { return backing_->check_point(); }
+    uint32_t magic() const override { return backing_->magic(); }
+    bool has(const std::string &id) const override { return backing_->has(id); }
+
+    std::shared_ptr<ailego::VecBufferPool> vec_buffer_pool() const override {
+      return backing_->vec_buffer_pool();
+    }
+    std::string file_path() const override { return backing_->file_path(); }
+
+    MemoryBlock::MemoryBlockType memory_block_type() const override {
+      return backing_->memory_block_type();
+    }
+    Segment::Pointer get(const std::string &id, int level) override {
+      auto segment = backing_->get(id, level);
+      if (segment && id == core::ChunkBroker::make_segment_id(
+                               core::ChunkBroker::CHUNK_TYPE_NODE, 0)) {
+        return std::make_shared<FaultSegment>(segment, fault);
+      }
+      return segment;
+    }
+
+    const std::shared_ptr<ReadFault> fault = std::make_shared<ReadFault>();
+
+   private:
+    const Pointer backing_ = core::IndexFactory::CreateStorage("BufferStorage");
+  };
+
+  class TestIndex : public HNSWIndex {
+   public:
+    using Index::init;
+    int open_storage(const core::IndexStorage::Pointer &storage) {
+      storage_ = storage;
+      const int ret = streamer_->open(storage_, false);
+      is_open_ = ret == 0;
+      return ret;
+    }
+  };
+
+  auto &budget = ailego::PoolPayloadBudget::get_instance();
+  const auto capacity = budget.capacity();
+  ASSERT_EQ(0, budget.init(64UL << 20));
+  const auto restore_budget =
+      ailego::ScopeGuard::Make([&] { EXPECT_EQ(0, budget.init(capacity)); });
+  const std::string path = "hnsw_read_error_interfaces.index";
+  test_util::RemoveTestFiles(path);
+  const auto remove_file =
+      ailego::ScopeGuard::Make([&] { test_util::RemoveTestFiles(path); });
+
+  auto storage = std::make_shared<FaultStorage>();
+  ASSERT_EQ(0, storage->init({}));
+  ASSERT_EQ(0, storage->open(path, true));
+  const auto params = HNSWIndexParamBuilder()
+                          .with_dimension(kDim)
+                          .with_data_type(DataType::DT_FP32)
+                          .with_metric_type(MetricType::kL2sq)
+                          .build();
+  TestIndex index;
+  ASSERT_EQ(0, index.init(*params));
+  ASSERT_EQ(0, index.open_storage(storage));
+  const std::array<float, kDim> values{};
+  const VectorData input{DenseVector{values.data()}};
+  ASSERT_EQ(0, index.add(input, 0));
+  auto provider = index.create_index_provider();
+  ASSERT_TRUE(provider);
+
+  const auto query = HNSWQueryParamBuilder().with_topk(1).build();
+  for (const int status : {core::IndexError_NoMemory, core::IndexError_NoReady,
+                           core::IndexError_ReadData,
+                           core::IndexError_InvalidFormat}) {
+    SCOPED_TRACE(status);
+    SearchResult result;
+    result.doc_list_.emplace_back(77, 0.0f);
+    int64_t id = 77;
+    VectorDataBuffer fetched;
+    std::get<DenseVectorBuffer>(fetched.vector_buffer).data = "previous";
+    auto block = core::IndexStorage::MemoryBlock::AllocateOwned(1);
+    storage->fault->error = status;
+    EXPECT_EQ(status, index.search(input, query, &result));
+    ASSERT_EQ(1u, result.doc_list_.size());
+    EXPECT_EQ(77u, result.doc_list_.front().key());
+    EXPECT_EQ(status, index.search_internal_ids(input, query, &id, nullptr));
+    EXPECT_EQ(77, id);
+    EXPECT_EQ(status, index.fetch(0, &fetched));
+    EXPECT_EQ("previous", std::get<DenseVectorBuffer>(fetched.vector_buffer).data);
+    EXPECT_EQ(status, provider->get_vector(0, block));
+    EXPECT_EQ(nullptr, block.data());
+  }
+
+  storage->fault->error = 0;
+  SearchResult retried;
+  EXPECT_EQ(0, index.search(input, query, &retried));
+  ASSERT_EQ(1u, retried.doc_list_.size());
+  EXPECT_EQ(0u, retried.doc_list_.front().key());
+  int64_t id = 77;
+  EXPECT_EQ(0, index.search_internal_ids(input, query, &id, nullptr));
+  EXPECT_EQ(0, id);
+  VectorDataBuffer fetched;
+  EXPECT_EQ(0, index.fetch(0, &fetched));
+  core::IndexStorage::MemoryBlock block;
+  EXPECT_EQ(0, provider->get_vector(0, block));
+  ASSERT_EQ(0, index.flush());
+  const auto pool = storage->vec_buffer_pool();
+  ASSERT_TRUE(pool);
+  pool->quarantine_writeback();
+  EXPECT_NE(0, index.close());
+  EXPECT_TRUE(storage->file_path().empty());
+  ASSERT_NE(nullptr, block.data());
+  EXPECT_EQ(0, std::memcmp(block.data(), values.data(), sizeof(values)));
+}
 
 TEST(HnswTurboQuantizerIndex, DefaultUsesFp32TurboQuantizer) {
   for (MetricType metric :

@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <atomic>
 #include <ailego/parallel/lock.h>
 #include <zvec/core/framework/index_framework.h>
 #include <zvec/core/framework/index_provider.h>
@@ -97,6 +98,8 @@ class HnswStreamer : public IndexStreamer {
     return entity_->storage_mode();
   }
 
+  uint32_t committed_doc_count() const;
+
   //! Whether the active search distance path is backed by a turbo quantizer.
   bool uses_turbo_distance() const {
     return quantizer_ != nullptr;
@@ -176,24 +179,16 @@ class HnswStreamer : public IndexStreamer {
                                ContextPointer &context) const override;
 
   //! Fetch vector by key
-  const void *get_vector(uint64_t key) const override {
-    return entity_->get_vector_by_key(key);
-  }
+  const void *get_vector(uint64_t key) const override;
 
   int get_vector(const uint64_t key,
-                 IndexStorage::MemoryBlock &block) const override {
-    return entity_->get_vector_by_key(key, block);
-  }
+                 IndexStorage::MemoryBlock &block) const override;
 
   //! Fetch vector by id
-  const void *get_vector_by_id(uint32_t id) const override {
-    return entity_->get_vector(id);
-  }
+  const void *get_vector_by_id(uint32_t id) const override;
 
   int get_vector_by_id(const uint32_t id,
-                       IndexStorage::MemoryBlock &block) const override {
-    return entity_->get_vector(id, block);
-  }
+                       IndexStorage::MemoryBlock &block) const override;
 
   //! Open index from file path
   int open(IndexStorage::Pointer stg) override;
@@ -249,6 +244,8 @@ class HnswStreamer : public IndexStreamer {
 
   //! Bind the distance functions and inline record layout used for search
   void bind_search_dist_space(HnswContext *ctx) const;
+  HnswGraphMutex *buffered_graph_mutex() const;
+  bool search_blocked_in_callback() const;
 
  private:
   enum State { STATE_INIT = 0, STATE_INITED = 1, STATE_OPENED = 2 };
@@ -309,7 +306,7 @@ class HnswStreamer : public IndexStreamer {
   float max_scan_ratio_{HnswEntity::kDefaultScanRatio};
 
   uint32_t magic_{0U};
-  State state_{STATE_INIT};
+  std::atomic<State> state_{STATE_INIT};
   bool read_only_{false};
   bool bf_enabled_{false};
   bool check_crc_enabled_{false};
@@ -321,7 +318,7 @@ class HnswStreamer : public IndexStreamer {
   bool use_external_vector_{false};
   const VectorSource *build_vector_source_{nullptr};
 
-  //! avoid add vector while dumping index
+  // Take the dump gate before the BufferPool graph lock.
   ailego::SharedMutex shared_mutex_{};
 };
 

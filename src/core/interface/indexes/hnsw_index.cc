@@ -98,6 +98,7 @@ const char *ResolveTurboQuantizerName(const QuantizerParam &quantizer_param,
 
 int HNSWIndex::open(const std::string &file_path,
                     StorageOptions storage_options) {
+  if (inside_hnsw_callback()) return core::IndexError_NoReady;
   int ret = Index::open(file_path, storage_options);
   if (ret == 0) {
     file_path_ = file_path;
@@ -108,6 +109,7 @@ int HNSWIndex::open(const std::string &file_path,
 
 int HNSWIndex::merge(const std::vector<Index::Pointer> &indexes,
                      const IndexFilter &filter, const MergeOptions &options) {
+  if (inside_hnsw_callback()) return core::IndexError_NoReady;
   // Reusing an existing graph is an append operation. Only an unpublished,
   // empty mmap target can replace its temporary graph with a packed index.
   if (!is_open_ || is_read_only_ || indexes.empty() || is_sparse_ ||
@@ -332,6 +334,7 @@ std::string HNSWIndex::storage_mode() const {
 int HNSWIndex::add_with_source(const VectorData &vector_data,
                                const uint32_t doc_id,
                                const core::VectorSource &src) {
+  if (inside_hnsw_callback()) return core::IndexError_NoReady;
   auto &context = acquire_context();
   if (!context) {
     LOG_ERROR("Failed to acquire context for AddWithSource");
@@ -350,6 +353,7 @@ int HNSWIndex::add_with_source(const VectorData &vector_data,
 int HNSWIndex::search_with_source(
     const VectorData &query, const BaseIndexQueryParam::Pointer &search_param,
     const core::VectorSource &src, SearchResult *result) {
+  if (inside_hnsw_callback()) return core::IndexError_NoReady;
   auto &context = acquire_context();
   if (!context) {
     LOG_ERROR("Failed to acquire context for SearchWithSource");

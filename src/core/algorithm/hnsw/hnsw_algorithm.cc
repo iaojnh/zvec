@@ -12,13 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include "hnsw_algorithm.h"
+#include <ailego/pattern/scope_guard.h>
 
 namespace zvec {
 namespace core {
 
 template <typename EntityType>
+int read_graph_key(const EntityType &entity, node_id_t id, key_t &key) {
+  if constexpr (std::is_same_v<EntityType, HnswBufferPoolStreamerEntity>) {
+    return entity.read_key(id, key);
+  } else {
+    key = entity.get_key_typed(id);
+    return 0;
+  }
+}
+
+template <typename EntityType>
 int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
                                         HnswContext *ctx) {
+  const auto clear_heaps =
+      ailego::ScopeGuard::Make([ctx] { ctx->clear_insert_heaps(); });
   spin_lock_.lock();
 
   auto cur_max_level = entity_.cur_max_level();
@@ -45,20 +58,29 @@ int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
 
   level_t cur_level = cur_max_level;
   dist_t dist = ctx->batch_dist(entry_point);
+  if (ailego_unlikely(ctx->error())) return ctx->dist_calculator().error_code();
+  // Without a graph transaction the vector is already published. Build with
+  // the candidates found before a traversal read failed.
   for (; cur_level > level; --cur_level) {
-    select_entry_point(cur_level, &entry_point, &dist, ctx);
+    select_entry_point(cur_level, &entry_point, &dist, ctx,
+                       kTransactionalBuild);
+    if (ailego_unlikely(ctx->error()))
+      return ctx->dist_calculator().error_code();
   }
 
   for (; cur_level >= 0; --cur_level) {
     search_neighbors(cur_level, &entry_point, &dist, ctx->level_topk(cur_level),
-                     ctx);
+                     ctx, kTransactionalBuild);
+    if (ailego_unlikely(ctx->error()))
+      return ctx->dist_calculator().error_code();
   }
 
   // add neighbors from down level to top level, to avoid upper level visible
   // to knn_search but the under layer level not ready
   for (cur_level = 0; cur_level <= level; ++cur_level) {
-    add_neighbors(id, cur_level, ctx->level_topk(cur_level), ctx);
-    ctx->level_topk(cur_level).clear();
+    const int ret =
+        add_neighbors(id, cur_level, ctx->level_topk(cur_level), ctx);
+    if (ailego_unlikely(ret != 0)) return ret;
   }
 
   if (ailego_unlikely(level > cur_max_level)) {
@@ -82,10 +104,12 @@ int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const {
   }
 
   dist_t dist = ctx->dist_calculator().dist(entry_point);
-  if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
+  if (ailego_unlikely(ctx->error())) return ctx->dist_calculator().error_code();
   for (level_t cur_level = max_level; cur_level >= 1; --cur_level) {
-    select_entry_point(cur_level, &entry_point, &dist, ctx);
-    if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
+    select_entry_point(cur_level, &entry_point, &dist, ctx,
+                       /*fail_on_read_error=*/true);
+    if (ailego_unlikely(ctx->error()))
+      return ctx->dist_calculator().error_code();
   }
 
   const uint32_t capacity = std::max(ctx->topk(), ctx->ef());
@@ -95,22 +119,22 @@ int HnswAlgorithm<EntityType>::search(HnswContext *ctx) const {
     if (ailego_unlikely(ret != 0)) return ret;
   } else {
     auto &topk = ctx->search_heap().reset<TopkHeap>(capacity);
-    search_neighbors(0, &entry_point, &dist, topk, ctx);
+    search_neighbors(0, &entry_point, &dist, topk, ctx,
+                     /*fail_on_read_error=*/true);
   }
 
-  if (ailego_unlikely(ctx->error())) return IndexError_Runtime;
+  if (ailego_unlikely(ctx->error())) return ctx->dist_calculator().error_code();
   if (ctx->group_by_search()) {
     expand_neighbors_by_group(ctx);
   }
 
-  return ctx->error() ? IndexError_Runtime : 0;
+  return ctx->dist_calculator().error_code();
 }
 
 template <typename EntityType>
-void HnswAlgorithm<EntityType>::select_entry_point(level_t level,
-                                                   node_id_t *entry_point,
-                                                   dist_t *dist,
-                                                   HnswContext *ctx) const {
+void HnswAlgorithm<EntityType>::select_entry_point(
+    level_t level, node_id_t *entry_point, dist_t *dist, HnswContext *ctx,
+    bool fail_on_read_error) const {
   const auto &entity = static_cast<const EntityType &>(ctx->get_entity());
   HnswDistCalculator &dc = ctx->dist_calculator();
   const bool use_provider = dc.has_provider();
@@ -124,6 +148,10 @@ void HnswAlgorithm<EntityType>::select_entry_point(level_t level,
       std::lock_guard<std::mutex> node_lock(
           lock_pool_[*entry_point & kLockMask]);
       const auto neighbors = entity.get_neighbors_typed(level, *entry_point);
+      if (ailego_unlikely(neighbors.status != 0)) {
+        if (fail_on_read_error) dc.set_error(neighbors.status);
+        return;
+      }
       neighbor_ids.clear();
       if (neighbors.size() != 0) {
         neighbor_ids.assign(neighbors.data, neighbors.data + neighbors.size());
@@ -150,7 +178,8 @@ void HnswAlgorithm<EntityType>::select_entry_point(level_t level,
       (*ctx->mutable_stats_get_vector())++;
     }
     if (ailego_unlikely(ret != 0)) {
-      break;
+      if (fail_on_read_error) dc.set_error(ret);
+      return;
     }
 
     bool find_closer = false;
@@ -198,27 +227,26 @@ void HnswAlgorithm<EntityType>::select_entry_point(level_t level,
 }
 
 template <typename EntityType>
-void HnswAlgorithm<EntityType>::add_neighbors(node_id_t id, level_t level,
-                                              TopkHeap &topk_heap,
-                                              HnswContext *ctx) {
-  if (ailego_unlikely(topk_heap.size() == 0)) {
-    return;
-  }
+int HnswAlgorithm<EntityType>::add_neighbors(node_id_t id, level_t level,
+                                             TopkHeap &topk_heap,
+                                             HnswContext *ctx) {
+  if (ailego_unlikely(topk_heap.size() == 0)) return 0;
 
   HnswDistCalculator &dc = ctx->dist_calculator();
 
   {
     std::lock_guard<std::mutex> node_lock(lock_pool_[id & kLockMask]);
-    update_neighbors(dc, id, level, topk_heap, ctx);
+    const int ret = update_neighbors(dc, id, level, topk_heap, ctx);
+    if (ailego_unlikely(ret != 0)) return ret;
   }
 
-  // reverse update neighbors
   for (size_t i = 0; i < topk_heap.size(); ++i) {
-    reverse_update_neighbors(dc, topk_heap[i].first, level, id,
-                             topk_heap[i].second, ctx->update_heap(), ctx);
+    const int ret =
+        reverse_update_neighbors(dc, topk_heap[i].first, level, id,
+                                 topk_heap[i].second, ctx->update_heap(), ctx);
+    if (ailego_unlikely(ret != 0)) return ret;
   }
-
-  return;
+  return 0;
 }
 
 // ============================================================================
@@ -261,6 +289,10 @@ void fast_search_neighbors(const EntityType &entity, HeapType &pool,
     auto current_node = pool.pop();
 
     const auto neighbors = entity.get_neighbors_typed(0, current_node);
+    if (ailego_unlikely(neighbors.status != 0)) {
+      dc.set_error(neighbors.status);
+      return;
+    }
     ailego_prefetch(neighbors.data);
 
     if (neighbors.size() > buf_capacity) {
@@ -349,6 +381,10 @@ void fast_search_neighbors_buffer(const EntityType &entity, HeapType &pool,
   while (pool.has_next()) {
     const auto current_node = pool.pop();
     const auto neighbors = entity.get_neighbors_typed(0, current_node);
+    if (ailego_unlikely(neighbors.status != 0)) {
+      dc.set_error(neighbors.status);
+      return;
+    }
     ailego_prefetch(neighbors.data);
 
     if (neighbors.size() > buf_capacity) {
@@ -372,10 +408,11 @@ void fast_search_neighbors_buffer(const EntityType &entity, HeapType &pool,
     if (unvisited_count == 0) continue;
 
     neighbor_vec_blocks.clear();
-    if (ailego_unlikely(entity.get_vector_typed(neighbor_ids.data(),
-                                                unvisited_count,
-                                                neighbor_vec_blocks) != 0)) {
-      break;
+    const int ret = entity.get_vector_typed(
+        neighbor_ids.data(), unvisited_count, neighbor_vec_blocks);
+    if (ailego_unlikely(ret != 0)) {
+      dc.set_error(ret);
+      return;
     }
     for (uint32_t i = 0; i < unvisited_count; ++i) {
       neighbor_vecs[i] = neighbor_vec_blocks[i].data();
@@ -410,7 +447,8 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
                                 node_id_t *entry_point, dist_t *dist,
                                 TopkHeap &topk, HnswContext *ctx,
                                 HnswDistCalculator &dc, FilterFn &&filter,
-                                std::mutex *node_locks, uint32_t lock_mask) {
+                                std::mutex *node_locks, uint32_t lock_mask,
+                                bool fail_on_read_error) {
   const uint32_t prefetch_offset = ctx->po();
   const size_t vector_lines = ailego_cache_line_count(entity.vector_size());
   const uint32_t prefetch_lines =
@@ -438,9 +476,17 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
   candidates.clear();
   visit.clear();
   visit.set_visited(*entry_point);
-  if (!filter(*entry_point)) {
-    topk.emplace(*entry_point, *dist);
-  }
+  const auto offer_candidate = [&](node_id_t id, dist_t score) {
+    bool excluded = false;
+    const int status = filter(id, excluded);
+    if (ailego_unlikely(status != 0)) {
+      dc.set_error(status);
+      return false;
+    }
+    if (!excluded) topk.emplace(id, score);
+    return true;
+  };
+  if (!offer_candidate(*entry_point, *dist)) return;
 
   candidates.emplace(*entry_point, *dist);
   while (!candidates.empty() && !ctx->reach_scan_limit()) {
@@ -457,6 +503,11 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
     {
       std::lock_guard<std::mutex> node_lock(node_locks[main_node & lock_mask]);
       const auto neighbors = entity.get_neighbors_typed(level, main_node);
+      if (ailego_unlikely(neighbors.status != 0)) {
+        if (!fail_on_read_error) continue;
+        dc.set_error(neighbors.status);
+        return;
+      }
       ailego_prefetch(neighbors.data);
       if (ailego_unlikely(ctx->debugging())) {
         (*ctx->mutable_stats_get_neighbors())++;
@@ -502,7 +553,8 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
       (*ctx->mutable_stats_get_vector())++;
     }
     if (ailego_unlikely(ret != 0)) {
-      break;
+      if (fail_on_read_error) dc.set_error(ret);
+      return;
     }
 
     if (ailego_unlikely(use_provider)) {
@@ -543,9 +595,7 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
           *entry_point = node;
           *dist = cur_dist;
         }
-        if (!filter(node)) {
-          topk.emplace(node, cur_dist);
-        }
+        if (!offer_candidate(node, cur_dist)) return;
       }
     }
   }
@@ -556,26 +606,29 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
 // queries, and upper levels for every backend.
 // ============================================================================
 template <typename EntityType>
-void HnswAlgorithm<EntityType>::search_neighbors(level_t level,
-                                                 node_id_t *entry_point,
-                                                 dist_t *dist, TopkHeap &topk,
-                                                 HnswContext *ctx) const {
+void HnswAlgorithm<EntityType>::search_neighbors(
+    level_t level, node_id_t *entry_point, dist_t *dist, TopkHeap &topk,
+    HnswContext *ctx, bool fail_on_read_error) const {
   const auto &entity = static_cast<const EntityType &>(ctx->get_entity());
   HnswDistCalculator &dc = ctx->dist_calculator();
 
   auto run_with_filter = [&](auto &&filter) {
     dual_heap_search_neighbors<EntityType, MemBlockType>(
         entity, level, entry_point, dist, topk, ctx, dc,
-        std::forward<decltype(filter)>(filter), lock_pool_.data(), kLockMask);
+        std::forward<decltype(filter)>(filter), lock_pool_.data(), kLockMask,
+        fail_on_read_error);
   };
 
   if (ctx->filter().is_valid()) {
-    auto filter = [&](node_id_t id) {
-      return ctx->filter()(entity.get_key_typed(id));
+    auto filter = [&](node_id_t id, bool &excluded) {
+      key_t key;
+      const int status = read_graph_key(entity, id, key);
+      if (status == 0) excluded = ctx->filter()(key);
+      return status;
     };
     run_with_filter(filter);
   } else {
-    run_with_filter([](node_id_t) { return false; });
+    run_with_filter([](node_id_t, bool &) { return 0; });
   }
 }
 
@@ -620,35 +673,31 @@ void HnswAlgorithm<EntityType>::expand_neighbors_by_group(
   }
 
   const auto &entity = static_cast<const EntityType &>(ctx->get_entity());
-  std::function<std::string(node_id_t)> group_by = [&](node_id_t id) {
-    return ctx->group_by()(entity.get_key_typed(id));
-  };
-
-  // devide into groups
+  HnswDistCalculator &dc = ctx->dist_calculator();
   std::map<std::string, TopkHeap> &group_topk_heaps = ctx->group_topk_heaps();
-  ctx->search_heap().for_each([&](node_id_t id, dist_t score) {
-    std::string group_id = group_by(id);
-
-    auto &topk_heap = group_topk_heaps[group_id];
+  const auto add_to_group = [&](key_t key, node_id_t id, dist_t score) {
+    auto &topk_heap = group_topk_heaps[ctx->group_by()(key)];
     if (topk_heap.empty()) {
       topk_heap.limit(ctx->group_topk());
     }
     topk_heap.emplace(id, score);
+  };
+  ctx->search_heap().for_each([&](node_id_t id, dist_t score) {
+    key_t key;
+    const int status = read_graph_key(entity, id, key);
+    if (ailego_unlikely(status != 0)) {
+      dc.set_error(status);
+      return false;
+    }
+    add_to_group(key, id, score);
     return true;
   });
+  if (dc.error()) return;
 
   // stage 2, expand to reach group num as possible
   if (group_topk_heaps.size() < ctx->group_num()) {
     VisitFilter &visit = ctx->visit_filter();
     CandidateHeap &candidates = ctx->candidates();
-    HnswDistCalculator &dc = ctx->dist_calculator();
-
-    std::function<bool(node_id_t)> filter = [](node_id_t) { return false; };
-    if (ctx->filter().is_valid()) {
-      filter = [&](node_id_t id) {
-        return ctx->filter()(entity.get_key_typed(id));
-      };
-    }
 
     // refill to get enough groups
     candidates.clear();
@@ -666,6 +715,10 @@ void HnswAlgorithm<EntityType>::expand_neighbors_by_group(
 
       candidates.pop();
       const auto neighbors = entity.get_neighbors_typed(0, main_node);
+      if (ailego_unlikely(neighbors.status != 0)) {
+        dc.set_error(neighbors.status);
+        return;
+      }
       if (ailego_unlikely(ctx->debugging())) {
         (*ctx->mutable_stats_get_neighbors())++;
       }
@@ -694,7 +747,8 @@ void HnswAlgorithm<EntityType>::expand_neighbors_by_group(
         (*ctx->mutable_stats_get_vector())++;
       }
       if (ailego_unlikely(ret != 0)) {
-        break;
+        dc.set_error(ret);
+        return;
       }
 
       std::vector<float> dists(size);
@@ -716,15 +770,14 @@ void HnswAlgorithm<EntityType>::expand_neighbors_by_group(
         node_id_t node = neighbor_ids[i];
         dist_t cur_dist = dists[i];
 
-        if (!filter(node)) {
-          std::string group_id = group_by(node);
-
-          auto &topk_heap = group_topk_heaps[group_id];
-          if (topk_heap.empty()) {
-            topk_heap.limit(ctx->group_topk());
-          }
-          topk_heap.emplace(node, cur_dist);
-
+        key_t key;
+        const int status = read_graph_key(entity, node, key);
+        if (ailego_unlikely(status != 0)) {
+          dc.set_error(status);
+          return;
+        }
+        if (!ctx->filter().is_valid() || !ctx->filter()(key)) {
+          add_to_group(key, node, cur_dist);
           if (group_topk_heaps.size() >= ctx->group_num()) {
             break;
           }
@@ -737,18 +790,16 @@ void HnswAlgorithm<EntityType>::expand_neighbors_by_group(
 }
 
 template <typename EntityType>
-void HnswAlgorithm<EntityType>::update_neighbors(HnswDistCalculator &dc,
-                                                 node_id_t id, level_t level,
-                                                 TopkHeap &topk_heap,
-                                                 HnswContext *ctx) {
+int HnswAlgorithm<EntityType>::update_neighbors(HnswDistCalculator &dc,
+                                                node_id_t id, level_t level,
+                                                TopkHeap &topk_heap,
+                                                HnswContext *ctx) {
   topk_heap.sort();
 
   uint32_t max_neighbor_cnt = entity_.neighbor_cnt(level);
-  if (topk_heap.size() <= static_cast<size_t>(entity_.prune_cnt())) {
-    if (topk_heap.size() <= static_cast<size_t>(max_neighbor_cnt)) {
-      entity_.update_neighbors(level, id, topk_heap.container());
-      return;
-    }
+  if (topk_heap.size() <= static_cast<size_t>(entity_.prune_cnt()) &&
+      topk_heap.size() <= static_cast<size_t>(max_neighbor_cnt)) {
+    return entity_.update_neighbors(level, id, topk_heap.container());
   }
 
   uint32_t cur_size = 0;
@@ -765,6 +816,8 @@ void HnswAlgorithm<EntityType>::update_neighbors(HnswDistCalculator &dc,
       prune_ids.emplace_back(candidate.first);
     }
     prune_blocks.clear();
+    const auto release_blocks =
+        ailego::ScopeGuard::Make([&] { prune_blocks.clear(); });
     // The active build metric may describe the provider's original vectors,
     // not the representation stored in the BufferPool entity.
     const int ret =
@@ -773,8 +826,7 @@ void HnswAlgorithm<EntityType>::update_neighbors(HnswDistCalculator &dc,
             : read_entity.get_vector_for_prune(prune_ids.data(),
                                                prune_ids.size(), prune_blocks);
     if (ailego_unlikely(ret != 0)) {
-      dc.set_error();
-      return;
+      return ret;
     }
     selected_indices.clear();
     selected_indices.reserve(max_neighbor_cnt);
@@ -802,7 +854,6 @@ void HnswAlgorithm<EntityType>::update_neighbors(HnswDistCalculator &dc,
         }
       }
     }
-    prune_blocks.clear();
   } else {
     for (size_t i = 0; i < topk_heap.size(); ++i) {
       node_id_t cur_node = topk_heap[i].first;
@@ -848,26 +899,31 @@ void HnswAlgorithm<EntityType>::update_neighbors(HnswDistCalculator &dc,
     }
   }
 
+  if (ailego_unlikely(ctx->error())) return ctx->dist_calculator().error_code();
   topk_heap.truncate(cur_size);
-  entity_.update_neighbors(level, id, topk_heap.container());
-
-  return;
+  return entity_.update_neighbors(level, id, topk_heap.container());
 }
 
 template <typename EntityType>
-void HnswAlgorithm<EntityType>::reverse_update_neighbors(
+int HnswAlgorithm<EntityType>::reverse_update_neighbors(
     HnswDistCalculator &dc, node_id_t id, level_t level, node_id_t link_id,
     dist_t dist, TopkHeap &update_heap, HnswContext *ctx) {
   const size_t max_neighbor_cnt = entity_.neighbor_cnt(level);
 
   const uint32_t lock_idx = id & kLockMask;
-  std::unique_lock<std::mutex> node_lock(lock_pool_[lock_idx]);
-  const Neighbors neighbors = entity_.get_neighbors(level, id);
+  std::lock_guard<std::mutex> node_lock(lock_pool_[lock_idx]);
+  Neighbors neighbors = entity_.get_neighbors(level, id);
+  if (ailego_unlikely(neighbors.status != 0 || !neighbors.data)) {
+    if constexpr (kTransactionalBuild) {
+      return neighbors.status != 0 ? neighbors.status : IndexError_ReadData;
+    }
+    return 0;
+  }
   const size_t size = neighbors.size();
   ailego_assert_with(size <= max_neighbor_cnt, "invalid neighbor size");
   if (size < max_neighbor_cnt) {
-    entity_.add_neighbor(level, id, size, link_id);
-    return;
+    neighbors.neighbor_block.reset();
+    return entity_.add_neighbor(level, id, size, link_id);
   }
 
   if constexpr (std::is_same_v<EntityType, HnswBufferPoolStreamerEntity>) {
@@ -889,8 +945,11 @@ void HnswAlgorithm<EntityType>::reverse_update_neighbors(
     for (size_t i = 0; i < size; ++i) {
       candidate_ids.emplace_back(neighbors[i]);
     }
+    neighbors.neighbor_block.reset();
 
     candidate_blocks.clear();
+    const auto release_blocks =
+        ailego::ScopeGuard::Make([&] { candidate_blocks.clear(); });
     const int ret =
         dc.has_provider()
             ? dc.get_vector(candidate_ids.data(), candidate_ids.size(),
@@ -898,8 +957,7 @@ void HnswAlgorithm<EntityType>::reverse_update_neighbors(
             : read_entity.get_vector_for_prune(
                   candidate_ids.data(), candidate_ids.size(), candidate_blocks);
     if (ailego_unlikely(ret != 0)) {
-      dc.set_error();
-      return;
+      return ret;
     }
 
     update_heap.clear();
@@ -945,12 +1003,12 @@ void HnswAlgorithm<EntityType>::reverse_update_neighbors(
     for (auto &selected : update_heap.mutable_container()) {
       selected.first = candidate_ids[selected.first];
     }
-    entity_.update_neighbors(level, id, update_heap.container());
-
-    node_lock.unlock();
-    update_heap.clear();
-    // Release BufferStorage pins before this worker consumes its next node.
+    // The writes can need the memory currently pinned by these vectors.
     candidate_blocks.clear();
+    const int write_result =
+        entity_.update_neighbors(level, id, update_heap.container());
+    update_heap.clear();
+    return write_result;
   } else {
     update_heap.emplace(link_id, dist);
     for (size_t i = 0; i < size; ++i) {
@@ -984,11 +1042,13 @@ void HnswAlgorithm<EntityType>::reverse_update_neighbors(
     }
 
     update_heap.truncate(cur_size);
-    entity_.update_neighbors(level, id, update_heap.container());
+    const int write_result =
+        ctx->error()
+            ? dc.error_code()
+            : entity_.update_neighbors(level, id, update_heap.container());
     update_heap.clear();
+    return write_result;
   }
-
-  return;
 }
 
 // Explicit template instantiation

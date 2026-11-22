@@ -14,10 +14,13 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -33,13 +36,14 @@
 #include "../../ailego/buffer/pool_payload_budget.h"
 #if RABITQ_SUPPORTED
 #include "core/algorithm/hnsw_rabitq/rabitq_converter.h"
-#include "zvec/core/framework/index_provider.h"
 #endif
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/utility/float_helper.h>
+#include <zvec/core/framework/index_dumper.h>
 #include <zvec/core/framework/index_factory.h>
 #include <zvec/core/framework/index_holder.h>
+#include <zvec/core/framework/index_provider.h>
 #include "algorithm/cluster/cluster_params.h"
 #include "algorithm/hnsw/hnsw_entity.h"
 #include "algorithm/hnsw/hnsw_params.h"
@@ -57,6 +61,18 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-result"
 #endif
+
+namespace zvec::ailego {
+struct VecBufferPoolTestPeer {
+  static void quarantine_writeback(VecBufferPool &pool) {
+    pool.writeback_error_.store(VecBufferPool::kWritebackQuarantined);
+  }
+
+  static bool has_writeback_worker(const VecBufferPool &pool) {
+    return pool.writeback_thread_.joinable();
+  }
+};
+}  // namespace zvec::ailego
 
 using namespace zvec::core_interface;
 
@@ -81,6 +97,12 @@ class TestableIVFIndex : public IVFIndex {
 
 class TestableHNSWIndex : public HNSWIndex {
  public:
+  using Index::init;
+
+  zvec::ailego::VecBufferPool::Pointer buffer_pool() const {
+    return storage_->vec_buffer_pool();
+  }
+
   int get_coarse_search_topk(const BaseIndexQueryParam::Pointer &param) {
     return _get_coarse_search_topk(param);
   }
@@ -135,6 +157,619 @@ class CountingHNSWIndex : public HNSWIndex {
 };
 
 }  // namespace
+
+TEST(IndexInterface, FailedHnswRollbackMakesDocCountUnavailable) {
+  using namespace zvec;
+  auto &budget = ailego::PoolPayloadBudget::get_instance();
+  const size_t saved_capacity = budget.capacity();
+  ASSERT_EQ(0, budget.init(64UL << 20));
+  const auto restore_budget =
+      ailego::ScopeGuard::Make([&] { EXPECT_EQ(0, budget.init(saved_capacity)); });
+
+  const std::string path = "hnsw_failed_rollback.index";
+  test_util::RemoveTestFiles(path + "*");
+  const auto cleanup =
+      ailego::ScopeGuard::Make([&] { test_util::RemoveTestFiles(path + "*"); });
+  // The terminal write failure prevents a normal close. Keep its cached
+  // interface context on a worker so thread exit drops all remaining pins.
+  std::thread worker([&] {
+    constexpr uint32_t kDim = 16;
+    const auto param = HNSWIndexParamBuilder()
+                           .with_dimension(kDim)
+                           .with_metric_type(MetricType::kL2sq)
+                           .with_data_type(DataType::DT_FP32)
+                           .build();
+    TestableHNSWIndex index;
+    ASSERT_EQ(0, index.init(*param));
+    ASSERT_EQ(0,
+              index.open(path, {StorageOptions::StorageType::kBufferPool, true}));
+    auto pool = index.buffer_pool();
+    ASSERT_NE(nullptr, pool);
+    ASSERT_TRUE(ailego::VecBufferPoolTestPeer::has_writeback_worker(*pool));
+    auto streamer = index.index_searcher();
+    auto context = streamer->create_context();
+    ASSERT_NE(nullptr, context);
+
+    std::array<float, kDim> vector{};
+    core::IndexQueryMeta meta(core::IndexMeta::DT_FP32, kDim);
+    ASSERT_EQ(0, streamer->add_with_id_impl(0, vector.data(), meta, context));
+    vector.fill(1.0f);
+    ASSERT_EQ(0, streamer->add_with_id_impl(1, vector.data(), meta, context));
+    ASSERT_EQ(2u, index.get_doc_count());
+    const auto exported = index.create_index_provider();
+    ASSERT_TRUE(exported);
+    const auto iterator = exported->create_iterator();
+    ASSERT_TRUE(iterator);
+
+
+    core::IndexStorage::MemoryBlock fetched;
+    ASSERT_EQ(0, streamer->get_vector_by_id(1, fetched));
+    vector.fill(1.5f);
+    ASSERT_EQ(0, streamer->add_with_id_impl(1, vector.data(), meta, context));
+    EXPECT_FLOAT_EQ(1.0f, static_cast<const float *>(fetched.data())[0]);
+
+    // Fail while searching for neighbors, after the overwrite has saved
+    // node 1's previous bytes. The quarantined pool also refuses restoration.
+    bool injected = false;
+    context->set_filter([&](uint64_t) -> bool {
+      injected = true;
+      ailego::VecBufferPoolTestPeer::quarantine_writeback(*pool);
+      throw std::bad_alloc();
+    });
+    vector.fill(2.0f);
+    ASSERT_EQ(core::IndexError_WriteData,
+              streamer->add_with_id_impl(1, vector.data(), meta, context));
+    ASSERT_TRUE(injected);
+    EXPECT_FALSE(ailego::VecBufferPoolTestPeer::has_writeback_worker(*pool));
+    ASSERT_EQ(nullptr, index.create_index_provider());
+    EXPECT_EQ(std::numeric_limits<uint32_t>::max(), index.get_doc_count());
+    EXPECT_EQ(core::IndexError_WriteData,
+              streamer->get_vector_by_id(1, fetched));
+    EXPECT_EQ(nullptr, fetched.data());
+    EXPECT_EQ(core::IndexError_WriteData, exported->get_vector(1, fetched));
+    EXPECT_EQ(nullptr, fetched.data());
+    EXPECT_EQ(nullptr, iterator->data());
+    EXPECT_EQ(core::IndexError_WriteData, iterator->status());
+    EXPECT_EQ(nullptr, streamer->get_vector_by_id(1));
+  });
+  worker.join();
+}
+
+#if GTEST_HAS_DEATH_TEST && !defined(__ANDROID__) && \
+    (!defined(__APPLE__) || !TARGET_OS_IPHONE)
+namespace {
+
+void RunHnswProviderFetchDuringAdd(size_t index_count) {
+  using namespace std::chrono_literals;
+  using namespace zvec;
+  using Provider = core::MultiPassIndexProvider<core::IndexMeta::DT_FP32>;
+  class FetchingProvider : public Provider {
+   public:
+    using Provider::Provider;
+
+    int get_vector(uint64_t key,
+                   core::IndexStorage::MemoryBlock &block) const override {
+      if (read_index) {
+        const int ret = read_index();
+        if (ret != 0) return ret;
+        ++reads;
+      }
+      return Provider::get_vector(key, block);
+    }
+
+    std::function<int()> read_index;
+    mutable size_t reads{0};
+  };
+
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(64UL << 20));
+  const std::string path = "hnsw_provider_fetch_";
+  test_util::RemoveTestFiles(path + "*");
+  const auto cleanup =
+      ailego::ScopeGuard::Make([&] { test_util::RemoveTestFiles(path + "*"); });
+  constexpr uint32_t kDim = 16;
+  core::IndexMeta meta(core::IndexMeta::DT_FP32, kDim);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params{});
+  ailego::NumericalVector<float> original(kDim), next(kDim);
+  for (uint32_t i = 0; i < kDim; ++i) {
+    original[i] = 0.0f;
+    next[i] = 1.0f;
+  }
+  struct IndexTestState {
+    Index::Pointer index;
+    std::shared_ptr<FetchingProvider> provider;
+    core::IndexContext::Pointer nested_context;
+    std::promise<void> provider_entered, write_finished;
+    std::future<void> provider_started{provider_entered.get_future()};
+    std::future<void> write_done{write_finished.get_future()};
+    std::thread writer;
+    size_t read_calls{0};
+    int status{core::IndexError_Runtime};
+  };
+  std::array<IndexTestState, 2> sites;
+  for (size_t i = 0; i < index_count; ++i) {
+    auto &site = sites[i];
+    site.provider = std::make_shared<FetchingProvider>(kDim);
+    ASSERT_TRUE(site.provider->emplace(0, original));
+    ASSERT_TRUE(site.provider->emplace(1, next));
+    const auto param = HNSWIndexParamBuilder()
+                           .with_dimension(kDim)
+                           .with_metric_type(MetricType::kL2sq)
+                           .with_data_type(DataType::DT_FP32)
+                           .with_provider(site.provider, meta)
+                           .build();
+    site.index = IndexFactory::CreateAndInitIndex(*param);
+    ASSERT_TRUE(site.index);
+    ASSERT_EQ(
+        0, site.index->open(path + std::to_string(i) + ".index",
+                            {StorageOptions::StorageType::kBufferPool, true}));
+    ASSERT_EQ(0, site.index->add(VectorData{DenseVector{original.data()}}, 0));
+    if (index_count == 1) {
+      site.nested_context = site.index->index_searcher()->create_context();
+      ASSERT_TRUE(site.nested_context);
+    }
+  }
+  for (size_t i = 0; i < index_count; ++i) {
+    auto &site = sites[i];
+    site.provider->read_index = [&, i] {
+      auto &target = sites[(i + 1) % index_count];
+      if (index_count == 2) {
+        // Let the build query through. Force the cross-read during traversal,
+        // after the new node has been staged, so failure must roll it back.
+        ++site.read_calls;
+        if (site.read_calls == 1) return 0;
+        if (site.read_calls == 2) {
+          site.provider_entered.set_value();
+          if (target.provider_started.wait_for(5s) != std::future_status::ready)
+            std::_Exit(2);
+        }
+      }
+      if (index_count == 1) {
+        std::vector<uint64_t> keys{42};
+        std::vector<float> scores{1.0f};
+        const core::IndexQueryMeta query_meta(core::IndexMeta::DT_FP32, kDim);
+        EXPECT_EQ(core::IndexError_NoReady,
+                  target.index->index_searcher()->search_candidates_impl(
+                      original.data(), query_meta, keys, site.nested_context,
+                      &scores));
+        EXPECT_TRUE(keys.empty());
+        EXPECT_TRUE(scores.empty());
+
+        auto worker_fetch = std::async(std::launch::async, [&] {
+          VectorDataBuffer worker_result;
+          return target.index->fetch(0, &worker_result);
+        });
+        if (worker_fetch.wait_for(5s) != std::future_status::ready)
+          std::_Exit(8);
+        EXPECT_EQ(core::IndexError_NoReady, worker_fetch.get());
+      }
+      VectorDataBuffer fetched;
+      return target.index->fetch(0, &fetched);
+    };
+    site.writer = std::thread([&site, &next] {
+      site.status = site.index->add(VectorData{DenseVector{next.data()}}, 1);
+      site.write_finished.set_value();
+    });
+  }
+  for (size_t i = 0; i < index_count; ++i) {
+    auto &site = sites[i];
+    if (site.write_done.wait_for(10s) != std::future_status::ready)
+      std::_Exit(3);
+    site.writer.join();
+  }
+
+  if (index_count == 1) {
+    EXPECT_EQ(0, sites[0].status);
+    // Cover the build query and reads of existing neighbors during mutation.
+    EXPECT_GT(sites[0].provider->reads, 1u);
+  } else {
+    EXPECT_TRUE(sites[0].status != 0 || sites[1].status != 0);
+  }
+  for (size_t i = 0; i < index_count; ++i) {
+    auto &site = sites[i];
+    if (site.status != 0) {
+      EXPECT_EQ(core::IndexError_NoReady, site.status);
+      ASSERT_EQ(1u, site.index->get_doc_count());
+      ASSERT_EQ(0, site.index->add(VectorData{DenseVector{next.data()}}, 1));
+    }
+    EXPECT_EQ(2u, site.index->get_doc_count());
+    VectorDataBuffer fetched;
+    ASSERT_EQ(0, site.index->fetch(1, &fetched));
+    EXPECT_EQ(std::string(reinterpret_cast<const char *>(next.data()),
+                          kDim * sizeof(float)),
+              std::get<DenseVectorBuffer>(fetched.vector_buffer).data);
+  }
+  for (size_t i = 0; i < index_count; ++i)
+    EXPECT_EQ(0, sites[i].index->close());
+}
+
+void RunHnswFilterFetchWithQueuedWriters(size_t index_count) {
+  using namespace std::chrono_literals;
+  using namespace zvec;
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(64UL << 20));
+  const std::string path = "hnsw_filter_fetch_";
+  test_util::RemoveTestFiles(path + "*");
+  const auto cleanup =
+      ailego::ScopeGuard::Make([&] { test_util::RemoveTestFiles(path + "*"); });
+  constexpr uint32_t kDim = 16;
+  const auto param = HNSWIndexParamBuilder()
+                         .with_dimension(kDim)
+                         .with_metric_type(MetricType::kL2sq)
+                         .with_data_type(DataType::DT_FP32)
+                         .build();
+  struct IndexTestState {
+    Index::Pointer index;
+    core::IndexStreamer::Pointer streamer;
+    core::IndexContext::Pointer write_context;
+    std::array<float, kDim> original, replacement;
+    std::promise<void> in_filter, entering_write, write_finished, did_fetch,
+        search_finished;
+    std::shared_future<void> filter_entered{in_filter.get_future()};
+    std::shared_future<void> writer_started{entering_write.get_future()};
+    std::shared_future<void> write_done{write_finished.get_future()};
+    std::shared_future<void> fetch_done{did_fetch.get_future()};
+    std::future<void> search_done{search_finished.get_future()};
+    std::thread reader, writer;
+    int write_status{core::IndexError_Runtime};
+  };
+  std::array<IndexTestState, 2> sites;
+  const auto bytes_of = [](const std::array<float, kDim> &data) {
+    return std::string(reinterpret_cast<const char *>(data.data()),
+                       sizeof(data));
+  };
+  core::IndexQueryMeta meta(core::IndexMeta::DT_FP32, kDim);
+  for (size_t i = 0; i < index_count; ++i) {
+    auto &site = sites[i];
+    site.index = IndexFactory::CreateAndInitIndex(*param);
+    ASSERT_TRUE(site.index);
+    ASSERT_EQ(
+        0, site.index->open(path + std::to_string(i) + ".index",
+                            {StorageOptions::StorageType::kBufferPool, true}));
+    site.streamer = site.index->index_searcher();
+    site.write_context = site.streamer->create_context();
+    ASSERT_TRUE(site.write_context);
+    site.original.fill(static_cast<float>(i));
+    site.replacement.fill(static_cast<float>(i + index_count));
+    ASSERT_EQ(0, site.streamer->add_with_id_impl(0, site.original.data(), meta,
+                                                 site.write_context));
+  }
+  for (size_t i = 0; i < index_count; ++i) {
+    auto &site = sites[i];
+    site.writer = std::thread([&site, &meta] {
+      if (site.filter_entered.wait_for(5s) != std::future_status::ready)
+        std::_Exit(2);
+      site.entering_write.set_value();
+      site.write_status = site.streamer->add_with_id_impl(
+          0, site.replacement.data(), meta, site.write_context);
+      site.write_finished.set_value();
+    });
+
+    auto query = std::make_shared<HNSWQueryParam>();
+    query->topk = 1;
+    query->is_linear = true;
+    query->filter = std::make_shared<IndexFilter>();
+    query->filter->set([&, i](uint64_t key) {
+      auto &target = sites[(i + 1) % index_count];
+      site.in_filter.set_value();
+      for (size_t j = 0; j < index_count; ++j) {
+        if (sites[j].writer_started.wait_for(5s) != std::future_status::ready)
+          std::_Exit(3);
+        EXPECT_EQ(std::future_status::timeout,
+                  sites[j].write_done.wait_for(100ms));
+      }
+      VectorDataBuffer fetched;
+      if (target.index->fetch(key, &fetched) != 0) std::_Exit(4);
+      EXPECT_EQ(bytes_of(target.original),
+                std::get<DenseVectorBuffer>(fetched.vector_buffer).data);
+      auto worker_fetch = std::async(std::launch::async, [&] {
+        VectorDataBuffer worker_result;
+        const int ret = target.index->fetch(key, &worker_result);
+        if (ret == 0) {
+          EXPECT_EQ(bytes_of(target.original),
+                    std::get<DenseVectorBuffer>(worker_result.vector_buffer).data);
+        }
+        return ret;
+      });
+      if (worker_fetch.wait_for(5s) != std::future_status::ready) std::_Exit(8);
+      const int worker_status = worker_fetch.get();
+      EXPECT_TRUE(worker_status == 0 || worker_status == core::IndexError_NoReady);
+      const VectorData input{DenseVector{site.original.data()}};
+      const auto nested_query = HNSWQueryParamBuilder().with_topk(1).build();
+      SearchResult nested;
+      EXPECT_EQ(core::IndexError_NoReady, target.index->search(
+                                               input, nested_query, &nested));
+      EXPECT_EQ(core::IndexError_NoReady, target.index->add(input, key));
+      EXPECT_EQ(core::IndexError_NoReady, target.index->flush());
+      site.did_fetch.set_value();
+      // Neither query can release its original read lock until both
+      // callbacks have observed the pre-overwrite vectors.
+      for (size_t j = 0; j < index_count; ++j) {
+        if (sites[j].fetch_done.wait_for(5s) != std::future_status::ready)
+          std::_Exit(5);
+      }
+      return false;
+    });
+    site.reader = std::thread([&site, query] {
+      SearchResult result;
+      EXPECT_EQ(
+          0, site.index->search(VectorData{DenseVector{site.original.data()}},
+                                query, &result));
+      EXPECT_EQ(1u, result.doc_list_.size());
+      site.search_finished.set_value();
+    });
+  }
+  for (size_t i = 0; i < index_count; ++i) {
+    auto &site = sites[i];
+    if (site.search_done.wait_for(10s) != std::future_status::ready)
+      std::_Exit(6);
+    if (site.write_done.wait_for(5s) != std::future_status::ready)
+      std::_Exit(7);
+  }
+  for (size_t i = 0; i < index_count; ++i) {
+    auto &site = sites[i];
+    site.reader.join();
+    site.writer.join();
+  }
+  for (size_t i = 0; i < index_count; ++i) {
+    auto &site = sites[i];
+    EXPECT_EQ(0, site.write_status);
+    VectorDataBuffer updated;
+    ASSERT_EQ(0, site.index->fetch(0, &updated));
+    EXPECT_EQ(bytes_of(site.replacement),
+              std::get<DenseVectorBuffer>(updated.vector_buffer).data);
+    site.write_context.reset();
+    EXPECT_EQ(0, site.index->close());
+  }
+}
+
+void RunHnswExportedProviderAcrossRollback() {
+  using namespace std::chrono_literals;
+  using namespace zvec;
+  using Provider = core::MultiPassIndexProvider<core::IndexMeta::DT_FP32>;
+  class BuildProvider : public Provider {
+   public:
+    using Provider::Provider;
+
+    int get_vector(uint64_t key,
+                   core::IndexStorage::MemoryBlock &block) const override {
+      if (after_staging && ++reads == 2) return after_staging();
+      return Provider::get_vector(key, block);
+    }
+
+    std::function<int()> after_staging;
+    mutable int reads{0};
+  };
+
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(64UL << 20));
+  const std::string path = "hnsw_exported_provider.index";
+  test_util::RemoveTestFiles(path + "*");
+  const auto cleanup =
+      ailego::ScopeGuard::Make([&] { test_util::RemoveTestFiles(path + "*"); });
+  constexpr uint32_t kDim = 16;
+  constexpr uint64_t kOriginalKey = 42;
+  auto build_provider = std::make_shared<BuildProvider>(kDim);
+  ailego::NumericalVector<float> zero(kDim), original(kDim), replacement(kDim);
+  std::fill_n(zero.data(), kDim, 0.0f);
+  std::fill_n(original.data(), kDim, 2.0f);
+  std::fill_n(replacement.data(), kDim, 9.0f);
+  ASSERT_TRUE(build_provider->emplace(0, zero));
+  ASSERT_TRUE(build_provider->emplace(1, original));
+  ASSERT_TRUE(build_provider->emplace(2, replacement));
+  ASSERT_TRUE(build_provider->emplace(kOriginalKey, original));
+  core::IndexMeta meta(core::IndexMeta::DT_FP32, kDim);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params{});
+  const auto param = HNSWIndexParamBuilder()
+                         .with_dimension(kDim)
+                         .with_metric_type(MetricType::kL2sq)
+                         .with_data_type(DataType::DT_FP32)
+                         .with_provider(build_provider, meta)
+                         .build();
+  auto index = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_TRUE(index);
+  ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kBufferPool,
+                                 true}));
+  ASSERT_EQ(0, index->add(VectorData{DenseVector{zero.data()}}, 0));
+  const auto streamer = index->index_searcher();
+  auto context = streamer->create_context();
+  ASSERT_TRUE(context);
+  const core::IndexQueryMeta query_meta(core::IndexMeta::DT_FP32, kDim);
+  ASSERT_EQ(0, streamer->add_impl(kOriginalKey, original.data(), query_meta,
+                                  context));
+  context.reset();
+  const auto exported = index->create_index_provider();
+  ASSERT_TRUE(exported);
+  core::IndexStorage::MemoryBlock retained;
+  ASSERT_EQ(0, exported->get_vector(kOriginalKey, retained));
+  auto iterator = exported->create_iterator();
+  ASSERT_TRUE(iterator);
+  iterator->next();
+  ASSERT_TRUE(iterator->is_valid());
+  ASSERT_EQ(kOriginalKey, iterator->key());
+
+  const auto query = HNSWQueryParamBuilder()
+                         .with_topk(1)
+                         .with_fetch_vector(true)
+                         .build();
+  SearchResult held_result;
+  ASSERT_EQ(0, index->search(VectorData{DenseVector{original.data()}}, query,
+                             &held_result));
+  ASSERT_EQ(1u, held_result.doc_list_.size());
+  ASSERT_EQ(kOriginalKey, held_result.doc_list_.front().key());
+  ASSERT_NE(nullptr, held_result.doc_list_.front().vector());
+  int64_t id = -1;
+  const auto ids_query = HNSWQueryParamBuilder().with_topk(1).build();
+  ASSERT_EQ(0, index->search_internal_ids(
+                   VectorData{DenseVector{original.data()}}, ids_query, &id,
+                   nullptr));
+  EXPECT_EQ(kOriginalKey, id);
+
+  std::promise<void> staged, resume_writer, entering_read;
+  auto writer_staged = staged.get_future();
+  auto resumed = resume_writer.get_future();
+  auto reader_started = entering_read.get_future();
+  const std::string expected(reinterpret_cast<const char *>(original.data()),
+                             kDim * sizeof(float));
+  build_provider->after_staging = [&] {
+    VectorDataBuffer fetched;
+    if (index->fetch(1, &fetched) != 0) std::_Exit(2);
+    EXPECT_EQ(expected, std::get<DenseVectorBuffer>(fetched.vector_buffer).data);
+    core::IndexStorage::MemoryBlock from_provider;
+    if (exported->get_vector(kOriginalKey, from_provider) != 0) std::_Exit(3);
+    EXPECT_EQ(expected, std::string(static_cast<const char *>(from_provider.data()),
+                                    kDim * sizeof(float)));
+    EXPECT_EQ(core::IndexError_NoExist, exported->get_vector(1, from_provider));
+    EXPECT_EQ(kOriginalKey, iterator->key());
+    const auto *data = static_cast<const char *>(iterator->data());
+    EXPECT_EQ(expected, data ? std::string(data, kDim * sizeof(float))
+                             : std::string{});
+    staged.set_value();
+    if (resumed.wait_for(5s) != std::future_status::ready) std::_Exit(4);
+    return core::IndexError_NoMemory;
+  };
+  const VectorData input{DenseVector{replacement.data()}};
+  auto write = std::async(std::launch::async, [&] { return index->add(input, 1); });
+  if (writer_staged.wait_for(5s) != std::future_status::ready) std::_Exit(5);
+  auto read = std::async(std::launch::async, [&] {
+    entering_read.set_value();
+    core::IndexStorage::MemoryBlock contended;
+    return std::make_pair(exported->get_vector(kOriginalKey, contended),
+                          index->get_doc_count());
+  });
+  if (reader_started.wait_for(5s) != std::future_status::ready) std::_Exit(6);
+  if (read.wait_for(5s) != std::future_status::ready) std::_Exit(7);
+  const auto [read_status, committed_count] = read.get();
+  EXPECT_EQ(core::IndexError_NoReady, read_status);
+  EXPECT_EQ(2u, committed_count);
+  resume_writer.set_value();
+  if (write.wait_for(5s) != std::future_status::ready) std::_Exit(9);
+  EXPECT_NE(0, write.get());
+  EXPECT_EQ(kOriginalKey, iterator->key());
+  EXPECT_EQ(0, iterator->status());
+
+  build_provider->after_staging = nullptr;
+  ASSERT_EQ(0, index->add(input, 1));
+  EXPECT_EQ(1u, iterator->key());
+  ASSERT_EQ(0, index->add(input, 2));
+  EXPECT_EQ(2u, exported->count());
+  EXPECT_EQ(expected, std::string(static_cast<const char *>(
+                                      held_result.doc_list_.front().vector()),
+                                  kDim * sizeof(float)));
+  EXPECT_EQ(expected, std::string(static_cast<const char *>(retained.data()),
+                                  kDim * sizeof(float)));
+  ASSERT_EQ(0, exported->get_vector(1, retained));
+  EXPECT_FLOAT_EQ(9.0f, static_cast<const float *>(retained.data())[0]);
+  ASSERT_EQ(0, exported->get_vector(2, retained));
+  EXPECT_FLOAT_EQ(9.0f, static_cast<const float *>(retained.data())[0]);
+  EXPECT_EQ(0, index->close());
+  EXPECT_EQ(core::IndexError_NoReady, exported->get_vector(1, retained));
+}
+
+void RunHnswDumpAndFlush() {
+  using namespace std::chrono_literals;
+  using namespace zvec;
+  class PausingDumper : public core::IndexDumper {
+   public:
+    int init(const ailego::Params &) override { return 0; }
+    int cleanup() override { return 0; }
+    int create(const std::string &) override { return 0; }
+    int close() override { return 0; }
+    int append(const std::string &, size_t, size_t, uint32_t) override {
+      return 0;
+    }
+    uint32_t magic() const override { return 0; }
+    size_t write(const void *, size_t size) override {
+      if (first_write) {
+        auto callback = std::exchange(first_write, nullptr);
+        callback();
+      }
+      return size;
+    }
+
+    std::function<void()> first_write;
+  };
+
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(64UL << 20));
+  const std::string path = "hnsw_dump_flush.index";
+  test_util::RemoveTestFiles(path + "*");
+  const auto cleanup =
+      ailego::ScopeGuard::Make([&] { test_util::RemoveTestFiles(path + "*"); });
+  constexpr uint32_t kDim = 16;
+  const auto param = HNSWIndexParamBuilder()
+                         .with_dimension(kDim)
+                         .with_metric_type(MetricType::kL2sq)
+                         .with_data_type(DataType::DT_FP32)
+                         .build();
+  auto index = IndexFactory::CreateAndInitIndex(*param);
+  ASSERT_TRUE(index);
+  ASSERT_EQ(0, index->open(path, {StorageOptions::StorageType::kBufferPool,
+                                 true}));
+  const std::array<float, kDim> data{};
+  ASSERT_EQ(0, index->add(VectorData{DenseVector{data.data()}}, 0));
+
+  std::promise<void> dumping, resume_dump, entering_flush;
+  auto dump_started = dumping.get_future();
+  auto dump_resumed = resume_dump.get_future();
+  auto flush_started = entering_flush.get_future();
+  auto dumper = std::make_shared<PausingDumper>();
+  dumper->first_write = [&] {
+    EXPECT_EQ(core::IndexError_NoReady, index->flush());
+    dumping.set_value();
+    if (dump_resumed.wait_for(5s) != std::future_status::ready) std::_Exit(2);
+  };
+  auto dump = std::async(std::launch::async, [&] {
+    return index->index_searcher()->dump(dumper);
+  });
+  if (dump_started.wait_for(5s) != std::future_status::ready) std::_Exit(3);
+  auto flush = std::async(std::launch::async, [&] {
+    entering_flush.set_value();
+    return index->flush();
+  });
+  if (flush_started.wait_for(5s) != std::future_status::ready) std::_Exit(4);
+  EXPECT_EQ(std::future_status::timeout, flush.wait_for(100ms));
+  resume_dump.set_value();
+  if (dump.wait_for(5s) != std::future_status::ready ||
+      flush.wait_for(5s) != std::future_status::ready) std::_Exit(5);
+  EXPECT_EQ(0, dump.get());
+  EXPECT_EQ(0, flush.get());
+  EXPECT_EQ(0, index->close());
+}
+
+}  // namespace
+
+TEST(IndexInterface, HnswProviderCanFetchFromTheIndexDuringAdd) {
+  ASSERT_EXIT((RunHnswProviderFetchDuringAdd(1),
+               std::_Exit(::testing::Test::HasFailure() ? 1 : 0)),
+              ::testing::ExitedWithCode(0), "");
+}
+
+TEST(IndexInterface, HnswProvidersDoNotDeadlockAcrossActiveWrites) {
+  ASSERT_EXIT((RunHnswProviderFetchDuringAdd(2),
+               std::_Exit(::testing::Test::HasFailure() ? 1 : 0)),
+              ::testing::ExitedWithCode(0), "");
+}
+
+TEST(IndexInterface, HnswFilterCanFetchWhileAnOverwriteWaits) {
+  ASSERT_EXIT((RunHnswFilterFetchWithQueuedWriters(1),
+               std::_Exit(::testing::Test::HasFailure() ? 1 : 0)),
+              ::testing::ExitedWithCode(0), "");
+}
+
+TEST(IndexInterface, HnswFiltersFetchAcrossIndexesWithQueuedWriters) {
+  ASSERT_EXIT((RunHnswFilterFetchWithQueuedWriters(2),
+               std::_Exit(::testing::Test::HasFailure() ? 1 : 0)),
+              ::testing::ExitedWithCode(0), "");
+}
+TEST(IndexInterface, HnswExportedProviderOnlyReadsCommittedVectors) {
+  ASSERT_EXIT((RunHnswExportedProviderAcrossRollback(),
+               std::_Exit(::testing::Test::HasFailure() ? 1 : 0)),
+              ::testing::ExitedWithCode(0), "");
+}
+
+TEST(IndexInterface, HnswDumpSerializesWithFlush) {
+  ASSERT_EXIT((RunHnswDumpAndFlush(),
+               std::_Exit(::testing::Test::HasFailure() ? 1 : 0)),
+              ::testing::ExitedWithCode(0), "");
+}
+#endif
 
 TEST(IndexInterface, GraphRefineKeepsLegacyDefaultCandidateCount) {
   constexpr uint32_t kTopk = 10;

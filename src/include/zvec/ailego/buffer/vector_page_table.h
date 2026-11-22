@@ -72,6 +72,7 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
     std::atomic<bool> writeback_pending{false};
     std::atomic<bool> ever_loaded{
         false};  // true once the page has been loaded at least once
+    std::atomic<bool> written_directly{false};
   };
   static_assert(sizeof(MetadataEntry) == 24,
                 "VectorPageTable::MetadataEntry must stay compact");
@@ -375,7 +376,7 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
     return entry_at(block_id).buffer.load(std::memory_order_acquire) != nullptr;
   }
 
-  //! Check whether reload requires I/O rather than initial zero-fill.
+  //! Check whether this page has previously been loaded into the cache.
   bool is_ever_loaded(block_id_t block_id) const {
     assert(block_id < entry_num_.load(std::memory_order_acquire));
     if (read_only_)
@@ -383,6 +384,20 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
                  std::memory_order_relaxed) != kReadOnlyNeverLoaded;
     return metadata_entry_at(block_id).ever_loaded.load(
         std::memory_order_relaxed);
+  }
+
+  bool can_zero_fill(block_id_t block_id) const {
+    assert(!read_only_);
+    return !is_ever_loaded(block_id) &&
+           !metadata_entry_at(block_id).written_directly.load(
+               std::memory_order_relaxed);
+  }
+
+  // Record a possible disk write before releasing the page's load claim.
+  void record_direct_write(block_id_t block_id) {
+    assert(!read_only_);
+    metadata_entry_at(block_id).written_directly.store(
+        true, std::memory_order_relaxed);
   }
 
   bool has_evicted() const {
@@ -779,6 +794,10 @@ class ZVEC_AILEGO_API VecBufferPool {
   //! Extend the backing file and page table to `new_size`.
   bool extend_file(size_t new_size);
   PageWriteStatus extend_file_status(size_t new_size);
+
+  //! Discard a page-aligned tail that no caller can address through a segment.
+  //! The caller excludes reads and writes to the discarded extent.
+  bool discard_unpublished_tail(size_t retained_size);
 
   bool writable() const {
     return writable_;

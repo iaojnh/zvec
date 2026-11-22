@@ -161,8 +161,10 @@ int ChunkBroker::open(IndexStorage::Pointer stg, uint32_t &chunk_size,
 int ChunkBroker::close() {
   // A loaded, unmodified index must not acquire a new timestamp on close.
   // Storage can still be dirty for a newly created index with no vectors.
-  int ret = stg_ && (dirty_ || stg_->is_dirty()) ? flush(0UL) : 0;
+  const int ret = stg_ && (dirty_ || stg_->is_dirty()) ? flush(0UL) : 0;
+  if (ret != 0) return ret;
 
+  chunk_meta_segment_.reset();
   stg_.reset();
   check_crc_ = false;
   dirty_ = false;
@@ -180,6 +182,7 @@ int ChunkBroker::flush(uint64_t checkpoint) {
       chunk_meta_segment_->write(0UL, &chunk_meta_, sizeof(HnswChunkMeta));
   if (ailego_unlikely(size != sizeof(HnswChunkMeta))) {
     LOG_ERROR("Storage write data failed, wsize=%zu", size);
+    return chunk_meta_segment_->write_error();
   }
 
   stg_->refresh(checkpoint);
@@ -192,54 +195,78 @@ int ChunkBroker::flush(uint64_t checkpoint) {
   return ret;
 }
 
+bool ChunkBroker::flush_after_rollback() {
+  // Chunk allocation may have updated the copy on disk while an insert was
+  // in flight. Restore the authoritative directory without admitting a page.
+  return chunk_meta_segment_->restore(0, &chunk_meta_, sizeof(chunk_meta_)) &&
+         stg_->flush() == 0;
+}
+
 std::pair<int, Chunk::Pointer> ChunkBroker::alloc_chunk(int type,
                                                         uint64_t seq_id,
                                                         size_t size) {
   ailego_assert_with(type < CHUNK_TYPE_MAX, "chunk type overflow");
 
-  Chunk::Pointer chunk;
   if (ailego_unlikely(!stg_)) {
     LOG_ERROR("Init storage first");
-    return std::make_pair(IndexError_Uninitialized, chunk);
+    return {IndexError_Uninitialized, nullptr};
   }
 
-  //! check exist a empty chunk with the same name
-  chunk = get_chunk(type, seq_id);
-  if (chunk) {
-    if (ailego_unlikely(chunk->capacity() == size &&
-                        chunk->data_size() == 0UL)) {
-      LOG_ERROR("Exist invalid chunk size %zu, expect size %zu",
-                chunk->capacity(), size);
-      chunk.reset();
-      return std::make_pair(IndexError_Runtime, chunk);
-    }
-    return std::make_pair(0, chunk);
-  }
-  //! align to page size
   size = (size + page_mask_) & (~page_mask_);
-  if (ailego_unlikely(chunk_meta_.total_size + size >= max_chunks_size_)) {
+  const uint64_t count = chunk_meta_.chunk_cnts[type];
+  if (seq_id > count) {
+    LOG_ERROR("Chunk sequence has a gap, type=%d count=%llu seq=%llu", type,
+              static_cast<unsigned long long>(count),
+              static_cast<unsigned long long>(seq_id));
+    return {IndexError_InvalidArgument, nullptr};
+  }
+
+  const std::string segment_id = make_segment_id(type, seq_id);
+  auto chunk = stg_->get(segment_id);
+  if (chunk && (chunk->capacity() != size || chunk->data_size() != 0)) {
+    LOG_ERROR("Invalid existing chunk, capacity=%zu expected=%zu data=%zu",
+              chunk->capacity(), size, chunk->data_size());
+    return {IndexError_Runtime, nullptr};
+  }
+  if (seq_id < count) {
+    if (chunk) return {0, std::move(chunk)};
+    return {
+        stg_->has(segment_id) ? IndexError_NoMemory : IndexError_InvalidFormat,
+        nullptr};
+  }
+
+  if (ailego_unlikely(chunk_meta_.total_size >= max_chunks_size_ ||
+                      size >= max_chunks_size_ - chunk_meta_.total_size)) {
     LOG_ERROR("No space to new a chunk, curIndexSize=%zu allocSize=%zu",
               (size_t)chunk_meta_.total_size, size);
-    return std::make_pair(IndexError_IndexFull, chunk);
+    return {IndexError_IndexFull, nullptr};
   }
 
-  std::string segment_id = make_segment_id(type, seq_id);
-  int ret = stg_->append(segment_id, size);
-  if (ailego_unlikely(ret != 0)) {
-    LOG_ERROR("Storage append segment failed for %s", IndexError::What(ret));
-    return std::make_pair(ret, chunk);
+  if (!chunk) {
+    if (stg_->has(segment_id)) return {IndexError_NoMemory, nullptr};
+    const int ret = stg_->append(segment_id, size);
+    if (ailego_unlikely(ret != 0)) {
+      LOG_ERROR("Storage append segment failed for %s", IndexError::What(ret));
+      return {ret, nullptr};
+    }
+    chunk = stg_->get(segment_id);
+    if (!chunk) return {IndexError_NoMemory, nullptr};
   }
-  chunk_meta_.chunk_cnts[type] += 1;
-  chunk_meta_.total_size += size;
+
+  // An appended segment can outlive a failed metadata write. Publish the
+  // count only after that write succeeds, including when reusing the segment.
+  auto updated = chunk_meta_;
+  ++updated.chunk_cnts[type];
+  updated.total_size += size;
+  const size_t written =
+      chunk_meta_segment_->write(0, &updated, sizeof(updated));
+  if (ailego_unlikely(written != sizeof(updated))) {
+    LOG_ERROR("Storage write chunk metadata failed, wsize=%zu", written);
+    return {chunk_meta_segment_->write_error(), nullptr};
+  }
+  chunk_meta_ = updated;
   (*stats_.mutable_index_size()) += size;
-
-  size = chunk_meta_segment_->write(0UL, &chunk_meta_, sizeof(HnswChunkMeta));
-  if (ailego_unlikely(size != sizeof(HnswChunkMeta))) {
-    LOG_ERROR("Storage append segment failed, wsize=%zu", size);
-  }
-
-  chunk = get_chunk(type, seq_id);
-  return std::make_pair(chunk ? 0 : IndexError_NoMemory, chunk);
+  return {0, std::move(chunk)};
 }
 
 Chunk::Pointer ChunkBroker::get_chunk(int type, uint64_t seq_id) const {

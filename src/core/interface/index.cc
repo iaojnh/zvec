@@ -23,6 +23,8 @@
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_storage.h>
 #include <zvec/core/interface/index.h>
+#include "algorithm/hnsw/hnsw_graph_mutex.h"
+#include "algorithm/hnsw/hnsw_streamer.h"
 #include "mixed_reducer/mixed_reducer_params.h"
 #include "utility/utility_params.h"
 
@@ -213,6 +215,12 @@ thread_local static std::array<core::IndexContext::Pointer,
     context_list;
 
 
+bool Index::inside_hnsw_callback() const {
+  // A nested HNSW operation could reuse the context of the running callback.
+  return core::HnswGraphLock::active() &&
+         param_.index_type == IndexType::kHNSW && !is_sparse_;
+}
+
 bool Index::init_context(int *status) {
   context_index_ = (magic_enum::enum_integer(param_.index_type) - 1) * 2 +
                    static_cast<size_t>(is_sparse_);
@@ -246,6 +254,7 @@ int Index::ensure_trained_for_query() {
 }
 
 int Index::train() {
+  if (inside_hnsw_callback()) return core::IndexError_NoReady;
   if (pending_quantizer_training_) return core::IndexError_NoReady;
   is_trained_ = true;
   return 0;
@@ -261,13 +270,18 @@ bool Index::is_trained() const {
 
 uint32_t Index::get_doc_count() const {
   if (pending_quantizer_training_) return 0;
-  if (streamer_ == nullptr) {
-    return -1;
-  }
+  constexpr auto unavailable = std::numeric_limits<uint32_t>::max();
+  if (!streamer_) return unavailable;
   if (is_sparse_) {
-    return streamer_->create_sparse_provider()->count();
+    const auto provider = streamer_->create_sparse_provider();
+    return provider ? provider->count() : unavailable;
   }
-  return streamer_->create_provider()->count();
+  const auto *hnsw = dynamic_cast<const core::HnswStreamer *>(streamer_.get());
+  if (hnsw && hnsw->storage_mode() == core::HnswStorageMode::kBufferPool) {
+    return hnsw->committed_doc_count();
+  }
+  const auto provider = streamer_->create_provider();
+  return provider ? provider->count() : unavailable;
 }
 
 core::IndexStreamer::Pointer Index::index_searcher() {
@@ -690,15 +704,25 @@ int Index::close() {
     return core::IndexError_Runtime;
   }
 
+  const auto pool = storage_->vec_buffer_pool();
+  const auto terminal = [&] {
+    return pool && pool->writeback_quarantined() &&
+           !core::HnswGraphLock::active();
+  };
+  int status = 0;
   if (!is_read_only_ && !pending_quantizer_training_) {
-    if (ailego_unlikely(flush() != 0)) {
-      LOG_ERROR("Failed to cleanup streamer");
-      return core::IndexError_Runtime;
+    status = flush();
+    if (status != 0) {
+      LOG_ERROR("Failed to flush index before close");
+      if (!terminal()) return status;
     }
   }
-  if (ailego_unlikely(streamer_->cleanup() != 0)) {
-    LOG_ERROR("Failed to cleanup streamer");
-    return core::IndexError_Runtime;
+  if (status == 0) {
+    status = streamer_->cleanup();
+    if (status != 0) {
+      LOG_ERROR("Failed to cleanup streamer");
+      if (!terminal()) return status;
+    }
   }
   // Contexts are cached per index type in thread-local storage. IVF contexts
   // own cloned storage segments, so leaving the current thread's context in
@@ -708,12 +732,13 @@ int Index::close() {
     context_list[context_index_].reset();
     context_index_ = std::numeric_limits<size_t>::max();
   }
-  if (ailego_unlikely(storage_->close() != 0)) {
+  const int close_status = storage_->close();
+  if (close_status != 0) {
     LOG_ERROR("Failed to close storage");
-    return core::IndexError_Runtime;
+    if (!terminal()) return close_status;
   }
   is_open_ = false;
-  return 0;
+  return status != 0 ? status : close_status;
 }
 
 int Index::flush() {
@@ -727,13 +752,19 @@ int Index::flush() {
     LOG_ERROR("Cannot flush read-only index");
     return core::IndexError_Runtime;
   }
-  if (ailego_unlikely(streamer_->flush(0) != 0)) {
+  if (const int ret = streamer_->flush(0); ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to flush streamer");
-    return core::IndexError_Runtime;
+    return ret;
   }
-  if (ailego_unlikely(storage_->flush() != 0)) {
+  // Dense buffered HNSW flushes its storage under the graph lock.
+  if (!is_sparse_ && param_.index_type == IndexType::kHNSW &&
+      storage_->memory_block_type() ==
+          core::IndexStorage::MemoryBlock::MBT_BUFFERPOOL) {
+    return 0;
+  }
+  if (const int ret = storage_->flush(); ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to flush storage");
-    return core::IndexError_Runtime;
+    return ret;
   }
   return 0;
 }
@@ -758,6 +789,7 @@ int Index::fetch(const uint32_t doc_id, VectorDataBuffer *vector_data_buffer) {
 }
 
 int Index::add(const VectorData &vector_data, const uint32_t doc_id) {
+  if (inside_hnsw_callback()) return core::IndexError_NoReady;
   if (pending_quantizer_training_) return core::IndexError_NoReady;
   if (!is_open_) {
     LOG_ERROR("Index is not open");
@@ -802,6 +834,7 @@ int Index::search_with_source(
 int Index::search(const VectorData &vector_data,
                   const BaseIndexQueryParam::Pointer &search_param,
                   SearchResult *result) {
+  if (inside_hnsw_callback()) return core::IndexError_NoReady;
   if (!is_open_) {
     LOG_ERROR("Index is not open");
     return core::IndexError_Runtime;

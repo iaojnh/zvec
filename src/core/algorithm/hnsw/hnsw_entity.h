@@ -455,6 +455,11 @@ class HnswEntity {
   //! Get primary key of the node id
   virtual key_t get_key(node_id_t id) const = 0;
 
+  virtual int read_key(node_id_t id, key_t &key) const {
+    key = get_key(id);
+    return 0;
+  }
+
   //! Get vector feature data by key
   virtual const void *get_vector(node_id_t id) const = 0;
 
@@ -506,9 +511,10 @@ class HnswEntity {
 
   //! Append neighbor_id to node id neighbors on level, size is the current
   //! neighbors size. Notice: the caller must be ensure the neighbors not full
-  virtual void add_neighbor(level_t /*level*/, node_id_t /*id*/,
-                            uint32_t /*size*/, node_id_t /*neighbor_id*/) {
+  virtual int add_neighbor(level_t /*level*/, node_id_t /*id*/,
+                           uint32_t /*size*/, node_id_t /*neighbor_id*/) {
     LOG_ERROR("Add neighbor not implemented");
+    return IndexError_NotImplemented;
   }
 
   //! Update entry point and max level
@@ -531,6 +537,12 @@ class HnswEntity {
   virtual int dump(const IndexDumper::Pointer & /*dumper*/) {
     LOG_ERROR("Dump not implemented");
     return IndexError_NotImplemented;
+  }
+
+  // Return vector bytes that can outlive the graph read lock.
+  virtual int get_vector_snapshot(node_id_t id,
+                                  IndexStorage::MemoryBlock &block) const {
+    return get_vector(id, block);
   }
 
   //! Fetch a vector for an operation bounded by this entity's lifetime.

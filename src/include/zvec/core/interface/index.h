@@ -137,8 +137,13 @@ class ZVEC_CORE_API Index {
 
   virtual int add(const VectorData &vector, uint32_t doc_id);
 
+  // BufferPool HNSW callbacks can fetch on their own thread or dispatch a
+  // fetch to a worker. Point reads on a worker return IndexError_NoReady
+  // when a writer holds or is waiting for the graph lock.
   virtual int fetch(const uint32_t doc_id,
                     VectorDataBuffer *vector_data_buffer);
+  // Reentrant HNSW searches and mutations on the callback thread return
+  // IndexError_NoReady. Dispatch other graph operations after the callback.
   virtual int search(const VectorData &query,
                      const BaseIndexQueryParam::Pointer &search_param,
                      SearchResult *result);
@@ -165,6 +170,7 @@ class ZVEC_CORE_API Index {
 
   bool is_dirty() const;
 
+  //! Returns UINT32_MAX when the document count is unavailable.
   uint32_t get_doc_count() const;
 
   core::IndexStreamer::Pointer index_searcher();
@@ -255,6 +261,7 @@ class ZVEC_CORE_API Index {
   }
 
  protected:
+  bool inside_hnsw_callback() const;
   bool init_context(int *status = nullptr);
   core::IndexContext::Pointer &acquire_context();
 
