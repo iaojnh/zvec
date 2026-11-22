@@ -215,7 +215,7 @@ class BufferReadStorage : public IndexStorage {
 
       bool pins_owned_by_lease = false;
       try {
-        std::vector<ReadSpan> spans;
+        ScatterBlock::Spans spans;
         spans.reserve(page_count);
         const size_t range_end = abs_offset + len;
         for (size_t i = 0; i < page_count; ++i) {
