@@ -24,6 +24,7 @@
 #include <zvec/core/framework/index_storage.h>
 #include <zvec/core/interface/index.h>
 #include "algorithm/hnsw/hnsw_graph_mutex.h"
+#include "algorithm/hnsw/hnsw_streamer.h"
 #include "mixed_reducer/mixed_reducer_params.h"
 #include "utility/utility_params.h"
 
@@ -274,6 +275,10 @@ uint32_t Index::get_doc_count() const {
   if (is_sparse_) {
     const auto provider = streamer_->create_sparse_provider();
     return provider ? provider->count() : unavailable;
+  }
+  const auto *hnsw = dynamic_cast<const core::HnswStreamer *>(streamer_.get());
+  if (hnsw && hnsw->storage_mode() == core::HnswStorageMode::kBufferPool) {
+    return hnsw->committed_doc_count();
   }
   const auto provider = streamer_->create_provider();
   return provider ? provider->count() : unavailable;

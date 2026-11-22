@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -59,6 +60,7 @@ class HnswStreamerEntity : public HnswEntity {
 
   //! Get primary key of the node id
   key_t get_key(node_id_t id) const override;
+  int read_key(node_id_t id, key_t &key) const override;
 
   //! Get vector feature data by key
   const void *get_vector(node_id_t id) const override;
@@ -108,9 +110,11 @@ class HnswStreamerEntity : public HnswEntity {
     return mutation_error();
   }
 
-  // Point readers hold the graph lock while checking the shared count.
+  // The committed count is available even while a writer owns the graph.
   node_id_t committed_doc_count() const {
-    return buffered_graph_ ? buffered_graph_->doc_count : doc_cnt();
+    return buffered_graph_
+               ? buffered_graph_->doc_count.load(std::memory_order_relaxed)
+               : doc_cnt();
   }
 
   HnswGraphMutex *buffered_graph_mutex() const {
@@ -433,7 +437,7 @@ class HnswStreamerEntity : public HnswEntity {
   struct BufferedGraph {
     HnswGraphMutex mutex;
     InsertUndo *undo{nullptr};
-    node_id_t doc_count{0};
+    std::atomic<node_id_t> doc_count{kInvalidNodeId};
     int error{0};
     bool closed{false};
   };
@@ -443,6 +447,7 @@ class HnswStreamerEntity : public HnswEntity {
   }
 
   void remember_size(Chunk &chunk);
+  bool rollback_insert(InsertUndo &undo);
   int capture_write_undo(Chunk &chunk, const IndexStorage::SegmentData *writes,
                          size_t count, void *mirror = nullptr,
                          bool streamed_vector = false);
@@ -451,7 +456,6 @@ class HnswStreamerEntity : public HnswEntity {
 
   int read_vector(node_id_t id, IndexStorage::MemoryBlock &block,
                   bool immutable) const;
-  int read_key(node_id_t id, key_t &key) const;
   int write_node_data(Chunk &chunk, size_t offset, const void *vec, key_t key);
   void set_doc_count(node_id_t count);
 
@@ -644,7 +648,7 @@ class HnswStreamerEntity : public HnswEntity {
   //! Preload the small, universally hot search root for BufferStorage.
   void protect_search_hotset();
 
-  int flush_header() {
+  int flush_header(bool recovering = false) {
     if (!broker_->dirty()) {
       // do not need to flush
       return 0;
@@ -655,8 +659,11 @@ class HnswStreamerEntity : public HnswEntity {
       LOG_ERROR("get header chunk failed");
       return IndexError_Runtime;
     }
-    size_t size = header_chunk->write(0UL, &header(), header_size());
-    if (ailego_unlikely(size != header_size())) {
+    const bool written =
+        recovering ? header_chunk->restore(0, &header(), header_size())
+                   : header_chunk->write(0, &header(), header_size()) ==
+                         header_size();
+    if (ailego_unlikely(!written)) {
       LOG_ERROR("Write header chunk failed");
       return IndexError_WriteData;
     }

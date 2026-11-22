@@ -111,6 +111,18 @@ int HnswStreamerEntity::write_with_undo(Chunk &chunk,
   return chunk.write_batch(writes, count) ? 0 : chunk.write_error();
 }
 
+bool HnswStreamerEntity::rollback_insert(InsertUndo &undo) try {
+  if (!undo.rollback()) return false;
+  if (undo.writes.empty() && undo.sizes.empty()) return true;
+
+  // Eviction and segment growth can persist staged bytes and lengths. Flush
+  // the restored state before readers using a separate cache can reopen it.
+  return flush_header(/*recovering=*/true) == 0 &&
+         broker_->flush_after_rollback();
+} catch (...) {
+  return false;
+}
+
 int HnswStreamerEntity::insert_buffered(
     level_t level, key_t key, const void *vec, bool explicit_id,
     const std::function<int(node_id_t)> &add_to_graph) {
@@ -137,10 +149,11 @@ int HnswStreamerEntity::insert_buffered(
     ret = IndexError_Runtime;
   }
   if (ret != 0) {
-    if (!undo.rollback()) {
-      LOG_ERROR("Failed to restore HNSW graph after insert error %d", ret);
+    if (!rollback_insert(undo)) {
+      LOG_ERROR("Failed to restore HNSW storage after insert error %d", ret);
       buffered_graph_->error = IndexError_WriteData;
-      // A failed size restore may leave staged bytes in the storage pool.
+      buffered_graph_->doc_count.store(kInvalidNodeId, std::memory_order_relaxed);
+      // A failed rollback may leave staged bytes in the storage pool.
       if (auto pool = broker_->storage()->vec_buffer_pool()) {
         pool->quarantine_writeback();
       }
@@ -158,7 +171,9 @@ int HnswStreamerEntity::insert_buffered(
 
 void HnswStreamerEntity::set_doc_count(node_id_t count) {
   *mutable_doc_cnt() = count;
-  if (buffered_graph_) buffered_graph_->doc_count = count;
+  if (buffered_graph_) {
+    buffered_graph_->doc_count.store(count, std::memory_order_relaxed);
+  }
 }
 
 HnswStreamerEntity::HnswStreamerEntity(IndexStreamer::Stats &stats)
@@ -865,7 +880,10 @@ int HnswStreamerEntity::close() {
   if (ret != 0) return ret;
   ret = broker_->close();
   if (ret != 0) return ret;
-  if (buffered_graph_) buffered_graph_->closed = true;
+  if (buffered_graph_) {
+    buffered_graph_->closed = true;
+    buffered_graph_->doc_count.store(kInvalidNodeId, std::memory_order_relaxed);
+  }
   mutable_header()->reset();
   upper_neighbor_index_->cleanup();
   keys_map_->clear();
@@ -899,7 +917,8 @@ int HnswStreamerEntity::dump(const IndexDumper::Pointer &dumper) {
   //! sort by keys, to support get_vector by key in searcher
   std::vector<key_t> keys(doc_cnt());
   for (node_id_t i = 0; i < doc_cnt(); ++i) {
-    keys[i] = get_key(i);
+    const int status = read_key(i, keys[i]);
+    if (status != 0) return status;
   }
 
   //! dump neighbors

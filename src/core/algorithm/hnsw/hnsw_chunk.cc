@@ -195,6 +195,13 @@ int ChunkBroker::flush(uint64_t checkpoint) {
   return ret;
 }
 
+bool ChunkBroker::flush_after_rollback() {
+  // Chunk allocation may have updated the copy on disk while an insert was
+  // in flight. Restore the authoritative directory without admitting a page.
+  return chunk_meta_segment_->restore(0, &chunk_meta_, sizeof(chunk_meta_)) &&
+         stg_->flush() == 0;
+}
+
 std::pair<int, Chunk::Pointer> ChunkBroker::alloc_chunk(int type,
                                                         uint64_t seq_id,
                                                         size_t size) {

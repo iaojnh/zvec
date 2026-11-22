@@ -180,21 +180,31 @@ class HnswContext : public IndexContext {
     return IndexError_NoMemory;
   }
 
-  inline void topk_to_keys(std::vector<uint64_t> &keys,
-                           std::vector<float> *scores = nullptr) {
+  inline int topk_to_keys(std::vector<uint64_t> &keys,
+                          std::vector<float> *scores = nullptr) try {
     keys.clear();
     keys.reserve((std::min)(static_cast<size_t>(topk_), search_heap_.size()));
     if (scores) {
       scores->clear();
       scores->reserve(keys.capacity());
-      collect_search_result([&](node_id_t id, dist_t score) {
-        keys.push_back(entity_->get_key(id));
-        scores->push_back(score);
-      });
-    } else {
-      collect_search_result(
-          [&](node_id_t id, dist_t) { keys.push_back(entity_->get_key(id)); });
     }
+    const int status = collect_search_result([&](node_id_t id, dist_t score) {
+      key_t key;
+      const int ret = entity_->read_key(id, key);
+      if (ret != 0) return ret;
+      keys.push_back(key);
+      if (scores) scores->push_back(score);
+      return 0;
+    });
+    if (status != 0) {
+      keys.clear();
+      if (scores) scores->clear();
+    }
+    return status;
+  } catch (const std::bad_alloc &) {
+    keys.clear();
+    if (scores) scores->clear();
+    return IndexError_NoMemory;
   }
 
   inline void recal_topk_dist() {
@@ -213,36 +223,45 @@ class HnswContext : public IndexContext {
   inline int topk_to_single_result(uint32_t idx) {
     ailego_assert_with(idx < results_.size(), "invalid idx");
     results_[idx].clear();
-    int status = 0;
-    collect_search_result([&](node_id_t id, dist_t score) {
-      if (status != 0) return;
-      if (fetch_vector_) {
-        IndexStorage::MemoryBlock block;
-        status = entity_->get_vector_snapshot(id, block);
-        if (status != 0) return;
-        results_[idx].emplace_back(entity_->get_key(id), score, id,
-                                   std::move(block));
-      } else {
-        results_[idx].emplace_back(entity_->get_key(id), score, id);
-      }
+    const int status = collect_search_result([&](node_id_t id, dist_t score) {
+      return append_search_document(results_[idx], id, score);
     });
     if (status != 0) results_[idx].clear();
     return status;
   }
 
  private:
+  int append_search_document(IndexDocumentList &docs, node_id_t id,
+                              dist_t score) const {
+    key_t key;
+    const int ret = entity_->read_key(id, key);
+    if (ret != 0) return ret;
+    if (fetch_vector_) {
+      IndexStorage::MemoryBlock block;
+      const int status = entity_->get_vector_snapshot(id, block);
+      if (status != 0) return status;
+      docs.emplace_back(key, score, id, std::move(block));
+    } else {
+      docs.emplace_back(key, score, id);
+    }
+    return 0;
+  }
+
   template <typename Fn>
-  void collect_search_result(Fn &&fn) {
+  int collect_search_result(Fn &&fn) {
     if (force_padding_topk_) {
       fill_random_to_topk_full();
+      if (dc_.error()) return dc_.error_code();
     }
+    int status = 0;
     search_heap_.for_each_sorted(topk_, [&](node_id_t id, dist_t score) {
       if (score > this->threshold()) {
         return false;
       }
-      fn(id, score);
-      return true;
+      status = fn(id, score);
+      return status == 0;
     });
+    return status;
   }
 
  public:
@@ -298,18 +317,11 @@ class HnswContext : public IndexContext {
 
         node_id_t id = group_topk_list[i].second[j].first;
 
-        if (fetch_vector_) {
-          IndexStorage::MemoryBlock block;
-          const int status = entity_->get_vector_snapshot(id, block);
-          if (status != 0) {
-            group_results_[idx].clear();
-            return status;
-          }
-          group_results_[idx][i].mutable_docs()->emplace_back(
-              entity_->get_key(id), score, id, std::move(block));
-        } else {
-          group_results_[idx][i].mutable_docs()->emplace_back(
-              entity_->get_key(id), score, id);
+        const int status = append_search_document(
+            *group_results_[idx][i].mutable_docs(), id, score);
+        if (status != 0) {
+          group_results_[idx].clear();
+          return status;
         }
       }
     }

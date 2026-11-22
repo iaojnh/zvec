@@ -1856,6 +1856,30 @@ TEST_F(BufferStorageWriteTest, AppendZeroSize) {
   EXPECT_EQ(0, storage->close());
 }
 
+TEST_F(BufferStorageWriteTest, RejectedAppendDoesNotFlushPendingWrites) {
+  for (const char *backend : {"MMapFileStorage", "BufferStorage"}) {
+    SCOPED_TRACE(backend);
+    const std::string path = file_path_ + backend;
+    AILEGO_DEFER([&] { ailego::File::Delete(path); });
+    auto storage = IndexFactory::CreateStorage(backend);
+    ASSERT_TRUE(storage);
+    ASSERT_EQ(0, storage->init({}));
+    ASSERT_EQ(0, storage->open(path, true));
+    ASSERT_EQ(0, storage->append("data", 4096));
+    ASSERT_EQ(0, storage->flush());
+    auto segment = storage->get("data");
+    ASSERT_TRUE(segment);
+    ASSERT_EQ(1u, segment->write(0, "x", 1));
+    ASSERT_TRUE(storage->is_dirty());
+
+    EXPECT_EQ(IndexError_Duplicate, storage->append("data", 4096));
+    EXPECT_TRUE(storage->is_dirty());
+    EXPECT_EQ(IndexError_InvalidArgument, storage->append("empty", 0));
+    EXPECT_TRUE(storage->is_dirty());
+    EXPECT_EQ(0, storage->close());
+  }
+}
+
 // ===== Code Review Issue Tests =====
 // The following tests target specific bugs/races found during code review.
 

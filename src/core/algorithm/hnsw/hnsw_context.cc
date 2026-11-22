@@ -284,13 +284,6 @@ void HnswContext::fill_random_to_topk_full() {
     std::uniform_int_distribution<node_id_t> dt(0, entity_->doc_cnt() - 1);
     std::function<node_id_t()> gen;
     node_id_t seqid;
-    std::function<bool(node_id_t)> myfilter = [](node_id_t) { return false; };
-    if (this->filter().is_valid()) {
-      myfilter = [&](node_id_t id) {
-        return this->filter()(entity_->get_key(id));
-      };
-    }
-
     if (capacity < entity_->doc_cnt() / 2) {
       gen = [&]() { return dt(mt); };
     } else {
@@ -306,10 +299,20 @@ void HnswContext::fill_random_to_topk_full() {
          static_cast<size_t>(heap.size()) < capacity && i < entity_->doc_cnt();
          ++i) {
       const auto id = gen();
-      if (!visit_filter_.visited(id) && !myfilter(id)) {
-        visit_filter_.set_visited(id);
-        SearchHeap::emplace(heap, id, dc_.dist(id));
+      if (visit_filter_.visited(id)) continue;
+      if (filter().is_valid()) {
+        key_t key;
+        const int ret = entity_->read_key(id, key);
+        if (ret != 0) {
+          dc_.set_error(ret);
+          return;
+        }
+        if (filter()(key)) continue;
       }
+      visit_filter_.set_visited(id);
+      const auto dist = dc_.dist(id);
+      if (dc_.error()) return;
+      SearchHeap::emplace(heap, id, dist);
     }
   });
 }

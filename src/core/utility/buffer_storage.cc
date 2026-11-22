@@ -1576,8 +1576,6 @@ class BufferStorageFile
   int append_segment(const std::string &id, size_t size) try {
     if (id.find('\0') != std::string::npos) return IndexError_InvalidArgument;
     AllShardsExclusiveLatch latch(mapping_shards_);
-    const int flush_ret = flush_index_locked();
-    if (flush_ret != 0) return flush_ret;
 
     if (!buffer_pool_ || !buffer_pool_handle_) {
       LOG_ERROR("append_segment: pool not ready, file[%s]", file_name_.c_str());
@@ -1588,7 +1586,7 @@ class BufferStorageFile
           "append_segment: storage is marked corrupted, refusing to append, "
           "file[%s], id[%s]",
           file_name_.c_str(), id.c_str());
-      return IndexError_Runtime;
+      return IndexError_WriteData;
     }
     if (!buffer_pool_->writable()) {
       LOG_ERROR("append_segment: pool is read-only, file[%s]",
@@ -1624,6 +1622,9 @@ class BufferStorageFile
     pending.try_emplace(std::string_view(id));
     auto pending_node = pending.extract(pending.begin());
     ailego::BudgetedVector<char> saved_id_bytes(id_size);
+
+    const int flush_ret = flush_index_locked();
+    if (flush_ret != 0) return flush_ret;
 
     MetaChain *chain = &meta_chains_.back();
     IndexFormat::MetaHeader *header = chain->header.get();

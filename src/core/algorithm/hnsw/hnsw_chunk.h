@@ -56,6 +56,8 @@ class ChunkBroker {
 
   int flush(uint64_t checkpoint);
 
+  bool flush_after_rollback();
+
   int dump_meta(const IndexDumper::Pointer &dumper, size_t node_chunks,
                 size_t node_chunk_size, size_t max_index_size) const;
 

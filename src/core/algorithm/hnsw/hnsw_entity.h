@@ -455,6 +455,11 @@ class HnswEntity {
   //! Get primary key of the node id
   virtual key_t get_key(node_id_t id) const = 0;
 
+  virtual int read_key(node_id_t id, key_t &key) const {
+    key = get_key(id);
+    return 0;
+  }
+
   //! Get vector feature data by key
   virtual const void *get_vector(node_id_t id) const = 0;
 

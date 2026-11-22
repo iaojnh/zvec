@@ -108,7 +108,7 @@ TEST_F(HnswStreamerTest, ExportedProviderReadsKeyInsertedInNewChunk) {
   EXPECT_EQ(0, storage->close());
 }
 
-TEST_F(HnswStreamerTest, ProviderDistinguishesKeyReadFailureFromUnusedId) {
+TEST_F(HnswStreamerTest, ReadersDistinguishKeyReadFailureFromUnusedId) {
   class FailingKey : public IndexSegmentStorage::Segment {
    public:
     FailingKey(const Chunk::Pointer &chunk, size_t key_offset)
@@ -160,6 +160,7 @@ TEST_F(HnswStreamerTest, ProviderDistinguishesKeyReadFailureFromUnusedId) {
   const float vector[dim]{};
   ASSERT_EQ(0, entity->add_vector_with_id(0, 0, vector));
   ASSERT_EQ(0, entity->add_vector_with_id(0, 2, vector));
+  ASSERT_EQ(0, entity->update_neighbors(0, 0, {{2, 0.0f}}));
   entity->update_ep_and_level(0, 0);
 
   auto segment = entity->wrap_key(2);
@@ -179,6 +180,44 @@ TEST_F(HnswStreamerTest, ProviderDistinguishesKeyReadFailureFromUnusedId) {
   iter->next();
   EXPECT_FALSE(iter->is_valid());
   EXPECT_EQ(IndexError_NoMemory, iter->status());
+
+  auto metric = IndexFactory::CreateMetric("SquaredEuclidean");
+  ASSERT_TRUE(metric);
+  ASSERT_EQ(0, metric->init(*index_meta_ptr_, {}));
+  HnswContext context(dim, metric, entity);
+  context.set_topk(2);
+  context.resize_results(1);
+  auto &topk = context.search_heap().reset<TopkHeap>(2);
+  topk.emplace(0, 0.0f);
+  topk.emplace(2, 1.0f);
+  EXPECT_EQ(IndexError_NoMemory, context.topk_to_result());
+  EXPECT_TRUE(context.result().empty());
+  std::vector<uint64_t> keys;
+  std::vector<float> scores;
+  EXPECT_EQ(IndexError_NoMemory, context.topk_to_keys(keys, &scores));
+  EXPECT_TRUE(keys.empty());
+  EXPECT_TRUE(scores.empty());
+
+  context.set_max_scan_limit(8);
+  context.set_min_scan_limit(8);
+  ASSERT_EQ(0, context.init(HnswContext::kStreamerContext));
+  context.check_need_adjuct_ctx(entity->doc_cnt());
+  context.set_filter([](uint64_t key) {
+    EXPECT_NE(zvec::core::kInvalidKey, key);
+    return false;
+  });
+  HnswAlgorithm<HnswBufferPoolStreamerEntity> algorithm(*entity);
+  const auto setup_query = [&] {
+    context.clear();
+    context.bind_dist_space(metric->distance(), metric->batch_distance(),
+                            nullptr, dim * sizeof(float), 0);
+    context.reset_query_raw(vector, *index_meta_ptr_);
+  };
+  setup_query();
+  EXPECT_EQ(IndexError_NoMemory, algorithm.search(&context));
+  segment->fail = false;
+  setup_query();
+  EXPECT_EQ(0, algorithm.search(&context));
   ASSERT_EQ(0, entity->close());
   ASSERT_EQ(0, storage->close());
 }
@@ -375,7 +414,7 @@ TEST_F(HnswStreamerTest, AdjacencyReadFailureAbortsSearchAndCanRetry) {
     entity->restore_entry_adjacency();
     ASSERT_EQ(0, search());
     std::vector<uint64_t> keys;
-    context.topk_to_keys(keys);
+    ASSERT_EQ(0, context.topk_to_keys(keys));
     EXPECT_EQ((std::vector<uint64_t>{1}), keys);
   }
   ASSERT_EQ(0, entity->close());
@@ -621,6 +660,78 @@ TEST_F(HnswStreamerTest, FailedFirstInsertLeavesAnOpenableEmptyIndex) {
   EXPECT_EQ(1u, reopened.doc_cnt());
   ASSERT_EQ(0, reopened.close());
   ASSERT_EQ(0, storage->close());
+}
+
+TEST_F(HnswStreamerTest, FailedBufferedInsertRestoresFileBeforeReturning) {
+  ASSERT_EQ(0, PoolPayloadBudget::get_instance().init(64UL << 20));
+  const auto init_entity = [](HnswBufferPoolStreamerEntity &entity) {
+    entity.set_vector_size(dim * sizeof(float));
+    entity.set_l0_neighbor_cnt(4);
+    entity.set_upper_neighbor_cnt(4);
+    entity.set_scaling_factor(5);
+    return entity.init(8);
+  };
+  const float original[dim] = {1.0f};
+  const float replacement[dim] = {2.0f};
+  constexpr uint64_t checkpoint = 42;
+
+  enum class InitialState { kEmpty, kFlushed, kUnflushed };
+  for (auto state :
+       {InitialState::kEmpty, InitialState::kFlushed, InitialState::kUnflushed}) {
+    const auto variant = std::to_string(static_cast<int>(state));
+    SCOPED_TRACE(variant);
+    const auto path = dir_ + "FailedBufferedInsert" + variant;
+    auto storage = IndexFactory::CreateStorage("BufferStorage");
+    ASSERT_TRUE(storage);
+    ASSERT_EQ(0, storage->init({}));
+    ASSERT_EQ(0, storage->open(path, true));
+    IndexStreamer::Stats stats;
+    HnswBufferPoolStreamerEntity writer(stats);
+    ASSERT_EQ(0, init_entity(writer));
+    ASSERT_EQ(0, writer.open(storage, 8UL << 20, false));
+    ASSERT_EQ(0, writer.flush(checkpoint));
+
+    const bool overwrite = state != InitialState::kEmpty;
+    if (overwrite) {
+      ASSERT_EQ(0, writer.insert_buffered(
+                       0, 0, original, true, [&](node_id_t id) {
+                         writer.update_ep_and_level(id, 0);
+                         return 0;
+                       }));
+    }
+    if (state == InitialState::kFlushed) {
+      ASSERT_EQ(0, writer.flush(checkpoint));
+    }
+    EXPECT_EQ(IndexError_NoMemory,
+              writer.insert_buffered(0, 0, replacement, true, [&](node_id_t) {
+                // Model an insert failing after the same flush that runs
+                // before BufferStorage grows its segment directory.
+                EXPECT_EQ(0, storage->flush());
+                return IndexError_NoMemory;
+              }));
+
+    // Inspect the file through a separate cache before flushing or closing
+    // the writer.
+    auto storage_reader = IndexFactory::CreateStorage("BufferStorage");
+    ASSERT_TRUE(storage_reader);
+    ASSERT_EQ(0, storage_reader->init({}));
+    ASSERT_EQ(0, storage_reader->open(path, false));
+    EXPECT_EQ(checkpoint, storage_reader->check_point());
+    IndexStreamer::Stats reader_stats;
+    HnswBufferPoolStreamerEntity reader(reader_stats);
+    ASSERT_EQ(0, init_entity(reader));
+    EXPECT_EQ(0, reader.open(storage_reader, 8UL << 20, false));
+    EXPECT_EQ(overwrite ? 1u : 0u, reader.doc_cnt());
+    EXPECT_EQ(overwrite ? 0u : kInvalidNodeId, reader.entry_point());
+    if (reader.doc_cnt() == 1) {
+      IndexStorage::MemoryBlock block;
+      ASSERT_EQ(0, reader.get_vector(0, block));
+      EXPECT_TRUE(std::equal(original, original + dim,
+                             static_cast<const float *>(block.data())));
+    }
+    ASSERT_EQ(0, writer.close());
+    ASSERT_EQ(0, storage->close());
+  }
 }
 
 TEST_F(HnswStreamerTest, FailedChunkMetadataWriteCanBeRetriedAfterReopen) {

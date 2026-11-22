@@ -631,11 +631,14 @@ void RunHnswExportedProviderAcrossRollback() {
   auto read = std::async(std::launch::async, [&] {
     entering_read.set_value();
     core::IndexStorage::MemoryBlock contended;
-    return exported->get_vector(kOriginalKey, contended);
+    return std::make_pair(exported->get_vector(kOriginalKey, contended),
+                          index->get_doc_count());
   });
   if (reader_started.wait_for(5s) != std::future_status::ready) std::_Exit(6);
   if (read.wait_for(5s) != std::future_status::ready) std::_Exit(7);
-  EXPECT_EQ(core::IndexError_NoReady, read.get());
+  const auto [read_status, committed_count] = read.get();
+  EXPECT_EQ(core::IndexError_NoReady, read_status);
+  EXPECT_EQ(2u, committed_count);
   resume_writer.set_value();
   if (write.wait_for(5s) != std::future_status::ready) std::_Exit(9);
   EXPECT_NE(0, write.get());

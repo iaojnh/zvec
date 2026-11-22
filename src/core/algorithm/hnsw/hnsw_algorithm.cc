@@ -18,6 +18,16 @@ namespace zvec {
 namespace core {
 
 template <typename EntityType>
+int read_graph_key(const EntityType &entity, node_id_t id, key_t &key) {
+  if constexpr (std::is_same_v<EntityType, HnswBufferPoolStreamerEntity>) {
+    return entity.read_key(id, key);
+  } else {
+    key = entity.get_key_typed(id);
+    return 0;
+  }
+}
+
+template <typename EntityType>
 int HnswAlgorithm<EntityType>::add_node(node_id_t id, level_t level,
                                         HnswContext *ctx) {
   const auto clear_heaps =
@@ -466,9 +476,17 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
   candidates.clear();
   visit.clear();
   visit.set_visited(*entry_point);
-  if (!filter(*entry_point)) {
-    topk.emplace(*entry_point, *dist);
-  }
+  const auto offer_candidate = [&](node_id_t id, dist_t score) {
+    bool excluded = false;
+    const int status = filter(id, excluded);
+    if (ailego_unlikely(status != 0)) {
+      dc.set_error(status);
+      return false;
+    }
+    if (!excluded) topk.emplace(id, score);
+    return true;
+  };
+  if (!offer_candidate(*entry_point, *dist)) return;
 
   candidates.emplace(*entry_point, *dist);
   while (!candidates.empty() && !ctx->reach_scan_limit()) {
@@ -577,9 +595,7 @@ void dual_heap_search_neighbors(const EntityType &entity, level_t level,
           *entry_point = node;
           *dist = cur_dist;
         }
-        if (!filter(node)) {
-          topk.emplace(node, cur_dist);
-        }
+        if (!offer_candidate(node, cur_dist)) return;
       }
     }
   }
@@ -604,12 +620,15 @@ void HnswAlgorithm<EntityType>::search_neighbors(
   };
 
   if (ctx->filter().is_valid()) {
-    auto filter = [&](node_id_t id) {
-      return ctx->filter()(entity.get_key_typed(id));
+    auto filter = [&](node_id_t id, bool &excluded) {
+      key_t key;
+      const int status = read_graph_key(entity, id, key);
+      if (status == 0) excluded = ctx->filter()(key);
+      return status;
     };
     run_with_filter(filter);
   } else {
-    run_with_filter([](node_id_t) { return false; });
+    run_with_filter([](node_id_t, bool &) { return 0; });
   }
 }
 
@@ -654,35 +673,31 @@ void HnswAlgorithm<EntityType>::expand_neighbors_by_group(
   }
 
   const auto &entity = static_cast<const EntityType &>(ctx->get_entity());
-  std::function<std::string(node_id_t)> group_by = [&](node_id_t id) {
-    return ctx->group_by()(entity.get_key_typed(id));
-  };
-
-  // devide into groups
+  HnswDistCalculator &dc = ctx->dist_calculator();
   std::map<std::string, TopkHeap> &group_topk_heaps = ctx->group_topk_heaps();
-  ctx->search_heap().for_each([&](node_id_t id, dist_t score) {
-    std::string group_id = group_by(id);
-
-    auto &topk_heap = group_topk_heaps[group_id];
+  const auto add_to_group = [&](key_t key, node_id_t id, dist_t score) {
+    auto &topk_heap = group_topk_heaps[ctx->group_by()(key)];
     if (topk_heap.empty()) {
       topk_heap.limit(ctx->group_topk());
     }
     topk_heap.emplace(id, score);
+  };
+  ctx->search_heap().for_each([&](node_id_t id, dist_t score) {
+    key_t key;
+    const int status = read_graph_key(entity, id, key);
+    if (ailego_unlikely(status != 0)) {
+      dc.set_error(status);
+      return false;
+    }
+    add_to_group(key, id, score);
     return true;
   });
+  if (dc.error()) return;
 
   // stage 2, expand to reach group num as possible
   if (group_topk_heaps.size() < ctx->group_num()) {
     VisitFilter &visit = ctx->visit_filter();
     CandidateHeap &candidates = ctx->candidates();
-    HnswDistCalculator &dc = ctx->dist_calculator();
-
-    std::function<bool(node_id_t)> filter = [](node_id_t) { return false; };
-    if (ctx->filter().is_valid()) {
-      filter = [&](node_id_t id) {
-        return ctx->filter()(entity.get_key_typed(id));
-      };
-    }
 
     // refill to get enough groups
     candidates.clear();
@@ -755,15 +770,14 @@ void HnswAlgorithm<EntityType>::expand_neighbors_by_group(
         node_id_t node = neighbor_ids[i];
         dist_t cur_dist = dists[i];
 
-        if (!filter(node)) {
-          std::string group_id = group_by(node);
-
-          auto &topk_heap = group_topk_heaps[group_id];
-          if (topk_heap.empty()) {
-            topk_heap.limit(ctx->group_topk());
-          }
-          topk_heap.emplace(node, cur_dist);
-
+        key_t key;
+        const int status = read_graph_key(entity, node, key);
+        if (ailego_unlikely(status != 0)) {
+          dc.set_error(status);
+          return;
+        }
+        if (!ctx->filter().is_valid() || !ctx->filter()(key)) {
+          add_to_group(key, node, cur_dist);
           if (group_topk_heaps.size() >= ctx->group_num()) {
             break;
           }

@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <atomic>
 #include <ailego/parallel/lock.h>
 #include <zvec/core/framework/index_framework.h>
 #include <zvec/core/framework/index_provider.h>
@@ -96,6 +97,8 @@ class HnswStreamer : public IndexStreamer {
     }
     return entity_->storage_mode();
   }
+
+  uint32_t committed_doc_count() const;
 
   //! Whether the active search distance path is backed by a turbo quantizer.
   bool uses_turbo_distance() const {
@@ -303,7 +306,7 @@ class HnswStreamer : public IndexStreamer {
   float max_scan_ratio_{HnswEntity::kDefaultScanRatio};
 
   uint32_t magic_{0U};
-  State state_{STATE_INIT};
+  std::atomic<State> state_{STATE_INIT};
   bool read_only_{false};
   bool bf_enabled_{false};
   bool check_crc_enabled_{false};

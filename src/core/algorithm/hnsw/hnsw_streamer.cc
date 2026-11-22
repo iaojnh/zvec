@@ -969,6 +969,12 @@ HnswGraphMutex *HnswStreamer::buffered_graph_mutex() const {
   return entity_ ? entity_->buffered_graph_mutex() : nullptr;
 }
 
+uint32_t HnswStreamer::committed_doc_count() const {
+  if (state_.load(std::memory_order_acquire) != STATE_OPENED)
+    return kInvalidNodeId;
+  return entity_->committed_doc_count();
+}
+
 bool HnswStreamer::search_blocked_in_callback() const {
   const auto *mutex = buffered_graph_mutex();
   // A separately owned context can read a different buffered graph or a
@@ -1372,14 +1378,7 @@ int HnswStreamer::search_candidates_impl(
     LOG_ERROR("Hnsw searcher fast search failed");
     return ret;
   }
-  ctx->topk_to_keys(keys, scores);
-
-  if (ailego_unlikely(ctx->error())) {
-    keys.clear();
-    if (scores) scores->clear();
-    return IndexError_Runtime;
-  }
-  return 0;
+  return ctx->topk_to_keys(keys, scores);
 }
 
 void HnswStreamer::print_debug_info() {
@@ -1450,27 +1449,24 @@ int HnswStreamer::search_bf_impl(
       return IndexError_InvalidArgument;
     }
 
-    std::function<std::string(node_id_t)> group_by = [&](node_id_t id) {
-      return ctx->group_by()(entity_->get_key(id));
-    };
-
     for (size_t q = 0; q < count; ++q) {
       ctx->reset_query(query, meta_);
       ctx->group_topk_heaps().clear();
 
       for (node_id_t id = 0; id < entity_->doc_cnt(); ++id) {
-        if (entity_->get_key(id) == kInvalidKey) {
-          continue;
-        }
+        key_t key;
+        const int status = entity_->read_key(id, key);
+        if (status != 0) return status;
+        if (key == kInvalidKey) continue;
 
-        if (!ctx->filter().is_valid() || !ctx->filter()(entity_->get_key(id))) {
+        if (!ctx->filter().is_valid() || !ctx->filter()(key)) {
           dist_t dist;
           if (!ctx->try_batch_dist(id, dist, skip_missing_vectors)) {
             if (ctx->error()) return ctx->dist_calculator().error_code();
             continue;
           }
 
-          std::string group_id = group_by(id);
+          std::string group_id = ctx->group_by()(key);
 
           auto &topk_heap = ctx->group_topk_heaps()[group_id];
           if (topk_heap.empty()) {
@@ -1493,11 +1489,12 @@ int HnswStreamer::search_bf_impl(
       ctx->reset_query(query, meta_);
       topk.clear();
       for (node_id_t id = 0; id < entity_->doc_cnt(); ++id) {
-        if (entity_->get_key(id) == kInvalidKey) {
-          continue;
-        }
+        key_t key;
+        const int status = entity_->read_key(id, key);
+        if (status != 0) return status;
+        if (key == kInvalidKey) continue;
 
-        if (!filter.is_valid() || !filter(entity_->get_key(id))) {
+        if (!filter.is_valid() || !filter(key)) {
           dist_t dist;
           if (!ctx->try_batch_dist(id, dist, skip_missing_vectors)) {
             if (ctx->error()) return ctx->dist_calculator().error_code();
@@ -1566,10 +1563,6 @@ int HnswStreamer::search_bf_by_p_keys_impl(
       return IndexError_InvalidArgument;
     }
 
-    std::function<std::string(node_id_t)> group_by = [&](node_id_t id) {
-      return ctx->group_by()(entity_->get_key(id));
-    };
-
     for (size_t q = 0; q < count; ++q) {
       ctx->reset_query(query, meta_);
       ctx->group_topk_heaps().clear();
@@ -1584,7 +1577,10 @@ int HnswStreamer::search_bf_by_p_keys_impl(
               if (ctx->error()) return ctx->dist_calculator().error_code();
               continue;
             }
-            std::string group_id = group_by(id);
+            key_t key;
+            const int status = entity_->read_key(id, key);
+            if (status != 0) return status;
+            std::string group_id = ctx->group_by()(key);
 
             auto &topk_heap = ctx->group_topk_heaps()[group_id];
             if (topk_heap.empty()) {
