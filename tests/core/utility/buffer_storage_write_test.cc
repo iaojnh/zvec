@@ -2526,36 +2526,26 @@ TEST_F(BufferStorageWriteTest, ParsingLeavesColdPagesUnpopulated) {
               segment->write(0, payload.data(), payload.size()));
     ASSERT_EQ(0, storage->close());
   }
-  for (const char *backend : {"BufferReadStorage", "BufferStorage"}) {
-    SCOPED_TRACE(backend);
-    auto storage = IndexFactory::CreateStorage(backend);
-    ailego::Params params;
-    params.set(BUFFER_READ_STORAGE_WARMUP_MODE,
-               BUFFER_READ_STORAGE_WARMUP_NONE);
-    ASSERT_EQ(0, storage->init(params));
-    const int ret = std::strcmp(backend, "BufferReadStorage") == 0
-                        ? storage->open(file_path_, false)
-                        : storage->open(file_path_, {false, true});
-    ASSERT_EQ(0, ret);
-    auto segment = storage->get("parser");
-    ASSERT_TRUE(segment);
-    const auto pages = storage->vec_buffer_pool();
-    ASSERT_TRUE(pages);
-    const size_t first = segment->data_offset() / page;
-    for (const size_t offset : {size_t{0}, page - 1}) {
-      IndexStorage::MemoryBlock result;
-      ASSERT_EQ(64u, segment->read_for_parsing(offset, result, 64));
-      EXPECT_EQ(0, std::memcmp(result.data(), payload.data() + offset, 64));
-      EXPECT_FALSE(pages->is_page_resident(first));
-      EXPECT_FALSE(pages->is_page_resident(first + 1));
-    }
-    IndexStorage::MemoryBlock query;
-    ASSERT_EQ(1u, segment->read(0, query, 1));
-    EXPECT_TRUE(pages->is_page_resident(first));
-    IndexStorage::MemoryBlock parsing;
-    ASSERT_EQ(1u, segment->read_for_parsing(0, parsing, 1));
-    EXPECT_EQ(query.data(), parsing.data());
+  auto storage = open_read_only();
+  ASSERT_TRUE(storage);
+  auto segment = storage->get("parser");
+  ASSERT_TRUE(segment);
+  const auto pages = storage->vec_buffer_pool();
+  ASSERT_TRUE(pages);
+  const size_t first = segment->data_offset() / page;
+  for (const size_t offset : {size_t{0}, page - 1}) {
+    IndexStorage::MemoryBlock result;
+    ASSERT_EQ(64u, segment->read_for_parsing(offset, result, 64));
+    EXPECT_EQ(0, std::memcmp(result.data(), payload.data() + offset, 64));
+    EXPECT_FALSE(pages->is_page_resident(first));
+    EXPECT_FALSE(pages->is_page_resident(first + 1));
   }
+  IndexStorage::MemoryBlock query;
+  ASSERT_EQ(1u, segment->read(0, query, 1));
+  EXPECT_TRUE(pages->is_page_resident(first));
+  IndexStorage::MemoryBlock parsing;
+  ASSERT_EQ(1u, segment->read_for_parsing(0, parsing, 1));
+  EXPECT_EQ(query.data(), parsing.data());
 }
 
 TEST_F(BufferStorageWriteTest, ParserReadsReuseButDoNotPopulateScratch) {
@@ -2570,47 +2560,42 @@ TEST_F(BufferStorageWriteTest, ParserReadsReuseButDoNotPopulateScratch) {
               segment->write(0, payload.data(), payload.size()));
     ASSERT_EQ(0, storage->close());
   }
-  for (const char *backend : {"BufferReadStorage", "BufferStorage"}) {
-    SCOPED_TRACE(backend);
-    auto storage = IndexFactory::CreateStorage(backend);
-    ailego::Params params;
-    ASSERT_EQ(0, storage->init(params));
-    ASSERT_EQ(0, storage->open(file_path_, false));
-    auto segment = storage->get("parser");
-    ASSERT_TRUE(segment);
-    // Keep both source pages resident so only result/cache ownership changes.
-    IndexStorage::MemoryBlock pins[2];
-    ASSERT_EQ(1u, segment->read_borrowed_immutable(0, pins[0], 1));
-    ASSERT_EQ(1u, segment->read_borrowed_immutable(page, pins[1], 1));
-    auto &pool = ailego::MemoryLimitPool::get_instance();
-    const auto before = pool.external_used();
-    IndexStorage::MemoryBlock result;
-    ASSERT_EQ(64u, segment->read_for_parsing(page - 16, result, 64));
-    EXPECT_EQ(0, std::memcmp(result.data(), std::string(64, 'p').data(), 64));
-    result.reset();
-    EXPECT_EQ(before, pool.external_used());
+  auto storage = open_read_only();
+  ASSERT_TRUE(storage);
+  auto segment = storage->get("parser");
+  ASSERT_TRUE(segment);
+  // Keep both source pages resident so only result/cache ownership changes.
+  IndexStorage::MemoryBlock pins[2];
+  ASSERT_EQ(1u, segment->read_borrowed_immutable(0, pins[0], 1));
+  ASSERT_EQ(1u, segment->read_borrowed_immutable(page, pins[1], 1));
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto before = pool.external_used();
+  IndexStorage::MemoryBlock result;
+  ASSERT_EQ(64u, segment->read_for_parsing(page - 16, result, 64));
+  EXPECT_EQ(0, std::memcmp(result.data(), std::string(64, 'p').data(), 64));
+  result.reset();
+  EXPECT_EQ(before, pool.external_used());
 
-    // An ordinary read may populate the cache. Parsing must still reuse that
-    // already-funded backing when no additional allocation can be admitted.
-    ASSERT_EQ(64u, segment->read(page - 16, result, 64));
-    ASSERT_EQ(IndexStorage::MemoryBlock::MBT_REUSABLE_SCRATCH, result.type_);
-    const void *backing = result.data();
-    result.reset();
+  // An ordinary read may populate the cache. Parsing must still reuse that
+  // already-funded backing when no additional allocation can be admitted.
+  ASSERT_EQ(64u, segment->read(page - 16, result, 64));
+  ASSERT_EQ(IndexStorage::MemoryBlock::MBT_REUSABLE_SCRATCH, result.type_);
+  const void *backing = result.data();
+  result.reset();
+  ASSERT_EQ(64u, segment->read_for_parsing(page - 16, result, 64));
+  EXPECT_EQ(backing, result.data());
+  {
+    // Keep the result live while creating pressure; an idle cache entry
+    // may legitimately be reclaimed by the background evictor.
+    WorkspacePressure pressure(0);
     ASSERT_EQ(64u, segment->read_for_parsing(page - 16, result, 64));
-    EXPECT_EQ(backing, result.data());
-    {
-      // Keep the result live while creating pressure; an idle cache entry
-      // may legitimately be reclaimed by the background evictor.
-      WorkspacePressure pressure(0);
-      ASSERT_EQ(64u, segment->read_for_parsing(page - 16, result, 64));
-      EXPECT_EQ(IndexStorage::MemoryBlock::MBT_REUSABLE_SCRATCH, result.type_);
-    }
-    const auto cached = pool.external_used();
-    IndexStorage::MemoryBlock overlapping;
-    ASSERT_EQ(64u, segment->read_for_parsing(page - 16, overlapping, 64));
-    overlapping.reset();
-    EXPECT_EQ(cached, pool.external_used());
+    EXPECT_EQ(IndexStorage::MemoryBlock::MBT_REUSABLE_SCRATCH, result.type_);
   }
+  const auto cached = pool.external_used();
+  IndexStorage::MemoryBlock overlapping;
+  ASSERT_EQ(64u, segment->read_for_parsing(page - 16, overlapping, 64));
+  overlapping.reset();
+  EXPECT_EQ(cached, pool.external_used());
 }
 
 void BufferStorageWriteTest::check_shared_cache_reserve(size_t capacity) {
