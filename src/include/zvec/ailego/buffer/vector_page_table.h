@@ -778,6 +778,10 @@ class ZVEC_AILEGO_API VecBufferPool {
   //! Returns 0 on success, -1 on failure (e.g. read-only pool or I/O error).
   int write_range(size_t file_offset, size_t length, const char *src);
 
+  //! Report the prefix copied into the cache, including on a failed write.
+  int write_range(size_t file_offset, size_t length, const char *src,
+                  size_t *written);
+
   //! Apply ordered fragments after acquiring every destination page.
   //! Admission failure leaves all destination bytes unchanged.
   int write_fragments(const VecBufferWriteFragment *fragments, size_t count);
@@ -924,7 +928,7 @@ class ZVEC_AILEGO_API VecBufferPool {
   char *acquire_buffer(block_id_t page_id, int retry, bool record_reuse,
                        bool *allocation_failed);
   PageWriteStatus write_range_status(size_t file_offset, size_t length,
-                                     const char *src);
+                                     const char *src, size_t *written = nullptr);
   PageWriteStatus write_fragments_status(
       const VecBufferWriteFragment *fragments, size_t count);
   struct WriteFragmentLayout {
@@ -1086,7 +1090,10 @@ class ZVEC_AILEGO_API VecBufferPoolHandle {
 
   int write_range(size_t file_offset, size_t len, const char *src);
   PageWriteStatus write_range_status(size_t file_offset, size_t len,
-                                     const char *src);
+                                     const char *src, size_t *written = nullptr);
+
+  int write_range(size_t file_offset, size_t len, const char *src,
+                  size_t *written);
 
   int write_fragments(const VecBufferWriteFragment *fragments, size_t count);
   PageWriteStatus write_fragments_status(
