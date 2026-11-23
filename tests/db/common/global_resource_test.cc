@@ -16,8 +16,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <future>
 #include <thread>
 #include <ailego/utility/memory_helper.h>
@@ -27,7 +25,6 @@
 #include <rocksdb/advanced_cache.h>
 #include <rocksdb/write_buffer_manager.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
-#include <zvec/db/collection.h>
 #include <zvec/db/config.h>
 #include "db/common/native_image_memory.h"
 #include "db/common/native_worker_memory.h"
@@ -116,29 +113,6 @@ TEST(GlobalResourceStartupDeathTest,
             resources.query_thread_pool() || resources.rocksdb_block_cache())
           std::_Exit(4);
         std::_Exit(0);
-      },
-      ::testing::ExitedWithCode(0), "");
-  ::testing::FLAGS_gtest_death_test_style = previous_style;
-}
-
-TEST(GlobalResourceStartupDeathTest, MissingManifestDoesNotFreezeConfiguration) {
-  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
-  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
-  EXPECT_EXIT(
-      {
-        namespace fs = std::filesystem;
-        const auto nonce =
-            std::chrono::steady_clock::now().time_since_epoch().count();
-        const auto path =
-            fs::temp_directory_path() / ("zvec_no_manifest_" + std::to_string(nonce));
-        if (!fs::create_directory(path)) std::_Exit(1);
-        std::ofstream(path / "LOCK").close();
-        auto opened = Collection::Open(path.u8string(), {false, false, 1UL << 20});
-        fs::remove_all(path);
-        if (opened || GlobalResource::Instance().initialized()) std::_Exit(2);
-        GlobalConfig::ConfigData config;
-        config.query_thread_count = config.query_thread_count == 1 ? 2 : 1;
-        std::_Exit(GlobalConfig::Instance().initialize(config).ok() ? 0 : 3);
       },
       ::testing::ExitedWithCode(0), "");
   ::testing::FLAGS_gtest_death_test_style = previous_style;

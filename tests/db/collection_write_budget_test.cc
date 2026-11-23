@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -22,6 +23,7 @@
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/db/collection.h>
+#include <zvec/db/config.h>
 #include "common/memory_budget_test_helper.h"
 #include "db/collection_fetch_internal.h"
 #include "db/common/file_helper.h"
@@ -38,6 +40,31 @@ namespace zvec {
 namespace {
 
 constexpr size_t kMiB = 1024 * 1024;
+
+#if GTEST_HAS_DEATH_TEST
+TEST(CollectionStartupDeathTest, MissingManifestDoesNotFreezeConfiguration) {
+  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        namespace fs = std::filesystem;
+        const auto nonce =
+            std::chrono::steady_clock::now().time_since_epoch().count();
+        const auto path = fs::temp_directory_path() /
+                          ("zvec_no_manifest_" + std::to_string(nonce));
+        if (!fs::create_directory(path)) std::_Exit(1);
+        std::ofstream(path / "LOCK").close();
+        auto opened = Collection::Open(path.u8string(), {false, false, kMiB});
+        fs::remove_all(path);
+        if (opened || GlobalResource::Instance().initialized()) std::_Exit(2);
+        GlobalConfig::ConfigData config;
+        config.query_thread_count = config.query_thread_count == 1 ? 2 : 1;
+        std::_Exit(GlobalConfig::Instance().initialize(config).ok() ? 0 : 3);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ::testing::FLAGS_gtest_death_test_style = previous_style;
+}
+#endif
 
 class CollectionWriteBudgetTest : public testing::Test {
  protected:

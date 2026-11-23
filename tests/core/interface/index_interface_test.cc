@@ -234,8 +234,11 @@ TEST(IndexInterface, IndexTypeKeepsExistingValues) {
 }
 
 TEST(IndexInterface, InternalIdSearchPreservesBorrowedCandidateRestriction) {
+  ASSERT_EQ(0, zvec::ailego::PoolPayloadBudget::get_instance().init(64ULL << 20));
   const std::string path = "test_borrowed_internal_ids.index";
   zvec::test_util::RemoveTestFiles(path);
+  auto cleanup = zvec::ailego::ScopeGuard::Make(
+      [&] { zvec::test_util::RemoveTestFiles(path); });
   auto param = FlatIndexParamBuilder()
                    .with_dimension(32)
                    .with_data_type(DataType::DT_FP32)
@@ -264,7 +267,6 @@ TEST(IndexInterface, InternalIdSearchPreservesBorrowedCandidateRestriction) {
   ASSERT_EQ(0, index->search_internal_ids(query, query_param, &borrowed, nullptr));
   EXPECT_EQ(owning, borrowed);
   ASSERT_EQ(0, index->close());
-  zvec::test_util::RemoveTestFiles(path);
 }
 
 TEST(IndexInterface, IvfCanCreateAfterAbandoningUntrainedIndex) {
