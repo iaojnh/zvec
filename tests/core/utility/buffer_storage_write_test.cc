@@ -1267,24 +1267,66 @@ TEST_F(BufferStorageWriteTest, WriteLargeBufferPersistence) {
 
 // ===== Refresh / Checkpoint Tests =====
 
-// Test: refresh() updates checkpoint and marks dirty
 TEST_F(BufferStorageWriteTest, RefreshCheckpoint) {
   auto storage = open_writable();
   ASSERT_TRUE(storage);
   ASSERT_EQ(0, storage->append("seg1", 4096));
 
   storage->refresh(42);
-  EXPECT_EQ(0, storage->flush());
+  EXPECT_TRUE(storage->is_dirty());
+  EXPECT_EQ(42u, storage->check_point());
+  EXPECT_EQ(IndexError_Duplicate, storage->append("seg1", 4096));
+  EXPECT_TRUE(storage->is_dirty());
+  EXPECT_EQ(42u, storage->check_point());
+  ASSERT_EQ(0, storage->flush());
+  EXPECT_EQ(42u, storage->check_point());
 
-  // After flush the check_point should be >= 42
-  EXPECT_GE(storage->check_point(), 42u);
-
-  // Increasing checkpoint
   storage->refresh(100);
-  EXPECT_EQ(0, storage->flush());
-  EXPECT_GE(storage->check_point(), 100u);
+  ASSERT_EQ(0, storage->flush());
+  EXPECT_EQ(100u, storage->check_point());
 
-  EXPECT_EQ(0, storage->close());
+  storage->refresh(50);
+  ASSERT_EQ(0, storage->flush());
+  EXPECT_EQ(50u, storage->check_point());
+  ASSERT_EQ(0, storage->close());
+  storage->refresh(200);
+  EXPECT_FALSE(storage->is_dirty());
+
+  storage = open_writable();
+  ASSERT_NE(nullptr, storage);
+  EXPECT_EQ(50u, storage->check_point());
+  storage->refresh(90);
+  storage->refresh(40);
+  ASSERT_EQ(0, storage->flush());
+  EXPECT_EQ(40u, storage->check_point());
+  ASSERT_EQ(0, storage->close());
+}
+
+TEST_F(BufferStorageWriteTest, ConcurrentRefreshAndFlushKeepsFinalRequest) {
+  auto storage = open_writable();
+  ASSERT_NE(nullptr, storage);
+  constexpr uint64_t kFinalCheckpoint = 7;
+  std::atomic<bool> done{false};
+  std::thread refresher([&]() {
+    for (uint64_t checkpoint = 1; checkpoint <= 128; ++checkpoint) {
+      storage->refresh(checkpoint);
+      std::this_thread::yield();
+      storage->refresh(1);
+    }
+    storage->refresh(kFinalCheckpoint);
+    done.store(true, std::memory_order_release);
+  });
+
+  int status;
+  do {
+    status = storage->flush();
+  } while (status == 0 && !done.load(std::memory_order_acquire));
+  refresher.join();
+  ASSERT_EQ(0, status);
+  ASSERT_EQ(0, storage->flush());
+  EXPECT_EQ(kFinalCheckpoint, storage->check_point());
+  EXPECT_FALSE(storage->is_dirty());
+  ASSERT_EQ(0, storage->close());
 }
 
 // ===== Duplicate / Error Handling =====
