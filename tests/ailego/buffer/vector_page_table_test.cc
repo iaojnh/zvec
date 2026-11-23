@@ -19,12 +19,14 @@
 //   4. Reclaimable 4 MiB-aligned slab allocation
 //   5. Observability counters (hit / miss / evict / second_chance / stats)
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <limits>
 #include <new>
@@ -57,7 +59,23 @@
 #include <unistd.h>
 #endif
 
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <unistd.h>
+#include <ailego/io/libaio_loader.h>
+#endif
+
 namespace zvec::ailego {
+#if defined(__linux__) && !defined(__ANDROID__)
+struct VecBufferPoolAioTestPeer {
+  static bool load(VecBufferPool &pool, const block_id_t *pages, size_t count) {
+    // Exercise libaio even on hosts that normally select io_uring.
+    pool.aio_enabled_ = true;
+    pool.io_backend_type_ = IOBackendType::kLibAio;
+    return pool.load_pages_aio(pages, count, VecBufferPool::kLowPriority);
+  }
+};
+#endif
+
 struct QueueResidentSampleTestPeer {
   static void stop_background() {
     MemoryLimitPool::get_instance().stop_background_evictor();
@@ -1192,6 +1210,148 @@ TEST_F(BufferPoolTest, FailedFileExtendDoesNotGrowBackingFile) {
   ASSERT_EQ(0, std::fseek(backing, 0, SEEK_END));
   EXPECT_EQ(static_cast<long>(old_size), std::ftell(backing));
   std::fclose(backing);
+}
+
+TEST_F(BufferPoolTest, ExtendFileRoundsUpToHostPageSize) {
+  init_vec_pool(/*capacity_pages=*/2, /*file_pages=*/2, /*writable=*/true);
+  std::string file = new_file(/*num_pages=*/1);
+  VecBufferPool pool(file, /*writable=*/true);
+  ASSERT_EQ(0, pool.init());
+
+  // An index written with a smaller format page size (e.g. 4 KiB) requests
+  // growth that is not aligned to this host's page size. Appends and
+  // directory splits on such files must still succeed.
+  ASSERT_TRUE(pool.extend_file(kVectorPageSize + 1));
+  EXPECT_EQ(2 * kVectorPageSize, pool.file_size());
+
+  std::vector<char> payload(kVectorPageSize, static_cast<char>(0x5a));
+  EXPECT_EQ(0,
+            pool.write_range(kVectorPageSize, kVectorPageSize, payload.data()));
+  EXPECT_EQ(0, pool.flush_all());
+}
+
+TEST_F(BufferPoolTest, FlushAllDoesNotSkipDirtyPageInTransition) {
+  init_vec_pool(/*capacity_pages=*/2, /*file_pages=*/1, /*writable=*/true);
+  std::string file = new_file(/*num_pages=*/1);
+  VecBufferPool pool(file, /*writable=*/true);
+  ASSERT_EQ(0, pool.init());
+
+  // Simulate a dirty page whose acquisition is blocked by an in-flight
+  // transition: flush must not mistake it for an already persisted page.
+  ASSERT_EQ(VectorPageTable::LoadClaimResult::kClaimed,
+            pool.page_table_.try_claim_block_load(/*block_id=*/0));
+  pool.page_table_.mark_dirty(/*block_id=*/0);
+
+  std::atomic<bool> done{false};
+  std::atomic<int> rc{0};
+  std::thread flusher([&] {
+    rc.store(pool.flush_all(), std::memory_order_release);
+    done.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  // Before the fix, flush_all skipped the dirty page and returned 0 at once.
+  EXPECT_FALSE(done.load(std::memory_order_acquire));
+
+  // Settle the transition without publishing a clean page. The page is still
+  // dirty and unpinnable, so the flush must fail loudly instead of reporting
+  // success with stale bytes on disk.
+  ASSERT_TRUE(pool.page_table_.cancel_block_load(/*block_id=*/0));
+  flusher.join();
+  EXPECT_TRUE(done.load(std::memory_order_acquire));
+  EXPECT_NE(0, rc.load(std::memory_order_acquire));
+  pool.page_table_.clear_dirty(/*block_id=*/0);
+}
+
+TEST_F(BufferPoolTest, SharedPageFirstLoadPreservesDirectory) {
+  init_vec_pool(/*capacity_pages=*/2, /*file_pages=*/2, /*writable=*/true);
+  std::string file = new_file(/*num_pages=*/1);
+  VecBufferPool pool(file, /*writable=*/true);
+  ASSERT_EQ(0, pool.init());
+  ASSERT_TRUE(pool.extend_file(2 * kVectorPageSize));
+  // A directory smaller than the host page shares it with segment data.
+  const size_t directory_size = kVectorPageSize / 4;
+  pool.register_metadata_range(kVectorPageSize, directory_size);
+  std::vector<char> header(64);
+  for (size_t i = 0; i < header.size(); ++i) {
+    header[i] = static_cast<char>(i + 1);
+  }
+  ASSERT_EQ(0, pool.write_meta(kVectorPageSize, header.size(), header.data()));
+  // The first segment write must load the directory from disk instead of
+  // zero-filling the newly extended page.
+  ASSERT_EQ(0,
+            pool.write_range(kVectorPageSize + directory_size, 5, "chunk"));
+  ASSERT_EQ(0, pool.flush_all());
+
+  std::vector<char> on_disk(kVectorPageSize);
+  FILE *input = std::fopen(file.c_str(), "rb");
+  ASSERT_NE(nullptr, input);
+  ASSERT_EQ(0, std::fseek(input, static_cast<long>(kVectorPageSize), SEEK_SET));
+  ASSERT_EQ(kVectorPageSize,
+            std::fread(on_disk.data(), 1, on_disk.size(), input));
+  std::fclose(input);
+  EXPECT_EQ(0, std::memcmp(on_disk.data(), header.data(), header.size()));
+  EXPECT_EQ(0, std::memcmp(on_disk.data() + directory_size, "chunk", 5));
+}
+
+TEST_F(BufferPoolTest, SharedPageWritebackSkipsStaleDirectory) {
+  init_vec_pool(/*capacity_pages=*/2, /*file_pages=*/1, /*writable=*/true);
+  std::string file = new_file(/*num_pages=*/1);
+  VecBufferPool pool(file, /*writable=*/true);
+  ASSERT_EQ(0, pool.init());
+  // The directory and data are both inside the first host page.
+  const size_t directory_size = kVectorPageSize / 4;
+  const size_t data_offset = kVectorPageSize / 2;
+  pool.register_metadata_range(0, directory_size);
+  const std::vector<char> old_header(64, 'o');
+  const std::vector<char> new_header(64, 'n');
+  ASSERT_EQ(0, pool.write_meta(0, old_header.size(), old_header.data()));
+  // Cache the page with the old directory and dirty its data bytes.
+  ASSERT_EQ(0, pool.write_range(data_offset, 5, "chunk"));
+  // An in-place append publishes a new directory through write_meta().
+  ASSERT_EQ(0, pool.write_meta(0, new_header.size(), new_header.data()));
+  // Data writeback must not flush the stale cached directory back.
+  ASSERT_EQ(0, pool.flush_all());
+
+  std::vector<char> on_disk(kVectorPageSize);
+  FILE *input = std::fopen(file.c_str(), "rb");
+  ASSERT_NE(nullptr, input);
+  ASSERT_EQ(kVectorPageSize,
+            std::fread(on_disk.data(), 1, on_disk.size(), input));
+  std::fclose(input);
+  EXPECT_EQ(0,
+            std::memcmp(on_disk.data(), new_header.data(), new_header.size()));
+  EXPECT_EQ(0, std::memcmp(on_disk.data() + data_offset, "chunk", 5));
+}
+
+TEST_F(BufferPoolTest, MixedBatchFlushesOrdinaryAndSharedPages) {
+  init_vec_pool(/*capacity_pages=*/4, /*file_pages=*/3, /*writable=*/true);
+  std::string file = new_file(/*num_pages=*/1);
+  VecBufferPool pool(file, /*writable=*/true);
+  ASSERT_EQ(0, pool.init());
+  ASSERT_TRUE(pool.extend_file(3 * kVectorPageSize));
+  const size_t directory_size = kVectorPageSize / 4;
+  pool.register_metadata_range(kVectorPageSize, directory_size);
+  const std::vector<char> header(64, 'h');
+  ASSERT_EQ(0, pool.write_meta(kVectorPageSize, header.size(), header.data()));
+  // Ordinary pages around one directory-sharing page, all dirty in one batch.
+  ASSERT_EQ(0, pool.write_range(0, 5, "page0"));
+  ASSERT_EQ(0,
+            pool.write_range(kVectorPageSize + directory_size, 5, "chunk"));
+  ASSERT_EQ(0, pool.write_range(2 * kVectorPageSize, 5, "page2"));
+  ASSERT_EQ(0, pool.flush_all());
+
+  std::vector<char> on_disk(3 * kVectorPageSize);
+  FILE *input = std::fopen(file.c_str(), "rb");
+  ASSERT_NE(nullptr, input);
+  ASSERT_EQ(on_disk.size(),
+            std::fread(on_disk.data(), 1, on_disk.size(), input));
+  std::fclose(input);
+  EXPECT_EQ(0, std::memcmp(on_disk.data(), "page0", 5));
+  EXPECT_EQ(0, std::memcmp(on_disk.data() + kVectorPageSize, header.data(),
+                           header.size()));
+  EXPECT_EQ(0, std::memcmp(on_disk.data() + kVectorPageSize + directory_size,
+                           "chunk", 5));
+  EXPECT_EQ(0, std::memcmp(on_disk.data() + 2 * kVectorPageSize, "page2", 5));
 }
 
 TEST_F(BufferPoolTest, ExternalReservationSharesThePageBudget) {
@@ -2353,6 +2513,151 @@ TEST_F(BufferPoolTest, AioAdmissionUsesFreeCapacityBeforeEviction) {
 // Scattered acquisition is storage-level functionality: it preserves caller
 // order, deduplicates cold I/O internally, and still returns one independent
 // pin for every occurrence of a duplicate page id.
+#if defined(__linux__) && !defined(__ANDROID__)
+namespace {
+struct BatchReadAioState {
+  bool partial_submit{false};
+  bool fail_wait{false};
+  std::function<void()> before_completion;
+  std::array<struct iocb *, 2> submitted{};
+  size_t accepted{0};
+};
+
+thread_local BatchReadAioState *batch_read_aio = nullptr;
+
+int BatchReadSubmit(io_context_t, long count, struct iocb *requests[]) {
+  if (count < 1 || count > 2) return -EINVAL;
+  auto &state = *batch_read_aio;
+  state.accepted = state.partial_submit ? 1 : static_cast<size_t>(count);
+  std::copy_n(requests, state.accepted, state.submitted.begin());
+  return static_cast<int>(state.accepted);
+}
+
+int BatchReadGetEvents(io_context_t, long, long, struct io_event *events,
+                       struct timespec *) {
+  auto &state = *batch_read_aio;
+  // Allocation shortage and partial submission have both cancelled page 1
+  // before reaching this point. Hold this batch until a new loader owns it.
+  state.before_completion();
+  if (state.fail_wait) return -EIO;
+  for (size_t i = 0; i < state.accepted; ++i) {
+    const auto *request = state.submitted[i];
+    events[i] = {};
+    events[i].data = request->data;
+    events[i].res = ::pread(request->aio_fildes, request->u.c.buf,
+                            request->u.c.nbytes, request->u.c.offset);
+  }
+  return static_cast<int>(state.accepted);
+}
+
+void ExpectFailedBatchPreservesNewLoader(VecBufferPool &pool,
+                                         bool partial_submit,
+                                         bool fail_wait = false) {
+  auto &loader = LibAioLoader::Instance();
+  if (!loader.load()) {
+    GTEST_SKIP() << "libaio is unavailable";
+  }
+  char *retry_buffer = nullptr;
+  ASSERT_TRUE(MemoryLimitPool::get_instance().try_acquire_buffer(
+      kVectorPageSize, retry_buffer));
+
+  std::promise<void> start_retry;
+  auto start = start_retry.get_future();
+  std::promise<void> retry_claimed;
+  auto claimed = retry_claimed.get_future();
+  std::promise<void> finish_retry;
+  auto finish = finish_retry.get_future();
+  std::once_flag start_once;
+  auto allow_retry = [&] {
+    std::call_once(start_once, [&] { start_retry.set_value(); });
+  };
+  std::thread retry([&] {
+    start.wait();
+    const auto claim = pool.page_table_.try_claim_block_load(1);
+    EXPECT_EQ(VectorPageTable::LoadClaimResult::kClaimed, claim);
+    retry_claimed.set_value();
+    // Keep the replacement claim in kLoading until the failed batch and
+    // its cleanup guard have both exited.
+    finish.wait();
+    if (claim != VectorPageTable::LoadClaimResult::kClaimed) {
+      MemoryLimitPool::get_instance().release_buffer(retry_buffer,
+                                                     kVectorPageSize);
+      return;
+    }
+    EXPECT_EQ(static_cast<ssize_t>(kVectorPageSize),
+              ::pread(pool.file_descriptor(), retry_buffer, kVectorPageSize,
+                       kVectorPageSize));
+    char *installed = pool.page_table_.publish_claimed_block(
+        1, retry_buffer, kVectorPageSize);
+    EXPECT_EQ(retry_buffer, installed);
+    if (installed) {
+      ExpectPageContent(installed, 1);
+      pool.page_table_.release_block(1);
+    }
+  });
+
+  BatchReadAioState state;
+  state.partial_submit = partial_submit;
+  state.fail_wait = fail_wait;
+  state.before_completion = [&] {
+    allow_retry();
+    EXPECT_EQ(std::future_status::ready,
+              claimed.wait_for(std::chrono::seconds(5)));
+  };
+  const auto original_submit = loader.io_submit;
+  const auto original_getevents = loader.io_getevents;
+  loader.io_submit = BatchReadSubmit;
+  loader.io_getevents = BatchReadGetEvents;
+  bool loaded = true;
+  // A fresh thread owns the real libaio context; join also destroys that
+  // context before restoring the process-wide function pointers.
+  std::thread batch([&] {
+    batch_read_aio = &state;
+    const std::array<block_id_t, 2> pages{{0, 1}};
+    loaded = VecBufferPoolAioTestPeer::load(pool, pages.data(), pages.size());
+    batch_read_aio = nullptr;
+  });
+  batch.join();
+  loader.io_submit = original_submit;
+  loader.io_getevents = original_getevents;
+  EXPECT_FALSE(loaded);
+  EXPECT_EQ(1u, state.accepted);
+  allow_retry();  // Also release the worker if setup failed unexpectedly.
+  claimed.wait();
+  EXPECT_TRUE(pool.page_table_.has_residency_activity(1));
+  finish_retry.set_value();
+  retry.join();
+}
+}  // namespace
+
+TEST_F(BufferPoolTest, AioPartialSubmitDoesNotCancelReplacementLoad) {
+  init_vec_pool(/*capacity_pages=*/16, /*file_pages=*/2);
+  VecBufferPool pool(new_file(2), /*writable=*/false);
+  ASSERT_EQ(0, pool.init());
+  QueueResidentSampleTestPeer::stop_background();
+  ExpectFailedBatchPreservesNewLoader(pool, /*partial_submit=*/true);
+}
+
+TEST_F(BufferPoolTest, AioAllocationShortageDoesNotCancelReplacementLoad) {
+  // The retry buffer consumes one of two available pages. The first batch
+  // can allocate only page 0 and must release its claim on page 1.
+  init_vec_pool(/*capacity_pages=*/2, /*file_pages=*/2);
+  VecBufferPool pool(new_file(2), /*writable=*/false);
+  ASSERT_EQ(0, pool.init());
+  QueueResidentSampleTestPeer::stop_background();
+  ExpectFailedBatchPreservesNewLoader(pool, /*partial_submit=*/false);
+}
+
+TEST_F(BufferPoolTest, AioWaitFailureDoesNotCancelReplacementLoad) {
+  init_vec_pool(/*capacity_pages=*/16, /*file_pages=*/2);
+  VecBufferPool pool(new_file(2), /*writable=*/false);
+  ASSERT_EQ(0, pool.init());
+  QueueResidentSampleTestPeer::stop_background();
+  ExpectFailedBatchPreservesNewLoader(pool, /*partial_submit=*/true,
+                                      /*fail_wait=*/true);
+}
+#endif
+
 TEST_F(BufferPoolTest, BatchAcquireScatteredPagesWithDuplicates) {
   init_vec_pool(/*capacity_pages=*/16, /*file_pages=*/32);
   std::string file = new_file(/*num_pages=*/32);

@@ -24,6 +24,7 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -823,11 +824,18 @@ class ZVEC_AILEGO_API VecBufferPool {
   //! Write metadata without cache admission.
   int write_meta(size_t offset, size_t length, const char *buffer);
 
+  //! Exclude an unaligned directory from data writeback. Register before
+  //! exposing its data pages, and remove only an unpublished directory.
+  void register_metadata_range(size_t offset, size_t length);
+  void unregister_metadata_range(size_t offset);
+
   //! Iterate all entries and persist any dirty blocks to disk. Safe to call
   //! repeatedly; no-op in read-only mode.
   int flush_all();
 
-  //! Extend the backing file and page table to `new_size`.
+  //! Extend the backing file and page table to at least `new_size`, rounding
+  //! the physical size up to the host page size. Callers only need to align
+  //! their requests to the index format's own page size.
   bool extend_file(size_t new_size);
 
   //! Shorten the file and discard unused page entries beyond `new_size`.
@@ -922,6 +930,7 @@ class ZVEC_AILEGO_API VecBufferPool {
 
  private:
   friend class VecBufferPoolHandle;
+  friend struct VecBufferPoolAioTestPeer;
   friend struct VecBufferPoolTestPeer;
   bool read_range_bypass(size_t file_offset, size_t length, char *buffer,
                          bool &allocation_failed);
@@ -958,6 +967,22 @@ class ZVEC_AILEGO_API VecBufferPool {
   void drain_writeback();
   void writeback_loop();
   bool flush_writeback_batch(std::vector<block_id_t> &page_ids, char *staging);
+  bool flush_whole_pages(const block_id_t *page_ids, size_t count,
+                         char *staging);
+  bool flush_shared_page(block_id_t page_id);
+  int writeback_page(size_t offset, size_t length, const char *buffer);
+  bool page_overlaps_metadata(size_t offset) const;
+  // Caller holds metadata_ranges_mutex_.
+  using MetadataRanges =
+      std::map<size_t, size_t, std::less<size_t>,
+               BudgetedAllocator<std::pair<const size_t, size_t>>>;
+  MetadataRanges::const_iterator first_metadata_range(
+      size_t offset) const;
+  // Pin a dirty page for writeback. Waits out an in-flight load/eviction so a
+  // flush never mistakes a temporarily unavailable dirty page for a persisted
+  // one. Returns nullptr for clean pages; sets *failed when the page is still
+  // dirty but cannot be pinned after the transition settles.
+  char *acquire_writeback_block(block_id_t page_id, bool *failed);
   int writeback_error() const {
     return writeback_error_.load(std::memory_order_acquire);
   }
@@ -970,9 +995,8 @@ class ZVEC_AILEGO_API VecBufferPool {
   int fd_;       // page-data channel: O_DIRECT or F_NOCACHE when supported
   int meta_fd_;  // metadata channel: always buffered IO
   size_t file_size_;
-  size_t initial_file_size_;  // file size at open time; pages beyond this
-                              // are created by extend_file and can skip
-                              // pread on first load (content is zeros).
+  size_t initial_file_size_;  // Newly extended pages without metadata can
+                              // skip pread on first load (content is zeros).
   std::string file_name_;
   bool writable_{false};
   bool direct_io_enabled_{false};
@@ -1030,6 +1054,11 @@ class ZVEC_AILEGO_API VecBufferPool {
   using PageLockArray = std::unique_ptr<std::shared_mutex[], PageLockDeleter>;
   PageLockArray block_mutexes_{nullptr, PageLockDeleter{}};
   size_t block_mutex_count_{0};
+
+  // Page-aligned directories cannot share a page with segment data.
+  std::atomic<bool> has_unaligned_metadata_{false};
+  mutable std::shared_mutex metadata_ranges_mutex_;
+  MetadataRanges metadata_ranges_;
 
   std::thread writeback_thread_{};
   // Anonymous page mapping: unmap before refunding its metadata reservation.

@@ -20,6 +20,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string_view>
@@ -873,8 +874,11 @@ class BufferStorage : public IndexStorage {
       if (status == ailego::PageWriteStatus::kNoMemory) {
         buffer_storage_write_error = IndexError_NoMemory;
       }
-      if (written != 0 || status == ailego::PageWriteStatus::kOk) {
+      if (status == ailego::PageWriteStatus::kOk) {
         publish_written_size(offset + written);
+      } else if (written != 0) {
+        // Persist the copied bytes without advancing the record cursor.
+        owner_->set_as_dirty();
       }
       return written;
     }
@@ -1496,6 +1500,12 @@ class BufferStorage : public IndexStorage {
     int ret;
     try {
       ret = parse_to_mapping();
+      if (ret == 0 && writable) {
+        for (const auto &chain : meta_chains_) {
+          buffer_pool_->register_metadata_range(chain.header_start_offset,
+                                                chain.header->content_offset);
+        }
+      }
     } catch (const std::bad_alloc &) {
       ret = IndexError_NoMemory;
     }
@@ -1994,9 +2004,25 @@ class BufferStorage : public IndexStorage {
       // Restore the old checkpoint against the table that just reached disk.
       bool footer_written = false;
       AILEGO_DEFER([&]() {
-        if (changes_checkpoint && !footer_written) {
-          restore_metadata(mchain.footer_file_offset(), sizeof(mchain.footer),
-                           reinterpret_cast<const char *>(&mchain.footer));
+        if (!changes_checkpoint || footer_written) return;
+        // Retry the restore once with the retained old footer. If the disk
+        // still rejects it, the checkpoint outcome is uncertain and must be
+        // reported instead of silently dropping the restore result.
+        if (!restore_metadata(mchain.footer_file_offset(),
+                              sizeof(mchain.footer),
+                              reinterpret_cast<const char *>(&mchain.footer)) &&
+            !restore_metadata(mchain.footer_file_offset(),
+                              sizeof(mchain.footer),
+                              reinterpret_cast<const char *>(&mchain.footer))) {
+          schedule_metadata_writeback();
+          try {
+            LOG_ERROR(
+                "flush_index: cannot restore footer after a short write; "
+                "checkpoint commit outcome is uncertain: file[%s], chain[%zu]",
+                file_name_.c_str(), ci);
+          } catch (...) {
+            // The original write error still propagates if logging fails.
+          }
         }
       });
       if (buffer_pool_handle_->write_meta(
@@ -2010,6 +2036,30 @@ class BufferStorage : public IndexStorage {
       mchain.footer = footer;
     }
     metadata_writeback_incomplete_ = false;
+    // Every on-disk link now matches the live chains. Ranges retained by a
+    // failed link rollback are unreachable and can be dropped safely.
+    for (const size_t start : stale_metadata_ranges_) {
+      buffer_pool_->unregister_metadata_range(start);
+    }
+    stale_metadata_ranges_.clear();
+    // A rolled-back split can now return the grown tail and its page-table
+    // entries, but never below the live directory's allocated end: a later
+    // committed append must not be cut by a stale truncation record.
+    if (pending_tail_truncation_) {
+      size_t allocated_end = 0;
+      for (const auto &chain : meta_chains_) {
+        allocated_end =
+            std::max<uint64_t>(allocated_end, chain.allocated_file_end());
+      }
+      const size_t target = std::max(*pending_tail_truncation_, allocated_end);
+      if (!buffer_pool_->truncate_unused_tail(target)) {
+        LOG_WARN(
+            "flush_index: cannot truncate rolled-back tail yet: file[%s], "
+            "target_eof[%zu]",
+            file_name_.c_str(), target);
+      }
+      pending_tail_truncation_.reset();
+    }
     persisted = true;
     return 0;
   } catch (const std::bad_alloc &) {
@@ -2054,6 +2104,8 @@ class BufferStorage : public IndexStorage {
     visible_checkpoint_.store(0, std::memory_order_release);
     index_dirty_.store(false, std::memory_order_relaxed);
     metadata_writeback_incomplete_ = false;
+    decltype(stale_metadata_ranges_){}.swap(stale_metadata_ranges_);
+    pending_tail_truncation_.reset();
     corrupted_.store(false, std::memory_order_relaxed);
     return status;
   }
@@ -2114,28 +2166,45 @@ class BufferStorage : public IndexStorage {
 
     size_t id_size = id.length() + 1;
     size_t need_size = sizeof(IndexFormat::SegmentMeta) + id_size;
+
+    // Allocate rollback bookkeeping on the fallible path BEFORE inserting
+    // the pending entry: an allocation failure must not leave an entry
+    // behind. A later push_back during unwinding must never allocate.
+    stale_metadata_ranges_.reserve(stale_metadata_ranges_.size() + 1);
+
     // Insert into the real directory map before any metadata is published.
     // The exclusive latch keeps the pending entry private until commit.
     auto pending = segments_.try_emplace(std::string_view(id));
     if (!pending.second) return IndexError_Duplicate;
     bool committed = false;
-    const size_t original_file_size = buffer_pool_->file_size();
+    size_t unpublished_directory_start = 0;
+    size_t original_file_size = buffer_pool_->file_size();
+    // Establish the rollback guard before any fallible operation: an
+    // allocation failure must never leave a pending segment in the map.
     AILEGO_DEFER([&]() {
       if (committed) return;
       if (pending.first != segments_.end()) segments_.erase(pending.first);
-      // Keep grown bytes if an incomplete rollback can still reference them.
+      if (unpublished_directory_start != 0) {
+        buffer_pool_->unregister_metadata_range(unpublished_directory_start);
+      }
+      // The directory rollback guards run first. Keep the grown bytes if
+      // restoring the directory failed and they may still be referenced.
       if (metadata_writeback_incomplete_ ||
           corrupted_.load(std::memory_order_acquire) ||
-          original_file_size == buffer_pool_->file_size()) {
+          original_file_size >= buffer_pool_->file_size()) {
         return;
       }
       try {
-        if (buffer_pool_->truncate_unused_tail(original_file_size)) return;
+        if (buffer_pool_->truncate_unused_tail(original_file_size)) {
+          // The immediate reclaim already returned the tail; the deferred
+          // record must not fire again after a later committed split.
+          pending_tail_truncation_.reset();
+          return;
+        }
       } catch (...) {
       }
       corrupted_.store(true, std::memory_order_release);
     });
-
     MetaChain *chain = &meta_chains_.back();
     bool chain_split = false;
     bool link_attempted = false;
@@ -2187,11 +2256,20 @@ class BufferStorage : public IndexStorage {
       // the existing chains and their checkpoint before exposing that link.
       const int status = flush_index_locked();
       if (status != 0) return status;
+      original_file_size = buffer_pool_->file_size();
 
       // Extend the file and write the new chain's header.
       if (!buffer_pool_->extend_file(new_chain_start + new_meta_total)) {
         return IndexError_Runtime;
       }
+      buffer_pool_->register_metadata_range(new_chain_start, new_meta_total);
+      unpublished_directory_start = new_chain_start;
+      // A retry after a failed link rollback revives this range: it belongs
+      // to the live chain again, not to the deferred cleanup list.
+      stale_metadata_ranges_.erase(
+          std::remove(stale_metadata_ranges_.begin(),
+                      stale_metadata_ranges_.end(), new_chain_start),
+          stale_metadata_ranges_.end());
 
       if (buffer_pool_handle_->write_meta(
               new_chain_start, sizeof(IndexFormat::MetaHeader),
@@ -2209,16 +2287,24 @@ class BufferStorage : public IndexStorage {
       // writeback before publishing it, including any affected older chain.
       const int status = flush_index_locked();
       if (status != 0) return status;
+      original_file_size = buffer_pool_->file_size();
     }
 
     AILEGO_DEFER([&]() {
       if (committed || !chain_split) return;
       meta_chains_.pop_back();
+      // Once the old chain's link is repaired, the grown tail beyond the
+      // original EOF and its page-table entries can be reclaimed.
+      pending_tail_truncation_ = original_file_size;
       const auto &old_chain = meta_chains_.back();
       if (link_attempted &&
           !restore_metadata(
               old_chain.footer_file_offset(), sizeof(old_chain.footer),
               reinterpret_cast<const char *>(&old_chain.footer))) {
+        // The on-disk link may still reference the new chain. Keep its range
+        // protected until a successful writeback unlinks it, then clean up.
+        stale_metadata_ranges_.push_back(unpublished_directory_start);
+        unpublished_directory_start = 0;
         schedule_metadata_writeback();
       }
     });
@@ -2349,6 +2435,9 @@ class BufferStorage : public IndexStorage {
       std::lock_guard<std::mutex> lock(checkpoint_mutex_);
       visible_checkpoint_.store(pending_checkpoint_, std::memory_order_release);
     }
+    // A committed append makes any earlier rollback's tail record
+    // obsolete: truncating now would cut the freshly committed chain.
+    pending_tail_truncation_.reset();
     committed = true;
     return 0;
   } catch (const std::bad_alloc &) {
@@ -2404,6 +2493,12 @@ class BufferStorage : public IndexStorage {
   // Set after page writeback until every metadata table and footer is written.
   // Accessed only under AllShardsExclusiveLatch.
   bool metadata_writeback_incomplete_{false};
+  // Ranges kept alive by a failed link rollback; cleared after the next
+  // successful metadata writeback. Same latch discipline as above.
+  ailego::BudgetedVector<size_t> stale_metadata_ranges_{};
+  // Original EOF recorded by a rolled-back split, reclaimed after the old
+  // chain's link is repaired. Optional keeps the record allocation-free.
+  std::optional<size_t> pending_tail_truncation_{};
   // A failed file-growth rollback blocks further writes.
   std::atomic<bool> corrupted_{false};
 
