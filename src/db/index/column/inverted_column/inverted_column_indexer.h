@@ -22,6 +22,7 @@
 #include "db/common/rocksdb_context.h"
 #include "inverted_codec.h"
 #include "inverted_doc_range.h"
+#include "inverted_range_prefix.h"
 #include "inverted_search_result.h"
 
 
@@ -237,6 +238,15 @@ class InvertedColumnIndexer {
 
   Status open();
 
+  RangeQueryPlan plan_range(const std::string &term, bool query_left,
+                            bool include_eq) const;
+  Result<roaring_bitmap_t *> execute_range_plan(
+      const std::string &term, const RangeQueryPlan &plan) const;
+  Result<roaring_bitmap_t *> get_bitmap_lt_raw(const std::string &term,
+                                               bool include_eq) const;
+  Result<roaring_bitmap_t *> get_bitmap_gt_raw(const std::string &term,
+                                               bool include_eq) const;
+
   inline std::string encode(const std::string &term) const {
     return InvertedIndexCodec::Encode(term, field_.element_data_type());
   }
@@ -303,10 +313,9 @@ class InvertedColumnIndexer {
                                      uint64_t *total_count,
                                      uint64_t *matching_count) const;
 
-  inline bool range_covers_most_values(const std::string &term,
-                                       CompareOp op) const;
+  bool range_covers_most_values(const std::string &term, CompareOp op) const;
 
-  inline roaring_bitmap_t *flip_bitmap(roaring_bitmap_t *bitmap) const;
+  roaring_bitmap_t *flip_bitmap(roaring_bitmap_t *bitmap) const;
 
   Result<roaring_bitmap_t *> get_bitmap_eq(const std::string &term) const;
 
@@ -362,6 +371,10 @@ class InvertedColumnIndexer {
   inline std::string cf_name_array_len() const {
     return field_.name() + INVERT_SUFFIX_ARRAY_LEN;
   };
+
+  inline std::string cf_name_prefixes() const {
+    return field_.name() + INVERT_SUFFIX_PREFIXES;
+  }
 
   inline std::string cf_name_ranges() const {
     return field_.name() + INVERT_SUFFIX_RANGES;
@@ -429,6 +442,8 @@ class InvertedColumnIndexer {
   std::atomic<uint32_t> max_id_{0};
   ConcurrentRoaringBitmap32 null_bitmap_{};
   SegmentDocRangeStat::Ptr doc_range_stat_{nullptr};
+  rocksdb::ColumnFamilyHandle *cf_prefixes_{nullptr};
+  std::unique_ptr<InvertedRangePrefix> range_prefix_;
 };
 
 

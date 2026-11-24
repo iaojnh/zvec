@@ -132,6 +132,7 @@ Status InvertedIndexer::seal() {
     }
     if (s = indexer->seal(); !s.ok()) {
       LOG_ERROR("Failed to seal %s", indexer->id().c_str());
+      return s;
     }
   }
 
