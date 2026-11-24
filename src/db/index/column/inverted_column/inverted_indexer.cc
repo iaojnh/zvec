@@ -51,6 +51,29 @@ Status InvertedIndexer::open(bool create_dir_if_missing, bool read_only) {
                 working_dir_.c_str());
       return Status::InvalidArgument();
     }
+    if (read_only) {
+      // Read-only opens only load the requested CFs. Prefixes are optional in
+      // older indexes, so request them only when they already exist on disk.
+      std::vector<std::string> existing_cf_names;
+      auto rs = rocksdb::DB::ListColumnFamilies(
+          rocksdb::DBOptions{}, working_dir_, &existing_cf_names);
+      if (!rs.ok()) {
+        return Status::InternalError("Failed to list RocksDB column families: ",
+                                     rs.ToString());
+      }
+      for (const auto &field : fields_) {
+        auto params =
+            std::dynamic_pointer_cast<InvertIndexParams>(field.index_params());
+        if (allow_range_optimization(field) &&
+            params->enable_range_optimization()) {
+          auto name = field.name() + INVERT_SUFFIX_PREFIXES;
+          if (std::find(existing_cf_names.begin(), existing_cf_names.end(),
+                        name) != existing_cf_names.end()) {
+            cf_names.push_back(std::move(name));
+          }
+        }
+      }
+    }
     s = rocksdb_context_.open(working_dir_, cf_names, read_only,
                               std::make_shared<InvertedRocksdbValueMerger>());
   } else {

@@ -251,6 +251,93 @@ TEST_F(InvertedIndexTest, INVERTED_SEARCH_RESULT) {
   ASSERT_FALSE(filter->is_filtered(11));
 }
 
+
+class InvertedPrefixReopenTest : public testing::TestWithParam<int> {
+ protected:
+  void SetUp() override {
+    path_ = "./inverted_prefix_reopen_" + std::to_string(GetParam());
+    test_util::RemoveTestPath(path_);
+  }
+
+  void TearDown() override {
+    column_.reset();
+    index_.reset();
+    test_util::RemoveTestPath(path_);
+  }
+
+  std::string path_;
+  InvertedIndexer::Ptr index_;
+  InvertedColumnIndexer::Ptr column_;
+};
+
+
+TEST_P(InvertedPrefixReopenTest, ReopensThroughProductionEntryPoint) {
+  FieldSchema field("value", DataType::INT32, true,
+                    std::make_shared<InvertIndexParams>(true, false));
+  auto raw = [](int32_t value) {
+    return std::string(reinterpret_cast<const char *>(&value), sizeof(value));
+  };
+  index_ = InvertedIndexer::CreateAndOpen("prefix_reopen", path_, true, {field},
+                                          false);
+  ASSERT_NE(index_, nullptr);
+  column_ = (*index_)["value"];
+  for (int32_t id = 0; id < 8000; ++id) {
+    ASSERT_TRUE(column_->insert(id, raw(id)).ok());
+  }
+  ASSERT_TRUE(index_->seal().ok());
+  ASSERT_NE(column_->range_prefix_, nullptr);
+
+  // Model both an old index without this optional CF and an interrupted build
+  // whose CF exists without its manifest.
+  if (GetParam() == 1) {
+    ASSERT_TRUE(index_->rocksdb_context_.drop_cf("value$PREFIXES").ok());
+  } else if (GetParam() == 2) {
+    auto &context = index_->rocksdb_context_;
+    ASSERT_TRUE(
+        context.db_
+            ->Delete(context.write_opts_, context.get_cf("value$PREFIXES"), "")
+            .ok());
+  }
+
+  for (bool read_only : {true, false}) {
+    column_.reset();
+    index_.reset();
+    index_ = InvertedIndexer::CreateAndOpen("prefix_reopen", path_, false,
+                                            {field}, read_only);
+    ASSERT_NE(index_, nullptr);
+    column_ = (*index_)["value"];
+    ASSERT_NE(column_, nullptr);
+    EXPECT_EQ(index_->rocksdb_context_.get_cf("value$PREFIXES") != nullptr,
+              GetParam() != 1);
+    EXPECT_EQ(column_->range_prefix_ != nullptr, GetParam() == 0);
+    if (GetParam() == 0) {
+      auto plan = column_->plan_range(column_->encode(raw(3999)), true, true);
+      EXPECT_NE(plan.prefix_index, SIZE_MAX);
+    }
+
+    for (int32_t bound : {-1, 0, 3999, 4000, 7999, 8000}) {
+      for (CompareOp op :
+           {CompareOp::LT, CompareOp::LE, CompareOp::GT, CompareOp::GE}) {
+        auto result = column_->search(raw(bound), op);
+        ASSERT_NE(result, nullptr);
+        size_t count = 0;
+        for (int32_t id = 0; id < 8000; ++id) {
+          bool match = op == CompareOp::LT   ? id < bound
+                       : op == CompareOp::LE ? id <= bound
+                       : op == CompareOp::GT ? id > bound
+                                             : id >= bound;
+          ASSERT_EQ(result->contains(id), match);
+          count += match;
+        }
+        EXPECT_EQ(result->count(), count);
+      }
+    }
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(PersistedAndLegacyIndexes, InvertedPrefixReopenTest,
+                         testing::Values(0, 1, 2));
+
 #if defined(__GNUC__) || defined(__GNUG__)
 #pragma GCC diagnostic pop
 #endif
