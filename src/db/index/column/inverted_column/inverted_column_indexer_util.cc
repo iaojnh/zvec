@@ -124,6 +124,13 @@ Status InvertedColumnIndexer::open() {
     return Status::InternalError();
   }
 
+  if (sealed_ && enable_range_optimization_) {
+    cf_prefixes_ = ctx_.get_cf(cf_name_prefixes());
+    if (cf_prefixes_) {
+      range_prefix_ = InvertedRangePrefix::Load(
+          ctx_, cf_prefixes_, max_id_.load(), null_bitmap_.bitmap());
+    }
+  }
   LOG_INFO("Opened %s", id().c_str());
   return Status::OK();
 }
@@ -163,6 +170,11 @@ Status InvertedColumnIndexer::drop_storage() {
     }
   }
   if (enable_range_optimization_) {
+    if (ctx_.get_cf(cf_name_prefixes())) {
+      range_prefix_.reset();
+      if (s = ctx_.drop_cf(cf_name_prefixes()); !s.ok()) return s;
+      cf_prefixes_ = nullptr;
+    }
     if (s = ctx_.drop_cf(cf_name_ranges()); !s.ok()) {
       return s;
     }

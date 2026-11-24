@@ -15,7 +15,7 @@
 
 #pragma once
 
-
+#include <cstring>
 #include <string>
 #include <roaring/roaring.h>
 #include <zvec/ailego/logger/logger.h>
@@ -231,8 +231,9 @@ class InvertedIndexCodec {
       return Status::InternalError();
     }
     for (size_t i = 1; i < size; i += sizeof(uint32_t)) {
-      roaring_bitmap_add(*bitmap,
-                         *reinterpret_cast<const uint32_t *>(data + i));
+      uint32_t doc_id;
+      std::memcpy(&doc_id, data + i, sizeof(doc_id));
+      roaring_bitmap_add(*bitmap, doc_id);
     }
     return Status::OK();
   }

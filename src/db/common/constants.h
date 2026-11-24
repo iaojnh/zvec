@@ -67,6 +67,8 @@ const std::string INVERT_SUFFIX_ARRAY_LEN{"$ARRAY_LEN"};
 
 const std::string INVERT_SUFFIX_RANGES{"$RANGES"};
 
+const std::string INVERT_SUFFIX_PREFIXES{"$PREFIXES"};
+
 const std::string INVERT_CDF{"$CDF"};
 
 const std::string INVERT_KEY_MAX_ID{"$ZVEC$MAX_ID"};

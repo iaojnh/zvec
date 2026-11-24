@@ -451,10 +451,27 @@ Status InvertedColumnIndexer::seal() {
     }
   }
 
+  if (enable_range_optimization_) {
+    // Reset partial output on a failed seal retry. The sealed marker is written
+    // only after all prefix records and their manifest have been stored.
+    status = ctx_.get_cf(cf_name_prefixes())
+                 ? ctx_.reset_cf(cf_name_prefixes())
+                 : ctx_.create_cf(cf_name_prefixes());
+    if (!status.ok()) return status;
+    cf_prefixes_ = ctx_.get_cf(cf_name_prefixes());
+    status = InvertedRangePrefix::Build(ctx_, cf_ranges_, cf_prefixes_,
+                                        max_id_.load(), null_bitmap_.bitmap());
+    if (!status.ok()) return status;
+  }
+
   auto rs = ctx_.db_->Put(ctx_.write_opts_, key_sealed(), "sealed");
   if (rs.ok()) {
     sealed_ = true;
     read_only_ = true;
+    if (cf_prefixes_) {
+      range_prefix_ = InvertedRangePrefix::Load(
+          ctx_, cf_prefixes_, max_id_.load(), null_bitmap_.bitmap());
+    }
     return Status::OK();
   } else {
     LOG_ERROR("Failed to seal %s", id().c_str());

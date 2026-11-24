@@ -441,6 +441,9 @@ TEST_F(BufferPoolTest, ShortReadDoesNotEvictHotPageOnFirstTouch) {
   constexpr size_t kCapacity = 256UL * 1024UL * 1024UL;
   auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
   ASSERT_EQ(0, memory_pool.init(kCapacity));
+  // Isolate foreground admission: background reclaim at the same pressure
+  // boundary may evict the hot page and clear pressure between the two reads.
+  QueueResidentSampleTestPeer::stop_background();
   std::string file = new_file(kFilePages);
 
   size_t charged_metadata = 0;
@@ -459,6 +462,8 @@ TEST_F(BufferPoolTest, ShortReadDoesNotEvictHotPageOnFirstTouch) {
     char *hot = pool.acquire_buffer(/*block_id=*/0, 10);
     ASSERT_NE(nullptr, hot);
     pool.page_table_.release_block(/*block_id=*/0);
+    EXPECT_TRUE(memory_pool.under_cache_pressure());
+    EXPECT_TRUE(pool.is_page_resident(0));
 
     std::vector<char> data(2 * kVectorPageSize);
     ASSERT_TRUE(handle.read_range(kVectorPageSize, data.size(), data.data()));
