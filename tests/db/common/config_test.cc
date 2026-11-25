@@ -13,10 +13,241 @@
 // limitations under the License.
 
 #include "zvec/db/config.h"
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <memory>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/logger/logger.h>
+#include <zvec/ailego/utility/file_helper.h>
+#include "db/common/global_resource.h"
+#include "db/common/glogger.h"
 #include "zvec/db/status.h"
 
 using namespace zvec;
+
+#if GTEST_HAS_DEATH_TEST
+namespace {
+
+std::weak_ptr<ailego::Logger> &ShutdownLoggerProbe() {
+  static std::weak_ptr<ailego::Logger> logger;
+  return logger;
+}
+
+int shutdown_logger_destructions = 0;
+
+class RegisteredConfigLogger : public ailego::Logger {
+ public:
+  int init(const ailego::Params &) override {
+    return 0;
+  }
+  int cleanup() override {
+    return 0;
+  }
+  void log(int, const char *, int, const char *, va_list) override {
+    ++messages;
+  }
+  static std::atomic<size_t> messages;
+};
+std::atomic<size_t> RegisteredConfigLogger::messages{0};
+
+class CustomLogConfig : public GlobalConfig::LogConfig {
+ public:
+  explicit CustomLogConfig(std::string type)
+      : LogConfig(GlobalConfig::LogLevel::kWarn), type_(std::move(type)) {}
+  std::string get_logger_type() const override {
+    return type_;
+  }
+
+ private:
+  std::string type_;
+};
+
+class CustomConsoleLogConfig : public GlobalConfig::ConsoleLogConfig {
+ public:
+  std::string get_logger_type() const override {
+    return "RegisteredConfigLogger";
+  }
+};
+
+void InitializeRegisteredLogger(bool derived_console) {
+  ailego::Factory<ailego::Logger>::Register<RegisteredConfigLogger>
+      registration("RegisteredConfigLogger");
+  GlobalConfig::ConfigData config;
+  config.memory_limit_bytes = 512ULL << 20;
+  config.query_thread_count = config.optimize_thread_count = 1;
+  config.log_config = std::make_shared<CustomLogConfig>("UnregisteredLogger");
+  const auto rejected = GlobalConfig::Instance().initialize(config);
+  ASSERT_EQ(StatusCode::INVALID_ARGUMENT, rejected.code());
+  EXPECT_FALSE(GlobalResource::Instance().initialized());
+  if (derived_console) {
+    config.log_config = std::make_shared<CustomConsoleLogConfig>();
+  } else {
+    config.log_config =
+        std::make_shared<CustomLogConfig>("RegisteredConfigLogger");
+  }
+  const auto initialized = GlobalConfig::Instance().initialize(config);
+  ASSERT_TRUE(initialized.ok()) << initialized.message();
+  EXPECT_EQ("RegisteredConfigLogger", GlobalConfig::Instance().log_type());
+  const auto before = RegisteredConfigLogger::messages.load();
+  LOG_WARN("registered logger remains usable through GlobalConfig");
+  EXPECT_GT(RegisteredConfigLogger::messages.load(), before);
+}
+
+class ShutdownProbeLogger : public ailego::Logger {
+ public:
+  ~ShutdownProbeLogger() override {
+    ++shutdown_logger_destructions;
+  }
+  int init(const ailego::Params &) override {
+    return 0;
+  }
+  int cleanup() override {
+    return 0;
+  }
+  void log(int, const char *, int, const char *, va_list) override {}
+};
+
+void CheckLoggerShutdown() {
+  // Keeping a weak reference alive prevents the control block from being
+  // freed. A shutdown hook accessing an already-destroyed broker shared_ptr
+  // then exposes its second release instead of relying on allocator reuse.
+  const auto use_count = ShutdownLoggerProbe().use_count();
+  if (shutdown_logger_destructions != 1 || use_count != 0) {
+    std::fprintf(stderr, "logger destructions=%d, remaining owners=%ld\n",
+                 shutdown_logger_destructions, use_count);
+    std::fflush(stderr);
+    std::_Exit(1);
+  }
+  std::fputs("logger shutdown released exactly once\n", stderr);
+  std::fflush(stderr);
+  std::_Exit(0);
+}
+
+void ExitAfterConfigInitialization() {
+  auto &probe = ShutdownLoggerProbe();
+  if (std::atexit(CheckLoggerShutdown) != 0) {
+    std::_Exit(2);
+  }
+  GlobalConfig::ConfigData config;
+  config.memory_limit_bytes = 128ULL * 1024 * 1024;
+  config.query_thread_count = 1;
+  config.optimize_thread_count = 1;
+  if (!GlobalConfig::Instance().initialize(config).ok()) {
+    std::_Exit(3);
+  }
+  auto logger = std::make_shared<ShutdownProbeLogger>();
+  probe = logger;
+  ailego::LoggerBroker::Register(std::move(logger));
+  std::exit(0);
+}
+
+void ReplaceAppendLoggerWithParams() {
+  namespace fs = std::filesystem;
+  const auto nonce =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto path = fs::temp_directory_path() /
+                    ("zvec_logger_replacement_" + std::to_string(nonce));
+  ASSERT_TRUE(fs::create_directory(path));
+  auto cleanup = ailego::ScopeGuard::Make([&] {
+    ailego::LoggerBroker::Unregister();
+    std::error_code error;
+    fs::remove_all(path, error);
+  });
+
+  ailego::Params params;
+  params.set("proxima.file.logger.log_file", "replacement");
+  params.set("proxima.file.logger.file_size", uint32_t{16});
+  params.set("proxima.file.logger.overdue_days", uint32_t{1});
+  ailego::LoggerBroker::SetLevel(ailego::Logger::LEVEL_WARN);
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    const auto destination = path / std::to_string(attempt);
+    ASSERT_TRUE(fs::create_directory(destination));
+    params.set("proxima.file.logger.log_dir", destination.u8string());
+    ASSERT_EQ(0, ailego::LoggerBroker::Register(
+                     std::make_shared<AppendLogger>(), params));
+    ASSERT_TRUE(google::glog_internal_namespace_::IsGoogleLoggingInitialized());
+    ailego::LoggerBroker::Log(ailego::Logger::LEVEL_WARN, __FILE__, __LINE__,
+                              "logger-replacement-message-%d", attempt);
+  }
+  ailego::LoggerBroker::Unregister();
+  EXPECT_FALSE(google::glog_internal_namespace_::IsGoogleLoggingInitialized());
+
+  std::string logs;
+  for (const auto &entry : fs::recursive_directory_iterator(path)) {
+    if (!entry.is_regular_file()) continue;
+    std::ifstream file(entry.path(), std::ios::binary);
+    logs.append(std::istreambuf_iterator<char>(file),
+                std::istreambuf_iterator<char>());
+  }
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    EXPECT_NE(std::string::npos, logs.find("logger-replacement-message-" +
+                                           std::to_string(attempt)));
+  }
+}
+
+
+}  // namespace
+#endif  // GTEST_HAS_DEATH_TEST
+
+TEST(ConfigDeathTest, LoggingShutdownPrecedesBrokerStaticDestruction) {
+#if GTEST_HAS_DEATH_TEST
+  // Re-exec so no earlier test can initialize the broker and mask the
+  // first-initialization ordering of its destructor and the exit hook.
+  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(ExitAfterConfigInitialization(), ::testing::ExitedWithCode(0),
+              "logger shutdown released exactly once");
+  ::testing::FLAGS_gtest_death_test_style = previous_style;
+#else
+  GTEST_SKIP()
+      << "Process-isolated exit tests are not supported on this platform";
+#endif
+}
+
+TEST(ConfigDeathTest, ReplacingAppendLoggerKeepsBackendAndFileLoggingAlive) {
+#if GTEST_HAS_DEATH_TEST
+  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        ReplaceAppendLoggerWithParams();
+        std::fflush(stdout);
+        std::fflush(stderr);
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ::testing::FLAGS_gtest_death_test_style = previous_style;
+#else
+  GTEST_SKIP()
+      << "Process-isolated logger tests are not supported on this platform";
+#endif
+}
+
+TEST(ConfigDeathTest,
+     RegisteredCustomLoggersWorkAndUnknownTypesRemainRetryable) {
+#if GTEST_HAS_DEATH_TEST
+  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  for (const bool derived_console : {false, true}) {
+    EXPECT_EXIT(
+        {
+          InitializeRegisteredLogger(derived_console);
+          std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+        },
+        ::testing::ExitedWithCode(0), "");
+  }
+  ::testing::FLAGS_gtest_death_test_style = previous_style;
+#else
+  GTEST_SKIP() << "Process-isolated tests are not supported on this platform";
+#endif
+}
 
 class ConfigTest : public ::testing::Test {
  protected:

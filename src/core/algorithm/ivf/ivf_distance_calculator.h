@@ -14,6 +14,7 @@
 #pragma once
 
 #include <turbo/quantizer/distance.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/utility/time_helper.h>
 #include <zvec/core/framework/index_framework.h>
 

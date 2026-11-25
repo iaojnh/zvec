@@ -17,6 +17,7 @@
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/core/framework/index_helper.h>
 #include <zvec/core/interface/index.h>
+#include "ailego/pattern/defer.h"
 #include "algorithm/hnsw/hnsw_bulk_builder.h"
 #include "algorithm/hnsw/hnsw_context.h"
 #include "algorithm/hnsw/hnsw_params.h"
@@ -96,12 +97,19 @@ const char *ResolveTurboQuantizerName(const QuantizerParam &quantizer_param,
 
 }  // namespace
 
+BaseIndexParam::Pointer HNSWIndex::get_param() const {
+  return std::make_shared<HNSWIndexParam>(param_);
+}
+
 int HNSWIndex::open(const std::string &file_path,
                     StorageOptions storage_options) {
+  const bool previous_legacy_pipeline = use_legacy_pipeline_;
   int ret = Index::open(file_path, storage_options);
   if (ret == 0) {
     file_path_ = file_path;
     storage_options_ = storage_options;
+  } else {
+    use_legacy_pipeline_ = previous_legacy_pipeline;
   }
   return ret;
 }
@@ -331,8 +339,9 @@ std::string HNSWIndex::storage_mode() const {
 
 int HNSWIndex::add_with_source(const VectorData &vector_data,
                                const uint32_t doc_id,
-                               const core::VectorSource &src) {
-  auto &context = acquire_context();
+                               const core::VectorSource &src) try {
+  auto &context = acquire_context(true);
+  AILEGO_DEFER([&] { release_context(); });
   if (!context) {
     LOG_ERROR("Failed to acquire context for AddWithSource");
     return core::IndexError_Runtime;
@@ -345,12 +354,15 @@ int HNSWIndex::add_with_source(const VectorData &vector_data,
     }
   }
   return Index::add(vector_data, doc_id);
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int HNSWIndex::search_with_source(
     const VectorData &query, const BaseIndexQueryParam::Pointer &search_param,
-    const core::VectorSource &src, SearchResult *result) {
-  auto &context = acquire_context();
+    const core::VectorSource &src, SearchResult *result) try {
+  auto &context = acquire_context(true);
+  AILEGO_DEFER([&] { release_context(); });
   if (!context) {
     LOG_ERROR("Failed to acquire context for SearchWithSource");
     return core::IndexError_Runtime;
@@ -359,6 +371,8 @@ int HNSWIndex::search_with_source(
     ctx->set_vector_source(&src);
   }
   return Index::search(query, search_param, result);
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int HNSWIndex::create_and_init_streamer(const BaseIndexParam &param) {
@@ -386,6 +400,8 @@ int HNSWIndex::create_and_init_streamer(const BaseIndexParam &param) {
     // TODO: use index params'  default query param here
     proxima_index_params_.set(core::PARAM_HNSW_SPARSE_STREAMER_EF,
                               kDefaultHnswEfSearch);
+    proxima_index_params_.set(core::PARAM_HNSW_SPARSE_STREAMER_USE_ID_MAP,
+                              param_.use_id_map);
     streamer_ = core::IndexFactory::CreateStreamer("HnswSparseStreamer");
 
   } else {

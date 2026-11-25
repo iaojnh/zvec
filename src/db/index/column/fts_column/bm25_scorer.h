@@ -107,10 +107,10 @@ class BM25Scorer {
   /*! Load per-segment statistics from $SEGMENT_STAT CF
    *  \param field_name  Field name
    *  \param stat_cf     $SEGMENT_STAT CF
-   *  \return 0 for success, non-0 for failure
+   *  A missing record is valid for a new mutable segment.
    */
-  int load_segment_stats(const std::string &field_name, RocksdbContext *ctx,
-                         rocksdb::ColumnFamilyHandle *stat_cf);
+  Status load_segment_stats(const std::string &field_name, RocksdbContext *ctx,
+                            rocksdb::ColumnFamilyHandle *stat_cf);
 
   /*! Calculate BM25 contribution score of a single term for a single document
    *  \param term_doc_freq   Document frequency of this term in segment (df)

@@ -50,6 +50,11 @@ class IVFSearcher : public IndexSearcher {
                      uint32_t count, Context::Pointer &context) const override;
 
   //! Similarity brute force search restricted to primary keys.
+  int search_bf_by_keys_impl(const void *query,
+                             const std::vector<uint64_t> &keys,
+                             const IndexQueryMeta &qmeta,
+                             Context::Pointer &context) const override;
+
   int search_bf_by_p_keys_impl(const void *query,
                                const std::vector<std::vector<uint64_t>> &p_keys,
                                const IndexQueryMeta &qmeta,
@@ -122,9 +127,13 @@ class IVFSearcher : public IndexSearcher {
   }
 
  private:
+  int search_batch(const void *query, const IndexQueryMeta &qmeta,
+                   uint32_t count, Context::Pointer &context, bool brute,
+                   const std::vector<std::vector<uint64_t>> *p_keys = nullptr,
+                   const std::vector<uint64_t> *single_keys = nullptr) const;
   int search_many(const void *query, const IndexQueryMeta &qmeta,
                   uint32_t count, IVFSearcherContext *ctx, bool brute_force,
-                  bool *handled) const;
+                  size_t result_offset, bool *handled) const;
 
   int search_bf(const void *query, const IndexQueryMeta &qmeta, uint32_t count,
                 Context::Pointer &context,

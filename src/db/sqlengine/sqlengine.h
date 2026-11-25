@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <functional>
 #include <zvec/db/query.h>
 #include <zvec/db/status.h>
 #include "db/common/profiler.h"
@@ -27,8 +28,16 @@ class SQLEngine {
   virtual ~SQLEngine();
 
   virtual Result<DocPtrList> execute(
-      CollectionSchema::Ptr collection, SearchQuery query,
+      CollectionSchema::Ptr collection, const SearchQuery &query,
       const std::vector<Segment::Ptr> &segments) = 0;
+
+  // Borrowed ID batches are valid only during the callback. The caller must
+  // keep the scanned collection stable and must not mutate it in the callback.
+  using DocIdConsumer = std::function<Status(const uint64_t *, size_t)>;
+  virtual Status scan_doc_ids(CollectionSchema::Ptr collection,
+                              const std::string &filter,
+                              const std::vector<Segment::Ptr> &segments,
+                              const DocIdConsumer &consume) = 0;
 
   virtual Result<GroupResults> execute_group_by(
       CollectionSchema::Ptr collection,

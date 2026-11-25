@@ -14,6 +14,7 @@
 #pragma once
 
 #include <zvec/core/framework/index_meta.h>
+#include "utility/graph_storage_error.h"
 #include "hnsw_sparse_entity.h"
 
 namespace zvec {
@@ -78,44 +79,44 @@ class HnswSparseDistCalculator {
   inline dist_t dist(const void *vec) {
     compare_cnt_++;
 
-    auto sparse_data = entity_->get_sparse_data_from_vector(vec);
-    if (sparse_data.first == nullptr) {
+    IndexStorage::MemoryBlock sparse;
+    int length = 0;
+    CheckGraphStorage(
+        entity_->get_sparse_data_from_vector(vec, sparse, length));
+    if (sparse.data() == nullptr) {
       error_ = true;
       return 0.0f;
     }
 
-    return dist(sparse_data.first, query_);
+    return dist(sparse.data(), query_);
   }
 
   //! Return distance between query and node id.
   inline dist_t dist(node_id_t id) {
     compare_cnt_++;
 
-    const void *feat = entity_->get_vector_meta(id);
-    if (ailego_unlikely(feat == nullptr)) {
+    IndexStorage::MemoryBlock sparse;
+    CheckGraphStorage(read_sparse(id, sparse));
+    if (!sparse.data()) {
       LOG_ERROR("Get nullptr vector, id=%u", id);
       error_ = true;
       return 0.0f;
     }
 
-    auto sparse_data = entity_->get_sparse_data_from_vector(feat);
-    if (sparse_data.first == nullptr) {
-      error_ = true;
-      return 0.0f;
-    }
-
-    return dist(sparse_data.first, query_);
+    return dist(sparse.data(), query_);
   }
 
   //! Return dist node lhs between node rhs
   inline dist_t dist(node_id_t lhs, node_id_t rhs) {
     compare_cnt_++;
-    IndexStorage::MemoryBlock feat;
-    IndexStorage::MemoryBlock query;
-    if (ailego_unlikely(entity_->get_sparse_data(lhs, feat) != 0 ||
-                        entity_->get_sparse_data(rhs, query) != 0 ||
-                        feat.data() == nullptr || query.data() == nullptr)) {
-      LOG_ERROR("Get nullptr sparse vector");
+
+    IndexStorage::MemoryBlock feat, query;
+    CheckGraphStorage(read_sparse(lhs, feat));
+    if (feat.data()) {
+      CheckGraphStorage(read_sparse(rhs, query));
+    }
+    if (!feat.data() || !query.data()) {
+      LOG_ERROR("Get nullptr vector");
       error_ = true;
       return 0.0f;
     }
@@ -157,6 +158,15 @@ class HnswSparseDistCalculator {
       delete;
 
  private:
+  int read_sparse(node_id_t id, IndexStorage::MemoryBlock &block) const {
+    IndexStorage::MemoryBlock meta;
+    int ret = entity_->get_vector_meta(id, meta);
+    if (ret != 0) return ret;
+    if (!meta.data()) return IndexError_ReadData;
+    int length = 0;
+    return entity_->get_sparse_data_from_vector(meta.data(), block, length);
+  }
+
   const HnswSparseEntity *entity_;
 
   IndexMetric::MatrixSparseDistance distance_;

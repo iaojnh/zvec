@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #pragma once
-
+#include <limits>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_builder.h>
 #include <zvec/core/framework/index_meta.h>
 #include "utility/ordinal_access_holder.h"
+#include "utility/paged_record_sort.h"
 #include "utility/stable_vector_holder.h"
+#include "utility/temporary_buffer_storage.h"
 #include "ivf_centroid_index.h"
 
 namespace zvec {
@@ -96,17 +99,27 @@ class IVFBuilder : public IndexBuilder {
 
       //! Retrieve pointer of data
       const void *data() const override {
-        return holder_->element(id_);
+        const void *data = nullptr;
+        if (status_ == 0) {
+          status_ = holder_->read_element(id_, &buffer_, &data);
+        }
+        return data;
       }
 
       //! Test if the iterator is valid
       bool is_valid() const override {
-        return id_ < holder_->count();
+        return status_ == 0 && id_ < holder_->count();
+      }
+
+      int status() const override {
+        return status_;
       }
 
       //! Retrieve primary key
       uint64_t key() const override {
-        return holder_->key(id_);
+        uint64_t key = std::numeric_limits<uint64_t>::max();
+        if (status_ == 0) status_ = holder_->read_key(id_, &key);
+        return key;
       }
 
       //! Next iterator
@@ -118,6 +131,8 @@ class IVFBuilder : public IndexBuilder {
       //! Members
       RandomAccessIndexHolder *holder_{nullptr};
       uint32_t id_{0};
+      mutable ailego::BudgetedString buffer_{};
+      mutable int status_{0};
     };
 
     //! Constructor
@@ -128,7 +143,7 @@ class IVFBuilder : public IndexBuilder {
 
     //! Retrieve count of elements in holder (-1 indicates unknown)
     size_t count() const override {
-      return keys_.size();
+      return count_;
     }
 
     //! Retrieve dimension
@@ -158,37 +173,107 @@ class IVFBuilder : public IndexBuilder {
     }
 
     void reserve(size_t elems) {
-      if (lifetime_) {
-        vectors_.reserve(elems);
-      } else {
-        features_->reserve(elems);
+      if (!storage_) {
+        if (lifetime_)
+          vectors_.reserve(elems);
+        else
+          features_->reserve(elems);
+        keys_.reserve(elems);
       }
-      keys_.reserve(elems);
+    }
+
+    int enable_buffered_storage(const std::string &prefix, size_t elems) {
+      if (count_ != 0 || element_size() == 0 ||
+          element_size() >
+              std::numeric_limits<size_t>::max() - sizeof(uint64_t) ||
+          elems > std::numeric_limits<size_t>::max() /
+                      (element_size() + sizeof(uint64_t))) {
+        return IndexError_InvalidArgument;
+      }
+      const int ret = TemporaryBufferStorage::Create(
+          prefix, elems * (element_size() + sizeof(uint64_t)), &storage_);
+      if (ret == 0) {
+        capacity_ = elems;
+        key_offset_ = elems * element_size();
+      }
+      return ret;
     }
 
     //! Append an element into holder
-    void emplace(uint64_t pkey, const void *vec) {
-      if (lifetime_) {
-        vectors_.emplace_back(vec);
+    int emplace(uint64_t pkey, const void *vec) {
+      if (!vec) return IndexError_InvalidArgument;
+      if (storage_) {
+        if (count_ >= capacity_) return IndexError_OutOfRange;
+        int ret = storage_->write(count_ * element_size(), vec, element_size());
+        if (ret == 0)
+          ret = storage_->write(key_offset_ + count_ * sizeof(pkey), &pkey,
+                                sizeof(pkey));
+        if (ret != 0) return ret;
       } else {
-        features_->emplace(vec);
+        try {
+          keys_.emplace_back(pkey);
+          try {
+            if (lifetime_)
+              vectors_.emplace_back(vec);
+            else
+              features_->emplace(vec);
+          } catch (...) {
+            keys_.pop_back();
+            throw;
+          }
+        } catch (const std::bad_alloc &) {
+          return IndexError_NoMemory;
+        }
       }
-      keys_.emplace_back(pkey);
+      ++count_;
+      return 0;
     }
 
-    //! Retrieve feature via local id
-    const void *element(size_t id) const {
-      if (lifetime_) {
-        ailego_assert_with(id < vectors_.size(), "Index Overflow");
-        return vectors_[id];
+    int read_element(size_t id, ailego::BudgetedString *buffer,
+                     const void **data) const {
+      *data = nullptr;
+      if (id >= count()) return IndexError_OutOfRange;
+      if (storage_) {
+        buffer->resize(element_size());
+        int ret =
+            storage_->read(id * element_size(), buffer->data(), element_size());
+        if (ret != 0) return ret;
+        *data = buffer->data();
+      } else {
+        *data = lifetime_ ? vectors_[id] : features_->element(id);
       }
-      return features_->element(id);
+      return 0;
+    }
+
+    const void *element(size_t id) const {
+      return lifetime_ ? vectors_.at(id) : features_->element(id);
+    }
+    bool borrowed() const {
+      return lifetime_ != nullptr;
+    }
+
+    int flush() {
+      return storage_ ? storage_->flush() : 0;
     }
 
     //! Retrieve key via local id
+    int read_key(size_t id, uint64_t *key) const {
+      if (!key || id >= count_) return IndexError_OutOfRange;
+      if (storage_)
+        return storage_->read(key_offset_ + id * sizeof(*key), key,
+                              sizeof(*key));
+      *key = keys_[id];
+      return 0;
+    }
+
     uint64_t key(size_t id) const {
-      ailego_assert_with(id < keys_.size(), "Index Overflow");
-      return keys_[id];
+      uint64_t result = std::numeric_limits<uint64_t>::max();
+      (void)read_key(id, &result);
+      return result;
+    }
+
+    size_t resident_key_capacity() const {
+      return keys_.capacity();
     }
 
    public:
@@ -198,42 +283,14 @@ class IVFBuilder : public IndexBuilder {
    private:
     //! Members
     CompactIndexFeatures::Pointer features_{};
-    std::vector<uint64_t> keys_{};
-    std::vector<const void *> vectors_{};
-    // Keep borrowed addresses valid through quantizer training and repeat
-    // dumps.
-    std::shared_ptr<const void> lifetime_{};
+    ailego::BudgetedVector<uint64_t> keys_{};
+    std::shared_ptr<TemporaryBufferStorage> storage_{};
+    size_t count_{0}, capacity_{0}, key_offset_{0};
+    ailego::BudgetedVector<const void *> vectors_;
+    std::shared_ptr<const void> lifetime_;
   };
 
  private:
-  /*! Wrapper of feature
-   */
-  class Vector {
-   public:
-    typedef std::shared_ptr<Vector> Pointer;
-
-    Vector(const void *vec, size_t len, uint32_t idx)
-        : vec_(reinterpret_cast<const char *>(vec), len), id_{idx} {}
-
-    const void *data() const {
-      return vec_.data();
-    }
-
-    size_t size() const {
-      return vec_.size();
-    }
-
-    uint32_t id() const {
-      return id_;
-    }
-
-   private:
-    std::string vec_{};
-    uint32_t id_{0u};
-  };
-
-  using VectorList = std::vector<Vector>;
-
   //! Check MajorOrder in meta, and update the major order if needed
   int check_and_update_major_order(IndexMeta &meta);
 
@@ -254,6 +311,9 @@ class IVFBuilder : public IndexBuilder {
 
   //! Read one original vector; the returned data is consumed before next read.
   int read_vector(size_t id, uint64_t *key, const void **data);
+  size_t label_count(size_t centroid) const;
+  int read_label(size_t centroid, size_t index, uint32_t *id) const;
+  IndexHolder::Pointer label_holder(size_t centroid) const;
 
   //! Prepare the quantizer for inverted index
   int prepare_quantizer(IndexThreads *threads);
@@ -280,24 +340,36 @@ class IVFBuilder : public IndexBuilder {
   }
 
   //! Select the nearest centroid id for the vector
-  void label(const std::shared_ptr<VectorList> &vecs) {
-    for (size_t i = 0; i < vecs->size(); ++i) {
-      auto &vec = (*vecs)[i];
-
-      uint32_t centroid_idx =
-          centroid_index_->search_nearest_centroid(vec.data(), vec.size());
-      if (centroid_idx == IVFCentroidIndex::kInvalidID) {
+  void label(const char *vectors, size_t element_size, uint32_t first_id,
+             size_t count) try {
+    for (size_t i = 0; i < count; ++i) {
+      const uint32_t id = first_id + static_cast<uint32_t>(i);
+      uint32_t centroid_idx = IVFCentroidIndex::kInvalidID;
+      const int label_ret = centroid_index_->search_nearest_centroid(
+          vectors + i * element_size, element_size, &centroid_idx);
+      if (label_ret != 0) {
         LOG_ERROR("Failed to search nearest centroid in CentroidIndex");
         if (!error_.exchange(true)) {
-          err_code_ = IndexError_Runtime;
+          err_code_ = label_ret;
         }
         return;
       }
       ailego_assert_with(centroid_idx < labels_.size(), "Index Overflow");
-      mutex_.lock();
-      labels_[centroid_idx].emplace_back(vec.id());
-      mutex_.unlock();
+      if (paged_labels_) {
+        KeyOrderRecord record{centroid_idx, id, 0};
+        int ret = label_records_.write(size_t{id} * sizeof(record), &record,
+                                       sizeof(record));
+        if (ret != 0) {
+          if (!error_.exchange(true)) err_code_ = ret;
+          return;
+        }
+        continue;
+      }
+      std::lock_guard<std::mutex> lock(mutex_);
+      labels_[centroid_idx].emplace_back(id);
     }
+  } catch (const std::bad_alloc &) {
+    if (!error_.exchange(true)) err_code_ = IndexError_NoMemory;
   }
 
 
@@ -320,7 +392,10 @@ class IVFBuilder : public IndexBuilder {
   std::string converter_class_{};
   std::vector<ailego::Params> cluster_params_{};
 
-  std::vector<std::vector<uint32_t>> labels_{};
+  ailego::BudgetedVector<ailego::BudgetedVector<uint32_t>> labels_{};
+  bool paged_labels_{false};
+  PagedBuildBuffer label_records_;
+  ailego::BudgetedVector<size_t> label_offsets_;
   std::mutex mutex_{};
   IVFCentroidIndex::Pointer centroid_index_{};
   IVFCentroidIndex::Pointer searcher_centroid_index_{};
@@ -329,10 +404,11 @@ class IVFBuilder : public IndexBuilder {
   // The reader owns only a key map and at most one provider, never all vectors.
   IndexHolder::Pointer source_holder_{};
   OrdinalAccessHolder::Reader::Pointer source_reader_{};
+  ailego::BudgetedString read_buffer_{};
   IndexMeta converted_meta_{};
   IndexConverter::Pointer converter_{};
   IndexMeta quantized_meta_{};
-  std::vector<IndexConverter::Pointer> quantizers_{};
+  ailego::BudgetedVector<IndexConverter::Pointer> quantizers_{};
   std::shared_ptr<zvec::turbo::Quantizer> turbo_quantizer_{};
 
   std::atomic_bool error_{false};

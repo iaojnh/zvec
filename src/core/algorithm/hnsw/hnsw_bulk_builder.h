@@ -15,7 +15,7 @@
 
 #include <memory>
 #include <string>
-#include <vector>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/core/framework/index_filter.h>
 #include <zvec/core/framework/index_provider.h>
@@ -63,9 +63,12 @@ class HnswBulkBuilder final {
   ailego::Params params_;
   std::shared_ptr<turbo::Quantizer> quantizer_;
   IndexQueryMeta vector_meta_;
-  std::vector<std::shared_ptr<const void>> lifetimes_;
-  std::vector<IndexProvider::Pointer> providers_;
-  std::vector<const void *> vectors_;
+  struct Source {
+    std::shared_ptr<const void> lifetime;
+    IndexProvider::Pointer provider;
+  };
+  ailego::BudgetedVector<Source> sources_;
+  ailego::BudgetedVector<const void *> vectors_;
   std::string packed_path_;
 };
 

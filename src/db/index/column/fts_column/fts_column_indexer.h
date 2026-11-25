@@ -27,6 +27,7 @@
 #include "iterator/fts_doc_iterator.h"
 #include "tokenizer/tokenizer_factory.h"
 #include "bm25_scorer.h"
+#include "fts_memory.h"
 #include "fts_query_ast.h"
 
 
@@ -139,7 +140,10 @@ class FtsColumnIndexer {
    *  \param text        UTF-8 encoded text content
    *  \return Result<void> on success, or Status on failure
    */
-  Result<void> insert(uint64_t seg_doc_id, const std::string &text);
+  // Segment writes supply admission acquired before WAL/ID-map mutation.
+  // Standalone/DDL calls acquire their own allowance before tokenization.
+  Result<void> insert(uint64_t seg_doc_id, const std::string &text,
+                      const detail::FtsWriteAdmission *admission = nullptr);
 
   /*! Flush in-memory statistics to RocksDB (called before segment dump)
    *  \return Result<void> on success, or Status on failure
@@ -198,8 +202,6 @@ class FtsColumnIndexer {
   Result<DocIteratorPtr> create_term_iterator_from_raw(
       const std::string &term, rocksdb::PinnableSlice raw_data,
       float boost = 1.0f) const;
-  std::vector<rocksdb::PinnableSlice> batch_get_postings(
-      const std::vector<rocksdb::Slice> &terms) const;
 
   // --- Write helpers ---
   static void encode_varint(uint32_t value, std::string *output);

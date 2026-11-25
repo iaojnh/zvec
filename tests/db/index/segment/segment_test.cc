@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
+#include <atomic>
 #include <iostream>
 #include <sstream>  // NOLINT(misc-include-cleaner): protects <sstream> from the private/public test macro below.
 #define private public
@@ -19,6 +21,7 @@
 #include "db/index/segment/segment.h"
 #undef private
 #undef protected
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <thread>
@@ -30,7 +33,9 @@
 #include <arrow/table.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include "db/common/document_memory.h"
 #include "db/common/file_helper.h"
+#include "db/common/result_memory_allowance.h"
 #include "db/index/common/delete_store.h"
 #include "db/index/common/id_map.h"
 #include "db/index/common/version_manager.h"
@@ -41,6 +46,47 @@
 
 using namespace zvec;
 
+namespace {
+
+Status InsertTwoPersistedBlocks(const Segment::Ptr &segment,
+                                const CollectionSchema &schema,
+                                uint64_t doc_count) {
+  for (uint64_t first : {uint64_t{0}, doc_count / 2}) {
+    const uint64_t end = first == 0 ? doc_count / 2 : doc_count;
+    auto status =
+        test::TestHelper::SegmentInsertDoc(segment, schema, first, end);
+    if (!status.ok()) return status;
+    status = segment->flush();
+    if (!status.ok()) return status;
+  }
+  return Status::OK();
+}
+
+class ExternalChargeGuard {
+ public:
+  ExternalChargeGuard(zvec::ailego::MemoryLimitPool &pool, size_t bytes)
+      : pool_(pool),
+        bytes_(bytes),
+        charged_(pool_.try_charge_external(bytes_)) {}
+
+  ~ExternalChargeGuard() {
+    if (charged_) {
+      pool_.release_external(bytes_);
+    }
+  }
+
+  bool charged() const {
+    return charged_;
+  }
+
+ private:
+  zvec::ailego::MemoryLimitPool &pool_;
+  size_t bytes_;
+  bool charged_;
+};
+
+}  // namespace
+
 TEST_P(SegmentTest, EmptySchema) {
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
@@ -49,6 +95,41 @@ TEST_P(SegmentTest, EmptySchema) {
   EXPECT_EQ(segment->id(), 0);
 
   segment.reset();
+}
+
+TEST_P(SegmentTest, BufferedVectorOpenAdmissionPrecedesFirstInsert) {
+  if (GetParam()) GTEST_SKIP() << "This case uses BufferStorage";
+  CollectionSchema vector_schema(col_name_);
+  ASSERT_TRUE(vector_schema.add_field(std::make_shared<FieldSchema>(
+      "emb", DataType::VECTOR_FP32, 4, false,
+      std::make_shared<FlatIndexParams>(MetricType::L2))).ok());
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, vector_schema, 0, 0, id_map_, delete_store_, version_manager_,
+      options_, 0, 0);
+  ASSERT_NE(segment, nullptr);
+  auto doc = test::TestHelper::CreateDoc(0, vector_schema);
+
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  detail::SharedResultMemoryAllowance().reclaim_idle();
+  // Admit the empty forward writer's initial document cache and leave less
+  // than one native page for opening the first vector index.
+  const size_t forward_cache_bytes = 2 * 128 * sizeof(Doc);
+  const size_t headroom = forward_cache_bytes + ailego::kVectorPageSize / 2;
+  ASSERT_GT(pool.available(), headroom);
+  {
+    ExternalChargeGuard pressure(pool, pool.available() - headroom);
+    ASSERT_TRUE(pressure.charged());
+    const auto status = segment->insert(doc);
+    EXPECT_EQ(status.code(), StatusCode::RESOURCE_EXHAUSTED)
+        << status.message();
+    EXPECT_NE(status.message().find("Failed to open index"), std::string::npos)
+        << status.message();
+    EXPECT_FALSE(segment->has_record());
+  }
+
+  const auto retried = segment->insert(doc);
+  ASSERT_TRUE(retried.ok()) << retried.message();
+  EXPECT_EQ(1u, segment->doc_count());
 }
 
 
@@ -72,7 +153,13 @@ TEST_P(SegmentTest, General) {
     if (batch == nullptr) break;
 
     EXPECT_EQ(batch->num_columns(), 4);
-
+    ASSERT_TRUE(batch->ValidateFull().ok());
+    const auto &row_ids =
+        static_cast<const arrow::UInt64Array &>(*batch->column(0));
+    EXPECT_EQ(row_ids.null_count(), 0);
+    for (int64_t row = 0; row < batch->num_rows(); ++row) {
+      EXPECT_EQ(row_ids.Value(row), total_doc + row);
+    }
     total_doc += batch->num_rows();
   }
   EXPECT_EQ(total_doc, 25);
@@ -187,6 +274,51 @@ TEST_P(SegmentTest, FetchByGlobalDocID) {
   EXPECT_TRUE(ret_doc != nullptr);
   EXPECT_EQ(ret_doc->doc_id(), 0);
   EXPECT_EQ(ret_doc->pk(), "pk_0");
+}
+
+TEST_P(SegmentTest, DefaultProjectionPreservesConcurrentReads) {
+  CollectionSchema schema(col_name_);
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "text", DataType::STRING, false))
+                  .ok());
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "number", DataType::INT64, false))
+                  .ok());
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, schema, 0, 100, id_map_, delete_store_, version_manager_,
+      options_, 100, 8);
+  ASSERT_NE(segment, nullptr);
+  std::atomic<bool> correct{true};
+  auto check = [&]() {
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t)
+      readers.emplace_back([&, t]() {
+        for (int n = 0; n < 32; ++n) {
+          const int id = 100 + (n + t) % 8;
+          auto expected = test::TestHelper::CreateDoc(id, schema);
+          auto doc = segment->fetch(id, std::nullopt, false);
+          if (!doc || doc->pk_ref() != expected.pk_ref() ||
+              doc->doc_id() != static_cast<uint64_t>(id) ||
+              doc->get<std::string>("text") !=
+                  expected.get<std::string>("text") ||
+              doc->get<int64_t>("number") != expected.get<int64_t>("number"))
+            correct.store(false);
+        }
+      });
+    for (auto &reader : readers) reader.join();
+    EXPECT_TRUE(correct.load());
+  };
+  check();
+  ASSERT_TRUE(segment->dump().ok());
+  check();
+  auto projected = segment->fetch(
+      103, std::vector<std::string>{"text", "unknown", "text"}, false);
+  ASSERT_NE(projected, nullptr);
+  EXPECT_FALSE(projected->has("number"));
+  EXPECT_EQ(projected->get<std::string>("text"),
+            test::TestHelper::CreateDoc(103, schema).get<std::string>("text"));
 }
 
 TEST_P(SegmentTest, FetchSingleRow) {
@@ -682,6 +814,21 @@ TEST_P(SegmentTest, FlushAfterInsert) {
       ASSERT_FLOAT_EQ(v[j], vv[j]);
     }
   }
+  ASSERT_TRUE(segment->flush_for_close().ok());
+  const auto meta = *segment->meta();
+  segment.reset();
+  auto read_options = options_;
+  read_options.read_only_ = true;
+  auto reopened = Segment::Open(col_path_, *schema_, meta, id_map_,
+                                delete_store_, version_manager_, read_options);
+  ASSERT_TRUE(reopened.has_value()) << reopened.error().message();
+  auto persisted = reopened.value()->fetch(149);
+  ASSERT_NE(nullptr, persisted);
+  const auto expected = test::TestHelper::CreateDoc(149, *schema_);
+  EXPECT_EQ(expected.get<std::string>("name"),
+            persisted->get<std::string>("name"));
+  EXPECT_EQ(expected.get<std::vector<float>>("dense_fp32"),
+            persisted->get<std::vector<float>>("dense_fp32"));
 }
 
 TEST_P(SegmentTest, Dump) {
@@ -757,7 +904,9 @@ TEST_P(SegmentTest, DocCount) {
 // }
 
 TEST_P(SegmentTest, CombinedVectorColumnIndexer) {
-  options_.max_buffer_size_ = 10 * 1024;
+  // Exercise multiple persisted blocks without creating hundreds of tiny
+  // per-field indexes whose mandatory metadata exhausts the 100 MiB fixture.
+  options_.max_buffer_size_ = 512 * 1024;
 
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
@@ -766,7 +915,19 @@ TEST_P(SegmentTest, CombinedVectorColumnIndexer) {
 
 
   uint64_t max_doc = 1000;
-  test::TestHelper::SegmentInsertDoc(segment, *schema_, 0, max_doc);
+  // Make the mixed disk/memory coverage independent of Doc's size estimate.
+  for (uint64_t first : {uint64_t{0}, max_doc / 2}) {
+    ASSERT_TRUE(test::TestHelper::SegmentInsertDoc(segment, *schema_, first,
+                                                   first + max_doc / 2)
+                    .ok());
+    ASSERT_TRUE(segment->flush().ok());
+  }
+  const auto &blocks = segment->meta()->persisted_blocks();
+  ASSERT_GT(std::count_if(blocks.begin(), blocks.end(),
+                          [](const auto &block) {
+                            return block.type() == BlockType::SCALAR;
+                          }),
+            1);
 
   Doc new_doc = test::TestHelper::CreateDoc(1000, *schema_);
   auto status = segment->insert(new_doc);
@@ -817,7 +978,7 @@ TEST_P(SegmentTest, CombinedVectorColumnIndexer) {
 }
 
 TEST_P(SegmentTest, CombinedVectorColumnIndexerWithQuantVectorIndex) {
-  options_.max_buffer_size_ = 10 * 1024;
+  options_.max_buffer_size_ = 512 * 1024;
 
   auto tmp_schema = test::TestHelper::CreateSchemaWithVectorIndex(
       false, "demo",
@@ -831,7 +992,18 @@ TEST_P(SegmentTest, CombinedVectorColumnIndexerWithQuantVectorIndex) {
 
 
   uint64_t max_doc = 1000;
-  test::TestHelper::SegmentInsertDoc(segment, *schema_, 0, max_doc);
+  for (uint64_t first : {uint64_t{0}, max_doc / 2}) {
+    ASSERT_TRUE(test::TestHelper::SegmentInsertDoc(segment, *schema_, first,
+                                                   first + max_doc / 2)
+                    .ok());
+    ASSERT_TRUE(segment->flush().ok());
+  }
+  const auto &blocks = segment->meta()->persisted_blocks();
+  ASSERT_GT(std::count_if(blocks.begin(), blocks.end(),
+                          [](const auto &block) {
+                            return block.type() == BlockType::SCALAR;
+                          }),
+            1);
 
   Doc new_doc = test::TestHelper::CreateDoc(1000, *schema_);
   auto status = segment->insert(new_doc);
@@ -887,7 +1059,7 @@ TEST_P(SegmentTest, CombinedVectorColumnIndexerWithQuantVectorIndex) {
 }
 
 TEST_P(SegmentTest, CombinedVectorColumnIndexerQueryWithPks) {
-  options_.max_buffer_size_ = 10 * 1024;
+  options_.max_buffer_size_ = 512 * 1024;
 
   auto tmp_schema = test::TestHelper::CreateSchemaWithVectorIndex(
       false, "demo", std::make_shared<HnswIndexParams>(MetricType::IP));
@@ -899,7 +1071,11 @@ TEST_P(SegmentTest, CombinedVectorColumnIndexerQueryWithPks) {
 
 
   uint64_t max_doc = 1000;
-  test::TestHelper::SegmentInsertDoc(segment, *schema_, 0, max_doc);
+  // Keep keys in two persisted blocks and the final keys in memory.
+  ASSERT_TRUE(InsertTwoPersistedBlocks(segment, *schema_, max_doc - 2).ok());
+  ASSERT_TRUE(test::TestHelper::SegmentInsertDoc(segment, *schema_, max_doc - 2,
+                                                 max_doc)
+                  .ok());
 
   auto combined_indexer = segment->get_combined_vector_indexer("dense_fp32");
   ASSERT_TRUE(combined_indexer != nullptr);
@@ -1596,15 +1772,15 @@ TEST_P(SegmentTest, AddColumn) {
 }
 
 TEST_P(SegmentTest, AddNullableColumnWithoutExpressionMultiBlock) {
-  // Use small buffer to force multiple scalar blocks within a single segment
-  options_.max_buffer_size_ = 1 * 1024;
+  options_.max_buffer_size_ = 512 * 1024;
   int doc_count = 100;
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
-      options_, 0, doc_count);
+      options_, 0, 0);
   ASSERT_TRUE(segment != nullptr);
+  ASSERT_TRUE(InsertTwoPersistedBlocks(segment, *schema_, doc_count).ok());
 
-  segment->dump();
+  ASSERT_TRUE(segment->dump().ok());
   auto writing_segment_meta = segment->meta();
 
   Version version = version_manager_->get_current_version();
@@ -1694,15 +1870,15 @@ TEST_P(SegmentTest, AddNullableColumnWithoutExpressionMultiBlock) {
 }
 
 TEST_P(SegmentTest, AddColumnWithExpressionMultiBlock) {
-  // Use small buffer to force multiple scalar blocks within a single segment
-  options_.max_buffer_size_ = 1 * 1024;
+  options_.max_buffer_size_ = 512 * 1024;
   int doc_count = 100;
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
-      options_, 0, doc_count);
+      options_, 0, 0);
   ASSERT_TRUE(segment != nullptr);
+  ASSERT_TRUE(InsertTwoPersistedBlocks(segment, *schema_, doc_count).ok());
 
-  segment->dump();
+  ASSERT_TRUE(segment->dump().ok());
   auto writing_segment_meta = segment->meta();
 
   Version version = version_manager_->get_current_version();
@@ -1803,14 +1979,19 @@ TEST_P(SegmentTest, AddColumnWithExpressionMultiBlock) {
 }
 
 TEST_P(SegmentTest, AlterColumnMultiBlock) {
-  options_.max_buffer_size_ = 1 * 1024;
+  constexpr size_t kSharedCacheCapacity = MIN_MEMORY_LIMIT_BYTES;
+  auto &memory_pool = zvec::ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(kSharedCacheCapacity, memory_pool.capacity());
+
+  options_.max_buffer_size_ = 512 * 1024;
   int doc_count = 100;
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
-      options_, 0, doc_count);
+      options_, 0, 0);
   ASSERT_TRUE(segment != nullptr);
+  ASSERT_TRUE(InsertTwoPersistedBlocks(segment, *schema_, doc_count).ok());
 
-  segment->dump();
+  ASSERT_TRUE(segment->dump().ok());
   auto writing_segment_meta = segment->meta();
 
   Version version = version_manager_->get_current_version();
@@ -1867,10 +2048,26 @@ TEST_P(SegmentTest, AlterColumnMultiBlock) {
   segment = std::move(result).value();
   ASSERT_TRUE(segment != nullptr);
 
+  constexpr size_t kExternalCharge = 4096;
+  ExternalChargeGuard external_charge(memory_pool, kExternalCharge);
+  if (!GetParam()) {
+    ASSERT_TRUE(external_charge.charged());
+  }
+
+  ASSERT_NE(segment->fetch(0, std::nullopt, false), nullptr);
   // Alter column type: int32 -> int64 on multi-block segment
   auto new_field = std::make_shared<FieldSchema>("id", DataType::INT64, false);
   s = segment->alter_column("id", new_field, AlterColumnOptions());
   ASSERT_TRUE(s.ok()) << "alter_column failed: " << s.message();
+  if (!GetParam()) {
+    EXPECT_EQ(kSharedCacheCapacity, memory_pool.capacity());
+    EXPECT_GE(memory_pool.external_used(), kExternalCharge);
+  }
+  auto after_change = segment->fetch(0, std::nullopt, false);
+  ASSERT_NE(after_change, nullptr);
+  EXPECT_TRUE(after_change->get<int64_t>("id").has_value());
+  EXPECT_FALSE(after_change->get<int32_t>("id").has_value());
+
 
   auto combined_reader = segment->scan({"id", "name", "age"});
   ASSERT_TRUE(combined_reader != nullptr);
@@ -1887,14 +2084,19 @@ TEST_P(SegmentTest, AlterColumnMultiBlock) {
 }
 
 TEST_P(SegmentTest, DropColumnMultiBlock) {
-  options_.max_buffer_size_ = 1 * 1024;
+  constexpr size_t kSharedCacheCapacity = MIN_MEMORY_LIMIT_BYTES;
+  auto &memory_pool = zvec::ailego::MemoryLimitPool::get_instance();
+  ASSERT_EQ(kSharedCacheCapacity, memory_pool.capacity());
+
+  options_.max_buffer_size_ = 512 * 1024;
   int doc_count = 100;
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
-      options_, 0, doc_count);
+      options_, 0, 0);
   ASSERT_TRUE(segment != nullptr);
+  ASSERT_TRUE(InsertTwoPersistedBlocks(segment, *schema_, doc_count).ok());
 
-  segment->dump();
+  ASSERT_TRUE(segment->dump().ok());
   auto writing_segment_meta = segment->meta();
 
   Version version = version_manager_->get_current_version();
@@ -1951,9 +2153,25 @@ TEST_P(SegmentTest, DropColumnMultiBlock) {
   segment = std::move(result).value();
   ASSERT_TRUE(segment != nullptr);
 
+  ASSERT_NE(segment->fetch(0, std::nullopt, false), nullptr);
+  constexpr size_t kExternalCharge = 4096;
+  ExternalChargeGuard external_charge(memory_pool, kExternalCharge);
+  if (!GetParam()) {
+    ASSERT_TRUE(external_charge.charged());
+  }
+
   // Drop column on multi-block segment
   s = segment->drop_column("id");
   ASSERT_TRUE(s.ok()) << "drop_column failed: " << s.message();
+  if (!GetParam()) {
+    EXPECT_EQ(kSharedCacheCapacity, memory_pool.capacity());
+    EXPECT_GE(memory_pool.external_used(), kExternalCharge);
+  }
+  auto after_change = segment->fetch(0, std::nullopt, false);
+  ASSERT_NE(after_change, nullptr);
+  EXPECT_FALSE(after_change->has("id"));
+  EXPECT_TRUE(after_change->has("name"));
+
 
   auto combined_reader = segment->scan({"id"});
   ASSERT_TRUE(combined_reader == nullptr);
@@ -1974,14 +2192,15 @@ TEST_P(SegmentTest, DropColumnMultiBlock) {
 }
 
 TEST_P(SegmentTest, AddNullableThenAlterDropMultiBlock) {
-  options_.max_buffer_size_ = 1 * 1024;
+  options_.max_buffer_size_ = 512 * 1024;
   int doc_count = 100;
   auto segment = test::TestHelper::CreateSegmentWithDoc(
       col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
-      options_, 0, doc_count);
+      options_, 0, 0);
   ASSERT_TRUE(segment != nullptr);
+  ASSERT_TRUE(InsertTwoPersistedBlocks(segment, *schema_, doc_count).ok());
 
-  segment->dump();
+  ASSERT_TRUE(segment->dump().ok());
   auto writing_segment_meta = segment->meta();
 
   Version version = version_manager_->get_current_version();
@@ -2295,3 +2514,326 @@ TEST_P(SegmentTest, DropColumn) {
 
 
 INSTANTIATE_TEST_SUITE_P(MMapTest, SegmentTest, testing::Values(true, false));
+
+TEST_P(SegmentTest, BufferedDirectDocFetchPreservesConcurrentReads) {
+  CollectionSchema schema(col_name_);
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "text", DataType::STRING, false))
+                  .ok());
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "number", DataType::INT64, false))
+                  .ok());
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "items", DataType::ARRAY_INT32, false))
+                  .ok());
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, schema, 0, 100, id_map_, delete_store_, version_manager_,
+      options_, 100, 4);
+  ASSERT_NE(segment, nullptr);
+  ASSERT_TRUE(segment->flush().ok());
+  ASSERT_TRUE(
+      test::TestHelper::SegmentInsertDoc(segment, schema, 104, 108).ok());
+  std::atomic<bool> correct{true};
+  auto check = [&]() {
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t)
+      readers.emplace_back([&, t]() {
+        for (int n = 0; n < 32; ++n) {
+          const int id = 100 + (n + t) % 8;
+          auto expected = test::TestHelper::CreateDoc(id, schema);
+          auto doc = segment->fetch(id, std::nullopt, false);
+          if (!doc || doc->pk_ref() != expected.pk_ref() ||
+              doc->doc_id() != static_cast<uint64_t>(id) ||
+              doc->get<std::string>("text") !=
+                  expected.get<std::string>("text") ||
+              doc->get<int64_t>("number") != expected.get<int64_t>("number") ||
+              doc->get<std::vector<int32_t>>("items") !=
+                  expected.get<std::vector<int32_t>>("items") ||
+              (!options_.enable_mmap_ &&
+               !detail::DocumentMemoryAccess::budgeted(*doc)))
+            correct.store(false);
+        }
+      });
+    for (auto &reader : readers) reader.join();
+    EXPECT_TRUE(correct.load());
+  };
+  check();
+  ASSERT_TRUE(segment->dump().ok());
+  size_t scalar_blocks = 0;
+  for (const auto &block : segment->meta()->persisted_blocks()) {
+    if (block.type() == BlockType::SCALAR) ++scalar_blocks;
+  }
+  ASSERT_GT(scalar_blocks, 1u);
+  check();
+  auto projected = segment->fetch(
+      103, std::vector<std::string>{"text", "unknown", "text"}, false);
+  ASSERT_NE(projected, nullptr);
+  EXPECT_FALSE(projected->has("number"));
+  EXPECT_EQ(projected->get<std::string>("text"),
+            test::TestHelper::CreateDoc(103, schema).get<std::string>("text"));
+}
+
+TEST_P(SegmentTest, FetchBatchPreservesMissingAndDuplicateGlobalIDs) {
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
+      options_, 0, 8);
+  ASSERT_NE(segment, nullptr);
+  const std::vector<uint64_t> ids{6, 1, UINT64_MAX, 6, 0};
+  auto check = [&]() {
+    auto docs = segment->fetch_batch(
+        ids, std::vector<std::string>{"id", "name", "binary", "array_binary"},
+        false);
+    ASSERT_EQ(docs.size(), ids.size());
+    EXPECT_EQ(docs[2], nullptr);
+    for (size_t i : {0u, 1u, 3u, 4u}) {
+      auto expected = segment->fetch(
+          ids[i],
+          std::vector<std::string>{"id", "name", "binary", "array_binary"},
+          false);
+      ASSERT_NE(docs[i], nullptr);
+      ASSERT_NE(expected, nullptr);
+      EXPECT_EQ(docs[i]->pk(), expected->pk());
+      EXPECT_EQ(docs[i]->doc_id(), expected->doc_id());
+      EXPECT_EQ(docs[i]->get<int32_t>("id"), expected->get<int32_t>("id"));
+      EXPECT_EQ(docs[i]->get<std::string>("name"),
+                expected->get<std::string>("name"));
+      EXPECT_EQ(docs[i]->get<std::string>("binary"),
+                expected->get<std::string>("binary"));
+      EXPECT_EQ(docs[i]->get<std::vector<std::string>>("array_binary"),
+                expected->get<std::vector<std::string>>("array_binary"));
+    }
+  };
+  check();
+  ASSERT_TRUE(segment->dump().ok());
+  check();
+}
+
+TEST_P(SegmentTest, FetchSharedBlockAndCrossBlockRowsPreserveOrder) {
+  options_.max_buffer_size_ = 64 * 1024 * 1024;
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
+      options_, 0, 8);
+  ASSERT_NE(segment, nullptr);
+  auto check = [&](const std::vector<int> &rows) {
+    auto table = segment->fetch({"name", GLOBAL_DOC_ID, "id", USER_ID}, rows);
+    ASSERT_NE(table, nullptr);
+    ASSERT_TRUE(table->ValidateFull().ok());
+    ASSERT_EQ(table->num_rows(), rows.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+      auto expected = test::TestHelper::CreateDoc(rows[i], *schema_);
+      auto name = table->column(0)->GetScalar(i);
+      auto global_id = table->column(1)->GetScalar(i);
+      auto id = table->column(2)->GetScalar(i);
+      auto pk = table->column(3)->GetScalar(i);
+      ASSERT_TRUE(name.ok() && global_id.ok() && id.ok() && pk.ok());
+      EXPECT_TRUE((*name)->Equals(
+          arrow::StringScalar(expected.get<std::string>("name").value())));
+      EXPECT_TRUE((*global_id)->Equals(arrow::UInt64Scalar(rows[i])));
+      EXPECT_TRUE((*id)->Equals(
+          arrow::Int32Scalar(expected.get<int32_t>("id").value())));
+      EXPECT_TRUE((*pk)->Equals(arrow::StringScalar(expected.pk())));
+    }
+  };
+  check({7, 1, 7, 0});
+  ASSERT_TRUE(segment->flush().ok());
+  check({7, 1, 7, 0});
+  ASSERT_TRUE(
+      test::TestHelper::SegmentInsertDoc(segment, *schema_, 8, 16).ok());
+  check({12, 8, 15, 12});
+  check({15, 0, 8, 3});
+  ASSERT_TRUE(segment->dump().ok());
+  check({12, 8, 15, 12});
+  check({15, 0, 8, 3});
+}
+
+TEST_P(SegmentTest, SharedLayoutCrossBlockOwnsReorderedArraysAndLocalIDs) {
+  options_.max_buffer_size_ = 64 * 1024 * 1024;
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
+      options_, 0, 8);
+  ASSERT_NE(segment, nullptr);
+  ASSERT_TRUE(segment->flush().ok());
+  ASSERT_TRUE(
+      test::TestHelper::SegmentInsertDoc(segment, *schema_, 8, 16).ok());
+  const std::vector<int> rows{15, 0, 8, 3, 15, 0, 7, 9};
+  const std::vector<std::string> columns{"array_binary", LOCAL_ROW_ID, "name",
+                                         "id"};
+  auto check = [&]() {
+    auto result = segment->fetch(columns, rows);
+    EXPECT_NE(result, nullptr);
+    if (!result) return result;
+    EXPECT_TRUE(result->ValidateFull().ok());
+    for (size_t row = 0; row < rows.size(); ++row) {
+      auto point = segment->fetch(columns, std::vector<int>{rows[row]});
+      EXPECT_NE(point, nullptr);
+      if (!point) continue;
+      for (size_t col = 0; col < columns.size(); ++col) {
+        EXPECT_TRUE(result->column(col)->GetScalar(row).ValueOrDie()->Equals(
+            *point->column(col)->GetScalar(0).ValueOrDie()));
+      }
+    }
+    return result;
+  };
+  check();  // Mixed persisted and mutable blocks.
+  ASSERT_TRUE(segment->dump().ok());
+  auto retained = check();
+  ASSERT_NE(retained, nullptr);
+  segment.reset();
+  for (int i = 0; i < 4; ++i) {
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(1 << 20);
+  }
+  ASSERT_TRUE(retained->ValidateFull().ok());
+  for (size_t row = 0; row < rows.size(); ++row) {
+    EXPECT_TRUE(retained->column(1)->GetScalar(row).ValueOrDie()->Equals(
+        arrow::UInt64Scalar(rows[row])));
+  }
+}
+
+TEST_P(SegmentTest, BufferedBatchFetchPreservesBlockOrderAndOwnership) {
+  CollectionSchema schema(col_name_);
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "text", DataType::STRING, true))
+                  .ok());
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "items", DataType::ARRAY_INT32, true))
+                  .ok());
+  ASSERT_TRUE(schema
+                  .add_field(std::make_shared<FieldSchema>(
+                      "bytes", DataType::BINARY, false))
+                  .ok());
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, schema, 0, 100, id_map_, delete_store_, version_manager_,
+      options_, 100, 0);
+  ASSERT_NE(segment, nullptr);
+  for (int row = 0; row < 20; ++row) {
+    Doc doc;
+    doc.set_pk("row-" + std::to_string(row));
+    doc.set<std::string>(
+        "bytes", std::string("\0\xff", 2) + std::string(row * 19, 'a' + row));
+    if (row % 3 != 0) {
+      doc.set<std::string>("text", std::string(row * 37, 'a' + row));
+      doc.set<std::vector<int32_t>>("items", {row, -row});
+    }
+    ASSERT_TRUE(segment->insert(doc).ok());
+    if (row == 7 || row == 15) {
+      auto status = segment->flush();
+      ASSERT_TRUE(status.ok()) << status.message();
+    }
+  }
+  const std::vector<std::string> columns{"items", LOCAL_ROW_ID,  USER_ID,
+                                         "bytes", GLOBAL_DOC_ID, "text"};
+  // Exercise the Doc API as well as the Arrow-table API. The request spans
+  // blocks, preserves duplicate/missing IDs, and crosses the batch boundary.
+  std::vector<uint64_t> doc_ids;
+  for (int row = 0; row < 70; ++row) doc_ids.push_back(100 + row * 7 % 20);
+  doc_ids.insert(doc_ids.begin() + 4, 999999);
+  auto check_docs = [&](const std::vector<Doc::Ptr> &docs) {
+    ASSERT_EQ(docs.size(), doc_ids.size());
+    for (size_t i = 0; i < docs.size(); ++i) {
+      if (doc_ids[i] == 999999) {
+        EXPECT_EQ(docs[i], nullptr);
+        continue;
+      }
+      ASSERT_NE(docs[i], nullptr);
+      const int row = static_cast<int>(doc_ids[i] - 100);
+      EXPECT_EQ(docs[i]->doc_id(), doc_ids[i]);
+      EXPECT_EQ(docs[i]->pk(), "row-" + std::to_string(row));
+      EXPECT_EQ(docs[i]->get<std::string>("bytes"),
+                std::string("\0\xff", 2) + std::string(row * 19, 'a' + row));
+      if (row % 3 == 0) {
+        EXPECT_FALSE(docs[i]->get<std::string>("text").has_value());
+        EXPECT_FALSE(docs[i]->get<std::vector<int32_t>>("items").has_value());
+      } else {
+        EXPECT_EQ(docs[i]->get<std::string>("text"),
+                  std::string(row * 37, 'a' + row));
+        EXPECT_EQ(docs[i]->get<std::vector<int32_t>>("items"),
+                  (std::vector<int32_t>{row, -row}));
+      }
+      if (!options_.enable_mmap_)
+        EXPECT_TRUE(detail::DocumentMemoryAccess::budgeted(*docs[i]));
+    }
+  };
+  const std::vector<std::string> doc_columns{"text", "items", "bytes"};
+  // The mutable tail keeps the ordinary bounded fallback.
+  check_docs(segment->fetch_docs(doc_ids, doc_columns, false));
+  std::vector<Doc::Ptr> retained_docs;
+  TablePtr retained;
+  for (const std::vector<int> rows :
+       {std::vector<int>{0, 2, 7, 8, 9, 14, 15, 16, 19},
+        std::vector<int>{19, 0, 8, 0, 15, 16, 7, 19, 3},
+        std::vector<int>{0, 2, 7, 7, 8, 9, 14, 15},
+        std::vector<int>{15, 0, 8, 0, 7, 9, 14, 8},
+        std::vector<int>{7, 2, 0, 7}}) {
+    auto result = segment->fetch(columns, rows);
+    ASSERT_NE(result, nullptr);
+    ASSERT_TRUE(result->ValidateFull().ok());
+    ASSERT_EQ(result->num_rows(), rows.size());
+    for (size_t row = 0; row < rows.size(); ++row) {
+      auto expected = segment->fetch(columns, rows[row]);
+      ASSERT_NE(expected, nullptr);
+      for (size_t col = 0; col < columns.size(); ++col) {
+        auto actual = result->column(col)->GetScalar(row);
+        ASSERT_TRUE(actual.ok());
+        ASSERT_TRUE(expected->values[col].is_scalar());
+        EXPECT_TRUE((*actual)->Equals(*expected->values[col].scalar()));
+      }
+    }
+    retained = std::move(result);
+  }
+  ASSERT_TRUE(segment->dump().ok());
+  for (int i = 0; i < 4; ++i)
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(1 << 20);
+  // A multi-segment request can leave only one or two rows in this segment.
+  // Keep nulls, duplicate/missing IDs, and owned binary/list values intact.
+  for (const auto &small :
+       {std::vector<uint64_t>{100}, std::vector<uint64_t>{100, 101},
+        std::vector<uint64_t>{101, 100}, std::vector<uint64_t>{100, 100},
+        std::vector<uint64_t>{119, 119}, std::vector<uint64_t>{100, 119},
+        std::vector<uint64_t>{119, 999999}}) {
+    doc_ids = small;
+    check_docs(segment->fetch_docs(doc_ids, doc_columns, false));
+  }
+  // At most two selected rows per persisted block exercises direct Doc
+  // materialization, including duplicates, nulls and the missing-ID hole.
+  doc_ids = {119, 100, 108, 100, 999999, 115};
+  for (int repeat = 0; repeat < 2; ++repeat) {
+    retained_docs = segment->fetch_docs(doc_ids, doc_columns, false);
+    check_docs(retained_docs);
+  }
+  std::vector<int> repeated_rows;
+  for (int row = 0; row < 70; ++row) repeated_rows.push_back(row * 7 % 20);
+  // Cover budgeted routing overflow and both cold and resident multi-block
+  // reads, retaining request order, duplicates and synthetic local IDs.
+  for (int repeat = 0; repeat < 2; ++repeat) {
+    auto batch = segment->fetch(columns, repeated_rows);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_TRUE(batch->ValidateFull().ok());
+    ASSERT_EQ(batch->num_rows(), repeated_rows.size());
+    for (size_t row = 0; row < repeated_rows.size(); ++row) {
+      auto expected = segment->fetch(columns, repeated_rows[row]);
+      ASSERT_NE(expected, nullptr);
+      for (size_t col = 0; col < columns.size(); ++col)
+        EXPECT_TRUE(batch->column(col)->GetScalar(row).ValueOrDie()->Equals(
+            *expected->values[col].scalar()));
+    }
+  }
+  segment.reset();
+  for (int i = 0; i < 4; ++i) {
+    ailego::BlockEvictionQueue::get_instance().batch_recycle(1 << 20);
+  }
+  check_docs(retained_docs);
+  ASSERT_TRUE(retained->ValidateFull().ok());
+  const std::vector<int> rows{7, 2, 0, 7};
+  for (size_t row = 0; row < rows.size(); ++row) {
+    auto actual = retained->GetColumnByName("bytes")->GetScalar(row);
+    ASSERT_TRUE(actual.ok());
+    EXPECT_TRUE((*actual)->Equals(
+        arrow::BinaryScalar(std::string("\0\xff", 2) +
+                            std::string(rows[row] * 19, 'a' + rows[row]))));
+  }
+}

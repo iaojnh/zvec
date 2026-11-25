@@ -32,7 +32,14 @@ arrow::Status CheckNotFilteredOp::CheckNotFilteredFunction(
       std::make_shared<arrow::BooleanBuilder>(ctx->memory_pool());
   ARROW_RETURN_NOT_OK(builder->Reserve(batch.length));
   for (int i = 0; i < batch.length; i++) {
-    builder->UnsafeAppend(!filter->is_filtered(row_span[i]));
+    auto result = filter->is_filtered_checked(row_span[i]);
+    if (!result) {
+      const auto &error = result.error();
+      return error.code() == StatusCode::RESOURCE_EXHAUSTED
+                 ? arrow::Status::OutOfMemory(error.message())
+                 : arrow::Status::ExecutionError(error.message());
+    }
+    builder->UnsafeAppend(!*result);
   }
   std::shared_ptr<arrow::Array> result_array;
   ARROW_RETURN_NOT_OK(builder->Finish(&result_array));

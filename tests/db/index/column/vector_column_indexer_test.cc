@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include "db/index/column/vector_column/engine_helper.hpp"
 #include "db/index/column/vector_column/vector_column_params.h"
 #include "tests/test_util.h"
@@ -33,6 +34,35 @@
 
 using namespace zvec;
 
+TEST(VectorColumnIndexerTest, BufferedOpenReportsBudgetRefusalAndCanRetry) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto original_capacity = pool.capacity();
+  AILEGO_DEFER([&] { EXPECT_EQ(0, pool.init(original_capacity)); });
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(8 << 20));
+
+  const std::string path = "test_open_budget.index";
+  test_util::RemoveTestFiles(path);
+  AILEGO_DEFER([&] { test_util::RemoveTestFiles(path); });
+  VectorColumnIndexer indexer(
+      path, FieldSchema("test", DataType::VECTOR_FP32, 4, false,
+                        std::make_shared<FlatIndexParams>(MetricType::L2)));
+
+  const size_t headroom = ailego::kVectorPageSize / 8;
+  ASSERT_GT(pool.available(), headroom);
+  {
+    ailego::MemoryReservation pressure;
+    pressure.add(pool.available() - headroom);
+    const auto status = indexer.open({false, true, false});
+    EXPECT_EQ(status.code(), StatusCode::RESOURCE_EXHAUSTED)
+        << status.message();
+    EXPECT_EQ(nullptr, indexer.debug_get_index());
+    EXPECT_FALSE(ailego::File::IsExist(path));
+  }
+
+  const auto retried = indexer.open({false, true, false});
+  ASSERT_TRUE(retried.ok()) << retried.message();
+  EXPECT_TRUE(indexer.destroy().ok());
+}
 
 TEST(VectorColumnIndexerTest, ReusedQueryParametersAndFlatFallback) {
   FieldSchema field("vector", DataType::VECTOR_FP32, 32, false,
@@ -123,6 +153,56 @@ TEST(VectorColumnIndexerTest, BaseQueryParametersForFlatFallback) {
                      type, query.query_params, nullptr, nullptr)
                      .ok());
   }
+}
+
+
+TEST(VectorColumnIndexerTest, PropagatesFilterReadFailure) {
+  class FailingFilter : public CheckedIndexFilter {
+   public:
+    explicit FailingFilter(StatusCode code) : code_(code) {}
+
+    Result<bool> is_filtered_checked(uint64_t id) const override {
+      if (id == 0) return false;
+      return tl::make_unexpected(Status(code_, "Cannot read document ID range"));
+    }
+
+   private:
+    StatusCode code_;
+  };
+
+  const std::string path = "test_failing_filter.index";
+  test_util::RemoveTestFiles(path);
+  VectorColumnIndexer indexer(
+      path, FieldSchema("test", DataType::VECTOR_FP32, 4, false,
+                        std::make_shared<FlatIndexParams>(MetricType::L2)));
+  ASSERT_TRUE(indexer.open({true, true}).ok());
+
+  const float values[] = {1.0f, 2.0f, 3.0f, 4.0f};
+  const vector_column_params::VectorData vector{
+      vector_column_params::DenseVector{values}};
+  ASSERT_TRUE(indexer.insert(vector, 0).ok());
+  ASSERT_TRUE(indexer.insert(vector, 1).ok());
+  vector_column_params::QueryParams params;
+  params.topk = 2;
+
+  for (auto code : {StatusCode::RESOURCE_EXHAUSTED, StatusCode::INTERNAL_ERROR}) {
+    FailingFilter filter(code);
+    params.filter = &filter;
+    auto result = indexer.search(vector, params);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), code);
+    EXPECT_EQ(result.error().message(), "Cannot read document ID range");
+
+    int64_t ids[2];
+    auto status = indexer.search_internal_ids(vector, params, ids, nullptr);
+    EXPECT_EQ(status.code(), code);
+    EXPECT_EQ(status.message(), "Cannot read document ID range");
+  }
+
+  params.filter = nullptr;
+  EXPECT_TRUE(indexer.search(vector, params));
+  EXPECT_TRUE(indexer.close().ok());
+  test_util::RemoveTestFiles(path);
 }
 
 
@@ -2231,15 +2311,14 @@ TEST(VectorColumnIndexerTest, Failure) {
 
   // Test case 10: use_mmap = false
   {
-    ::zvec::ailego::PoolPayloadBudget::get_instance().init(10 * 1024UL *
-                                                           1024UL);
+    zvec::ailego::PoolPayloadBudget::get_instance().init(10 * 1024UL * 1024UL);
     auto indexer = std::make_shared<VectorColumnIndexer>(
         index_file_path,
         FieldSchema("test", DataType::VECTOR_FP32, 3, false,
                     std::make_shared<FlatIndexParams>(MetricType::IP)));
     ASSERT_TRUE(indexer);
     ASSERT_TRUE(
-        indexer->open(vector_column_params::ReadOptions{true, true, false})
+        indexer->open(vector_column_params::ReadOptions{false, true, false})
             .ok());
     // Insert some data first
     auto data = vector_column_params::VectorData{
@@ -2349,8 +2428,9 @@ TEST(VectorColumnIndexerTest, Failure) {
     // Fetch non-existent doc_id should fail
     auto fetch_result = indexer->fetch(99999);
     ASSERT_FALSE(fetch_result.has_value());
+    EXPECT_EQ(StatusCode::INTERNAL_ERROR, fetch_result.error().code());
     ASSERT_EQ(fetch_result.error().message(),
-              "Failed to fetch vector from index");
+              "Failed to fetch vector from index: No exist");
 
     indexer->destroy();
   }

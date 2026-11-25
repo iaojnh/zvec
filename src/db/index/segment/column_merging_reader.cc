@@ -47,18 +47,32 @@ std::shared_ptr<arrow::Schema> ColumnMergingReader::schema() const {
 
 arrow::Status ColumnMergingReader::ReadNext(
     std::shared_ptr<arrow::RecordBatch> *out) {
+  return read_next(out, false).status();
+}
+
+arrow::Result<bool> ColumnMergingReader::ReadNextResident(
+    std::shared_ptr<arrow::RecordBatch> *out) {
+  return read_next(out, true);
+}
+
+arrow::Result<bool> ColumnMergingReader::read_next(
+    std::shared_ptr<arrow::RecordBatch> *out, bool resident_only) {
   *out = nullptr;
 
   if (!has_more_) {
-    return arrow::Status::OK();
+    return true;
   }
 
   // Load a non-empty batch for each reader that exhausted its current batch.
   for (size_t i = 0; i < input_readers_.size(); ++i) {
     while (current_batches_[i] == nullptr) {
-      arrow::Status status = input_readers_[i]->ReadNext(&current_batches_[i]);
-      if (!status.ok()) {
-        return status;
+      if (resident_only) {
+        ARROW_ASSIGN_OR_RAISE(
+            auto ready,
+            zvec::ReadNextResident(*input_readers_[i], &current_batches_[i]));
+        if (!ready) return false;
+      } else {
+        ARROW_RETURN_NOT_OK(input_readers_[i]->ReadNext(&current_batches_[i]));
       }
       current_batch_offsets_[i] = 0;
       if (current_batches_[i] == nullptr) {
@@ -83,7 +97,7 @@ arrow::Status ColumnMergingReader::ReadNext(
 
   if (all_null) {
     has_more_ = false;
-    return arrow::Status::OK();
+    return true;
   }
   if (any_null) {
     return arrow::Status::Invalid(
@@ -144,7 +158,7 @@ arrow::Status ColumnMergingReader::ReadNext(
     }
   }
 
-  return arrow::Status::OK();
+  return true;
 }
 
 }  // namespace zvec

@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include "quantizer/distance_quantizer.h"
 #include "seeker.h"
 
@@ -87,6 +88,9 @@ class LinearSeeker : public Seeker {
 
   //! Seek (TOP 1 Document)
   int seek(const void *query, size_t len, Document *out) override;
+  int seek(const void *query, size_t len, Document *out,
+           const IndexCluster::CentroidList *stored_centroids,
+           ailego::BudgetedAlignedBuffer *scratch);
 
   //! Retrieve the original features
   IndexFeatures::Pointer original() const override {

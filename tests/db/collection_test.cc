@@ -31,6 +31,8 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <arrow/acero/api.h>
+#include <arrow/compute/initialize.h>
 #include "../ailego/buffer/pool_payload_budget.h"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -43,14 +45,18 @@
 #endif
 #include <gtest/gtest.h>
 #include <magic_enum/magic_enum.hpp>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/file_helper.h>
+#include "db/collection_fetch_internal.h"
 #include "db/collection_query_internal.h"
 #include "db/common/constants.h"
 #include "db/common/file_helper.h"
+#include "db/common/result_memory_allowance.h"
 #include "db/index/common/type_helper.h"
 #include "db/index/common/version_manager.h"
+#include "db/sqlengine/planner/plan_info.h"
 #include "index/utils/utils.h"
 #include "zvec/ailego/utility/float_helper.h"
 #include "zvec/db/doc.h"
@@ -71,8 +77,8 @@ std::string col_path = "test_collection";
 class CollectionTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    ::zvec::ailego::PoolPayloadBudget::get_instance().init(2 * 1024ll * 1024ll *
-                                                           1024ll);
+    zvec::ailego::PoolPayloadBudget::get_instance().init(2 * 1024ll * 1024ll *
+                                                         1024ll);
     FileHelper::RemoveDirectory(col_path);
   }
 
@@ -3309,6 +3315,314 @@ TEST_F(CollectionTest, Feature_Optimize_Concurrent_ReadWrite_NonBlocking) {
   }
 }
 
+TEST_F(CollectionTest, Feature_Fetch_BatchScalarsPreserveLookupAndProjection) {
+  for (bool mmap : {false, true}) {
+    collection_.reset();
+    FileHelper::RemoveDirectory(col_path);
+    options_ = CollectionOptions{false, mmap, 64 * 1024 * 1024};
+    auto schema = make_schema();
+    ASSERT_TRUE(schema
+                    .add_field(std::make_shared<FieldSchema>(
+                        "text", DataType::STRING, true))
+                    .ok());
+    ASSERT_TRUE(schema
+                    .add_field(std::make_shared<FieldSchema>(
+                        "bytes", DataType::BINARY, true))
+                    .ok());
+    ASSERT_TRUE(schema
+                    .add_field(std::make_shared<FieldSchema>(
+                        "items", DataType::ARRAY_INT32, true))
+                    .ok());
+    create(schema);
+    for (int begin : {0, 6}) {
+      std::vector<Doc> docs;
+      for (int i = begin; i < begin + 6; ++i) {
+        auto doc = make_doc("batch_" + std::to_string(i), i);
+        if (i % 3) {
+          doc.set("text", std::string("x\0y", 3) + std::string(256, 'a' + i));
+        }
+        if (i % 2) doc.set("bytes", std::string("\0\xff\0", 3));
+        if (i % 4) {
+          doc.set("items", i == 5 ? std::vector<int32_t>{}
+                                  : std::vector<int32_t>{i, -i});
+        }
+        docs.push_back(std::move(doc));
+      }
+      expect_write(collection_->insert(docs), docs.size());
+      if (begin == 0) {
+        ASSERT_TRUE(collection_->flush().ok());
+        ASSERT_TRUE(collection_->optimize().ok());
+      }
+    }
+    const std::vector<std::string> keys{"batch_11", "missing", "batch_5",
+                                        "batch_9",  "batch_1", "batch_9",
+                                        "batch_3",  ""};
+    bool deleted = false;
+    auto check = [&]() {
+      const std::vector<std::optional<std::vector<std::string>>> projections{
+          std::nullopt,
+          std::vector<std::string>{"items", "bytes", "value", "unknown",
+                                   "value"},
+          std::vector<std::string>{}};
+      for (const auto &projection : projections) {
+        auto batch = collection_->fetch(keys, projection, false);
+        ASSERT_TRUE(batch.has_value()) << batch.error().message();
+        ASSERT_EQ(batch->size(), 7u);
+        for (const auto &key : keys) {
+          auto single = collection_->fetch({key}, projection, false);
+          ASSERT_TRUE(single.has_value());
+          auto expected = single->at(key);
+          auto actual = batch->at(key);
+          EXPECT_EQ(expected == nullptr, key.empty() || key == "missing" ||
+                                             (deleted && key == "batch_3"));
+          ASSERT_EQ(actual == nullptr, expected == nullptr) << key;
+          if (!expected) continue;
+          EXPECT_EQ(actual->pk(), expected->pk());
+          EXPECT_EQ(actual->doc_id(), expected->doc_id());
+          for (const auto &field :
+               {"value", "text", "bytes", "items", "extra"}) {
+            EXPECT_EQ(actual->has(field), expected->has(field)) << field;
+          }
+          if (expected->has("value"))
+            EXPECT_EQ(actual->get<int32_t>("value"),
+                      expected->get<int32_t>("value"));
+          if (expected->has("text"))
+            EXPECT_EQ(actual->get<std::string>("text"),
+                      expected->get<std::string>("text"));
+          if (expected->has("bytes"))
+            EXPECT_EQ(actual->get<std::string>("bytes"),
+                      expected->get<std::string>("bytes"));
+          if (expected->has("items"))
+            EXPECT_EQ(actual->get<std::vector<int32_t>>("items"),
+                      expected->get<std::vector<int32_t>>("items"));
+          if (expected->has("extra"))
+            EXPECT_EQ(actual->get<int64_t>("extra"),
+                      expected->get<int64_t>("extra"));
+        }
+      }
+    };
+    check();
+    ASSERT_TRUE(collection_->flush().ok());
+    check();
+    expect_write(collection_->delete_({"batch_3"}), 1);
+    deleted = true;
+    ASSERT_TRUE(collection_->flush().ok());
+    ASSERT_TRUE(collection_->optimize().ok());
+    check();
+    ASSERT_TRUE(collection_
+                    ->add_column(std::make_shared<FieldSchema>(
+                                     "extra", DataType::INT64, true),
+                                 "value + 7", AddColumnOptions())
+                    .ok());
+    check();
+    options_.read_only_ = true;
+    reopen();
+    check();
+  }
+}
+
+TEST_F(CollectionTest, Feature_Fetch_BatchAllScalarTypesMatchSingleReads) {
+  auto normal = TestHelper::CreateNormalSchema(false);
+  CollectionSchema scalar_schema("batch_scalar_types");
+  for (const auto &field : normal->forward_fields()) {
+    ASSERT_TRUE(scalar_schema.add_field(field).ok());
+  }
+  for (bool mmap : {false, true}) {
+    collection_.reset();
+    FileHelper::RemoveDirectory(col_path);
+    options_ = CollectionOptions{false, mmap, 64 * 1024 * 1024};
+    collection_ = TestHelper::CreateCollectionWithDoc(col_path, scalar_schema,
+                                                      options_, 0, 12, false);
+    ASSERT_NE(collection_, nullptr);
+    std::vector<std::string> keys;
+    for (int row : {11, 2, 7, 2, 0}) {
+      keys.push_back(TestHelper::CreateDoc(row, scalar_schema).pk());
+    }
+    auto check = [&]() {
+      auto batch = collection_->fetch(keys, std::nullopt, false);
+      ASSERT_TRUE(batch.has_value());
+      EXPECT_EQ(batch->size(), 4u);
+      for (const auto &key : keys) {
+        auto single = collection_->fetch({key}, std::nullopt, false);
+        ASSERT_TRUE(single.has_value());
+        ASSERT_NE(batch->at(key), nullptr);
+        ASSERT_NE(single->at(key), nullptr);
+        EXPECT_EQ(*batch->at(key), *single->at(key));
+        EXPECT_EQ(batch->at(key)->doc_id(), single->at(key)->doc_id());
+      }
+    };
+    check();
+    ASSERT_TRUE(collection_->flush().ok());
+    check();
+    options_.read_only_ = true;
+    reopen();
+    check();
+  }
+}
+
+TEST_F(CollectionTest, Feature_Fetch_MultiGetPreservesKeyAndMutationSemantics) {
+  for (bool mmap : {false, true}) {
+    collection_.reset();
+    FileHelper::RemoveDirectory(col_path);
+    options_ = CollectionOptions{false, mmap, 64 * 1024 * 1024};
+    create(make_schema());
+    for (int begin : {0, 20}) {
+      std::vector<Doc> docs;
+      for (int row = begin; row < begin + 20; ++row) {
+        docs.push_back(make_doc("lookup_" + std::to_string(row), row));
+      }
+      expect_write(collection_->insert(docs), docs.size());
+      if (begin == 0) ASSERT_TRUE(collection_->flush().ok());
+    }
+    std::vector<std::string> mixed;
+    for (int row = 39; row >= 0; --row) {
+      mixed.push_back("lookup_" + std::to_string(row));
+      if (row % 5 == 0) mixed.push_back("lookup_1");
+      if (row % 7 == 0) mixed.push_back("missing");
+    }
+    mixed.push_back("");
+    const std::vector<std::vector<std::string>> batches{
+        {},
+        {"lookup_1", "lookup_1", "lookup_1"},
+        {"missing", "missing"},
+        {"missing", "missing2", "", "missing"},
+        mixed};
+    auto check = [&]() {
+      for (const auto &keys : batches) {
+        // Including vectors retains the point-lookup path and provides an
+        // independent reference even for batches with the same projections.
+        for (bool include_vector : {false, true}) {
+          for (const auto &projection :
+               {std::optional<std::vector<std::string>>{},
+                std::optional<std::vector<std::string>>(
+                    std::vector<std::string>{})}) {
+            auto batch = collection_->fetch(keys, projection, include_vector);
+            ASSERT_TRUE(batch.has_value()) << batch.error().message();
+            std::vector<std::string> distinct = keys;
+            std::sort(distinct.begin(), distinct.end());
+            distinct.erase(std::unique(distinct.begin(), distinct.end()),
+                           distinct.end());
+            ASSERT_EQ(batch->size(), distinct.size());
+            for (const auto &key : distinct) {
+              auto single =
+                  collection_->fetch({key}, projection, include_vector);
+              ASSERT_TRUE(single.has_value());
+              auto expected = single->at(key);
+              auto actual = batch->at(key);
+              ASSERT_EQ(actual == nullptr, expected == nullptr) << key;
+              if (!expected) continue;
+              EXPECT_EQ(*actual, *expected) << key;
+              EXPECT_EQ(actual->doc_id(), expected->doc_id()) << key;
+            }
+          }
+        }
+      }
+    };
+    check();
+    expect_write(collection_->delete_({"lookup_4", "lookup_35"}), 2);
+    check();
+    std::vector<Doc> updates{make_doc("lookup_1", 999),
+                             make_doc("lookup_35", 355)};
+    expect_write(collection_->upsert(updates), updates.size());
+    check();
+    ASSERT_TRUE(collection_->flush().ok());
+    ASSERT_TRUE(collection_->optimize().ok());
+    options_.read_only_ = true;
+    reopen();
+    check();
+  }
+}
+
+namespace {
+struct FetchLookupStub {
+  bool batch_error = false;
+  mutable int batch_calls = 0;
+  mutable std::vector<std::string> point_keys;
+
+  Status multi_get(const std::vector<std::string> &,
+                   std::vector<uint64_t> *ids) const {
+    ++batch_calls;
+    if (batch_error) {
+      *ids = {777};  // A failed MultiGet need not have finished every output.
+      return Status::InternalError("injected batch failure");
+    }
+    *ids = {17, INVALID_DOC_ID, 29};
+    return Status::OK();
+  }
+
+  bool has(const std::string &key, uint64_t *id) const {
+    point_keys.push_back(key);
+    if (key == "live") {
+      *id = 17;
+      return true;
+    }
+    if (key == "live2") {
+      *id = 29;
+      return true;
+    }
+    if (key == "error") *id = 999;
+    return false;
+  }
+
+  Result<bool> lookup(const std::string &key, uint64_t *id) const {
+    if (key == "error") {
+      point_keys.push_back(key);
+      return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                        "injected lookup budget failure"));
+    }
+    return has(key, id);
+  }
+};
+}  // namespace
+
+TEST(CollectionFetchLookupTest, BatchErrorPreservesPointReadSemantics) {
+  FetchLookupStub lookup;
+  lookup.batch_error = true;
+  const std::vector<std::string> keys{"live", "missing", "error", "live2"};
+  auto ids = detail::FetchPrimaryKeyIds(lookup, keys);
+  EXPECT_EQ(ids,
+            (std::vector<uint64_t>{17, INVALID_DOC_ID, INVALID_DOC_ID, 29}));
+  EXPECT_EQ(lookup.batch_calls, 1);
+  EXPECT_EQ(lookup.point_keys, keys);
+}
+
+TEST(CollectionFetchLookupTest, SuccessfulBatchAndTrivialInputs) {
+  FetchLookupStub lookup;
+  EXPECT_TRUE(detail::FetchPrimaryKeyIds(lookup, {}).empty());
+  EXPECT_EQ(lookup.batch_calls, 0);
+  EXPECT_TRUE(lookup.point_keys.empty());
+  EXPECT_EQ(detail::FetchPrimaryKeyIds(lookup, {"live"}),
+            (std::vector<uint64_t>{17}));
+  EXPECT_EQ(detail::FetchPrimaryKeyIds(lookup, {"error"}),
+            (std::vector<uint64_t>{INVALID_DOC_ID}));
+  EXPECT_EQ(lookup.batch_calls, 0);
+  lookup.point_keys.clear();
+  EXPECT_EQ(detail::FetchPrimaryKeyIds(lookup, {"live", "missing", "live2"}),
+            (std::vector<uint64_t>{17, INVALID_DOC_ID, 29}));
+  EXPECT_EQ(lookup.batch_calls, 1);
+  EXPECT_TRUE(lookup.point_keys.empty());
+}
+
+TEST(CollectionFetchLookupTest, CheckedBatchFailureRetriesMissingKeys) {
+  FetchLookupStub lookup;
+  lookup.batch_error = true;
+  const std::vector<std::string> keys{"live", "missing", "live2"};
+  auto ids = detail::FetchPrimaryKeyIdsChecked(lookup, keys);
+  ASSERT_TRUE(ids.has_value());
+  EXPECT_EQ(*ids, (std::vector<uint64_t>{17, INVALID_DOC_ID, 29}));
+  EXPECT_EQ(lookup.point_keys, keys);
+}
+
+TEST(CollectionFetchLookupTest, CheckedReadFailureIsNotMissingDocument) {
+  FetchLookupStub lookup;
+  lookup.batch_error = true;
+  auto ids =
+      detail::FetchPrimaryKeyIdsChecked(lookup, {"live", "error", "live2"});
+  ASSERT_FALSE(ids.has_value());
+  EXPECT_EQ(ids.error().code(), StatusCode::RESOURCE_EXHAUSTED);
+  EXPECT_EQ(lookup.point_keys, (std::vector<std::string>{"live", "error"}));
+}
+
 TEST_F(CollectionTest, Feature_Optimize_Superseded_Index_File_Removed) {
   namespace fs = std::filesystem;
   int doc_count = 1000;
@@ -5490,6 +5804,87 @@ TEST_F(CollectionTest, Feature_MultiQuery_WithOutputFields) {
   ASSERT_TRUE(result.has_value()) << result.error().message();
   EXPECT_GT(result.value().size(), 0u);
   EXPECT_LE(result.value().size(), 5u);
+  for (const auto &doc : *result) {
+    EXPECT_TRUE(doc->has("int32"));
+    EXPECT_TRUE(doc->has("string"));
+    EXPECT_FALSE(doc->has("int64"));
+  }
+
+  mvq.output_fields = {{"*"}};
+  result = collection->query(mvq);
+  ASSERT_TRUE(result.has_value()) << result.error().message();
+  ASSERT_FALSE(result->empty());
+  for (const auto &doc : *result) {
+    EXPECT_TRUE(doc->has("int32"));
+    EXPECT_TRUE(doc->has("string"));
+    EXPECT_TRUE(doc->has("int64"));
+  }
+
+  mvq.output_fields = {{"int32", "missing_field"}};
+  result = collection->query(mvq);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(StatusCode::INVALID_ARGUMENT, result.error().code());
+}
+
+TEST_F(CollectionTest, MultiQueryOmitsEmptySparseVector) {
+  using SparseVector = std::pair<std::vector<uint32_t>, std::vector<float>>;
+  auto schema = make_schema();
+  ASSERT_TRUE(schema.add_field(std::make_shared<FieldSchema>(
+      "dense", DataType::VECTOR_FP32, 2, false,
+      std::make_shared<FlatIndexParams>(MetricType::L2))).ok());
+  ASSERT_TRUE(schema.add_field(std::make_shared<FieldSchema>(
+      "sparse", DataType::SPARSE_VECTOR_FP32, 0, true,
+      std::make_shared<FlatIndexParams>(MetricType::IP))).ok());
+  const std::vector<float> vector{1.0f, 2.0f};
+  const SparseVector sparse{{3}, {4.0f}};
+  SearchQuery single;
+  single.target_.field_name_ = "dense";
+  single.target_.set_vector(std::string(
+      reinterpret_cast<const char *>(vector.data()), sizeof(float) * 2));
+  single.topk_ = 2;
+  single.include_vector_ = true;
+  MultiQuery hybrid;
+  hybrid.topk = 2;
+  hybrid.include_vector = true;
+  hybrid.rerank = reranker::RrfParams{60};
+  hybrid.queries = {{single.target_, 2}, {single.target_, 2}};
+
+  for (bool mmap : {true, false}) {
+    SCOPED_TRACE(mmap);
+    options_.enable_mmap_ = mmap;
+    ASSERT_NO_FATAL_FAILURE(create(schema));
+    std::vector<Doc> docs{make_doc("empty", 0), make_doc("present", 1)};
+    for (auto &doc : docs) doc.set("dense", vector);
+    docs[0].set("sparse", SparseVector{});
+    docs[1].set("sparse", sparse);
+    ASSERT_NO_FATAL_FAILURE(expect_write(collection_->insert(docs), 2));
+
+    for (bool persisted : {false, true}) {
+      SCOPED_TRACE(persisted);
+      if (persisted) ASSERT_TRUE(collection_->flush().ok());
+      auto control = collection_->query(single);
+      ASSERT_TRUE(control.has_value()) << control.error().message();
+      auto result = collection_->query(hybrid);
+      ASSERT_TRUE(result.has_value()) << result.error().message();
+      ASSERT_EQ(result->size(), docs.size());
+      ASSERT_EQ(control->size(), docs.size());
+      for (const auto &doc : *result) {
+        EXPECT_TRUE(doc->has("dense"));
+        EXPECT_TRUE(doc->has("value"));
+        const bool has_sparse = doc->pk() == "present";
+        const auto same_row = std::find_if(
+            control->begin(), control->end(),
+            [&](const Doc::Ptr &row) { return row->pk() == doc->pk(); });
+        ASSERT_NE(same_row, control->end());
+        EXPECT_EQ((*same_row)->has("sparse"), doc->has("sparse"));
+        EXPECT_EQ(has_sparse, doc->has("sparse"));
+        if (has_sparse) EXPECT_EQ(sparse, doc->get_ref<SparseVector>("sparse"));
+      }
+    }
+
+    ASSERT_TRUE(collection_->destroy().ok());
+    collection_.reset();
+  }
 }
 
 TEST_F(CollectionTest, Feature_MultiQuery_CallbackReranker) {
@@ -5573,6 +5968,88 @@ TEST_F(CollectionTest, Feature_MultiQuery_CallbackReranker) {
   for (size_t i = 1; i < result.value().size(); ++i) {
     EXPECT_GE(result.value()[i - 1]->score(), result.value()[i]->score());
   }
+}
+
+TEST_F(CollectionTest, FetchReportsVectorAdmissionFailure) {
+  constexpr uint32_t kDimension = 16384;
+  auto schema = make_schema();
+  auto field = std::make_shared<FieldSchema>(
+      "vector", DataType::VECTOR_FP32, kDimension, false,
+      std::make_shared<FlatIndexParams>(MetricType::L2));
+  ASSERT_TRUE(schema.add_field(field).ok());
+  // mmap keeps index pages outside this pool. Only the owned vector returned
+  // by fetch needs a workspace lease, so the denial is independent of cache.
+  options_.enable_mmap_ = true;
+  ASSERT_NO_FATAL_FAILURE(create(schema));
+  std::vector<Doc> docs{make_doc("doc", 1)};
+  const std::vector<float> vector(kDimension, 1.0f);
+  ASSERT_TRUE(docs[0].set("vector", vector));
+  auto written = collection_->insert(docs);
+  ASSERT_NO_FATAL_FAILURE(expect_write(written, 1));
+
+  auto verify = [&] {
+    auto &pool = ailego::MemoryLimitPool::get_instance();
+    constexpr size_t kSpare = 16384;
+    {
+      ailego::MemoryReservation held;
+      for (size_t attempt = 0; attempt < 8; ++attempt) {
+        const auto available = pool.available();
+        if (available <= kSpare) break;
+        held.add(available - kSpare);
+      }
+      ASSERT_LT(pool.available(), vector.size() * sizeof(float));
+      auto scalar = collection_->fetch({"doc"}, std::nullopt, false);
+      ASSERT_TRUE(scalar.has_value()) << scalar.error().message();
+      ASSERT_NE(nullptr, scalar->at("doc"));
+      auto denied = collection_->fetch({"doc"});
+      ASSERT_FALSE(denied.has_value());
+      EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, denied.error().code());
+    }
+    auto fetched = collection_->fetch({"doc"});
+    ASSERT_TRUE(fetched.has_value()) << fetched.error().message();
+    ASSERT_NE(nullptr, fetched->at("doc"));
+    EXPECT_EQ(vector, fetched->at("doc")->get_ref<std::vector<float>>("vector"));
+  };
+  ASSERT_NO_FATAL_FAILURE(verify());
+  ASSERT_TRUE(collection_->flush().ok());
+  ASSERT_NO_FATAL_FAILURE(verify());
+}
+
+TEST_F(CollectionTest, IteratorRetriesRejectedResultWindow) {
+  options_.enable_mmap_ = false;
+  ASSERT_NO_FATAL_FAILURE(create(make_schema()));
+  std::vector<Doc> docs{make_doc("first", 1), make_doc("second", 2)};
+  auto write = collection_->insert(docs);
+  ASSERT_NO_FATAL_FAILURE(expect_write(write, 2));
+  auto iterator = collection_->create_iterator({});
+  ASSERT_TRUE(iterator.has_value()) << iterator.error().message();
+
+  {
+    auto &allowance = detail::SharedResultMemoryAllowance();
+    const size_t result_limit =
+        ailego::MemoryLimitPool::get_instance().capacity() / 8;
+    const size_t occupied = allowance.active_bytes();
+    ASSERT_GT(result_limit, occupied);
+    detail::ResultMemoryAllowance::Lease held(&allowance);
+    held.add(result_limit - occupied);
+    auto rejected = (*iterator)->next();
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(StatusCode::RESOURCE_EXHAUSTED, rejected.error().code());
+    EXPECT_NE(std::string::npos,
+              rejected.error().message().find("iterator result window"));
+  }
+
+  auto first = (*iterator)->next();
+  ASSERT_TRUE(first.has_value()) << first.error().message();
+  ASSERT_NE(nullptr, *first);
+  EXPECT_EQ("first", (*first)->pk());
+  auto second = (*iterator)->next();
+  ASSERT_TRUE(second.has_value()) << second.error().message();
+  ASSERT_NE(nullptr, *second);
+  EXPECT_EQ("second", (*second)->pk());
+  auto end = (*iterator)->next();
+  ASSERT_TRUE(end.has_value()) << end.error().message();
+  EXPECT_EQ(nullptr, *end);
 }
 
 TEST_F(CollectionTest, Feature_GroupByQuery) {}
@@ -7558,6 +8035,142 @@ TEST_F(CollectionTest, Feature_FtsOptimizeAcceptsGlobalDocIdGaps) {
   ASSERT_EQ(result.value().size(), 10u);
 
   ASSERT_TRUE(col->destroy().ok());
+}
+
+TEST(ArrowExecutionLifetimeTest, ConcurrentCompletionCancellationAndError) {
+  ASSERT_TRUE(arrow::compute::Initialize().ok());
+  arrow::Int64Builder values;
+  ASSERT_TRUE(values.Append(42).ok());
+  auto array = values.Finish().ValueOrDie();
+  auto schema = arrow::schema({arrow::field("key", arrow::int64())});
+  auto table = arrow::Table::Make(schema, {array});
+  std::atomic<bool> correct{true};
+  std::vector<std::thread> workers;
+  for (int worker = 0; worker < 4; ++worker)
+    workers.emplace_back([&] {
+      for (int iteration = 0; iteration < 192; ++iteration) {
+        const bool error = iteration % 3 == 2;
+        arrow::acero::Declaration node{
+            "table_source", arrow::acero::TableSourceNodeOptions{table}};
+        if (error) {
+          node = arrow::acero::Declaration{
+              "source", arrow::acero::SourceNodeOptions{
+                            schema, [] {
+                              return arrow::Future<
+                                  std::optional<arrow::compute::ExecBatch>>::
+                                  MakeFinished(arrow::Status::Invalid(
+                                      "expected source error"));
+                            }}};
+        }
+        zvec::sqlengine::PlanInfo plan(std::move(node), schema);
+        auto result = plan.execute_to_reader();
+        if (!result.has_value()) {
+          correct = false;
+          continue;
+        }
+        auto reader = std::move(result.value());
+        std::shared_ptr<arrow::RecordBatch> batch;
+        auto status = reader->ReadNext(&batch);
+        if (error) {
+          if (status.ok() || status.ToString().find("expected source error") ==
+                                 std::string::npos)
+            correct = false;
+        } else if (!status.ok() || !batch || batch->num_rows() != 1) {
+          correct = false;
+        } else if (iteration % 3 == 0) {
+          if (!reader->ReadNext(&batch).ok() || batch) correct = false;
+        }
+        // Other iterations abandon the reader after its first batch or error.
+      }
+    });
+  for (auto &worker : workers) worker.join();
+  EXPECT_TRUE(correct.load());
+}
+
+TEST_F(CollectionTest, FtsFilterKeepsMergeSchemaAcrossSegmentOptimizations) {
+  for (bool mmap : {false, true}) {
+    auto schema = std::make_shared<CollectionSchema>("fts_filter_merge_schema");
+    schema->set_max_doc_count_per_segment(1000);
+    ASSERT_TRUE(schema
+                    ->add_field(std::make_shared<FieldSchema>(
+                        "key", DataType::INT64, false,
+                        std::make_shared<InvertIndexParams>()))
+                    .ok());
+    ASSERT_TRUE(schema
+                    ->add_field(std::make_shared<FieldSchema>(
+                        "content", DataType::STRING, false,
+                        std::make_shared<FtsIndexParams>()))
+                    .ok());
+    ASSERT_TRUE(schema
+                    ->add_field(std::make_shared<FieldSchema>(
+                        "vec", DataType::VECTOR_FP32, uint32_t{2}, false,
+                        std::make_shared<FlatIndexParams>(
+                            MetricType::IP, QuantizeType::UNDEFINED)))
+                    .ok());
+    auto created = Collection::CreateAndOpen(col_path, *schema,
+                                             CollectionOptions{false, mmap});
+    ASSERT_TRUE(created.has_value()) << created.error().message();
+    auto col = std::move(created.value());
+    for (int batch = 0; batch < 3; ++batch) {
+      std::vector<Doc> docs;
+      for (int i = 0; i < 1000; ++i) {
+        int64_t key = batch * 1000 + i;
+        Doc doc;
+        doc.set_pk(std::to_string(key));
+        doc.set<int64_t>("key", key);
+        doc.set<std::string>("content", "needle shared");
+        doc.set<std::vector<float>>(
+            "vec", {static_cast<float>(key), static_cast<float>(key) + 0.5f});
+        docs.push_back(std::move(doc));
+      }
+      ASSERT_TRUE(col->insert(docs).has_value());
+      ASSERT_TRUE(col->flush().ok());
+    }
+    ASSERT_TRUE(col->close().ok());
+    col.reset();
+    auto opened = Collection::Open(col_path, CollectionOptions{true, mmap});
+    ASSERT_TRUE(opened.has_value()) << opened.error().message();
+    col = std::move(opened.value());
+    for (const std::string filter : {"key >= 500", "key < 1500"}) {
+      SearchQuery query;
+      query.target_.field_name_ = "content";
+      FtsClause fts;
+      fts.query_string_ = "needle";
+      query.target_.clause_ = fts;
+      query.filter_ = filter;
+      query.output_fields_ = std::vector<std::string>{"content"};
+      query.include_vector_ = false;
+      query.topk_ = 4096;
+      auto result = col->query(query);
+      ASSERT_TRUE(result.has_value()) << result.error().message();
+      ASSERT_EQ(result->size(), filter == "key >= 500" ? 2500u : 1500u);
+      for (const auto &doc : *result) {
+        const int key = std::stoi(doc->pk());
+        EXPECT_TRUE(filter == "key >= 500" ? key >= 500 : key < 1500);
+        EXPECT_TRUE(doc->has("content"));
+        EXPECT_FALSE(doc->has("key"));
+        EXPECT_GT(doc->score(), 0);
+      }
+    }
+    SearchQuery scalar;
+    scalar.filter_ = "key >= 500";
+    scalar.topk_ = 8;
+    scalar.include_vector_ = true;
+    scalar.output_fields_ = std::vector<std::string>{"vec"};
+    auto result = col->query(scalar);
+    ASSERT_TRUE(result.has_value()) << result.error().message();
+    ASSERT_EQ(result->size(), 8u);
+    for (const auto &doc : *result) {
+      const auto key = static_cast<float>(std::stoi(doc->pk()));
+      auto vector = doc->get<std::vector<float>>("vec");
+      ASSERT_TRUE(vector.has_value());
+      EXPECT_EQ(*vector, (std::vector<float>{key, key + 0.5f}));
+      EXPECT_FALSE(doc->has("key"));
+    }
+    ASSERT_TRUE(col->close().ok());
+    col.reset();
+    FileHelper::RemoveDirectory(col_path);
+  }
 }
 
 TEST_F(CollectionTest, Feature_NoVectorCollection_FtsReopenWithoutOptimize) {

@@ -273,7 +273,12 @@ int IVFCentroidIndex::search(const void *query, const IndexQueryMeta &qmeta,
   int ret = 0;
 
   if (reformer_) {
-    std::string buffer;
+    ailego::BudgetedStringWorkspace workspace;
+    const size_t stride =
+        std::max<size_t>(qmeta.element_size(), meta_.element_size());
+    if (stride && count > SIZE_MAX / stride) return IndexError_Overflow;
+    workspace.reserve(count * stride);
+    auto &buffer = workspace.value;
     IndexQueryMeta ometa;
     ret = reformer_->transform(query, qmeta, count, &buffer, &ometa);
     if (ret == IndexError_Unsupported || ret == IndexError_NotImplemented) {
@@ -304,52 +309,72 @@ int IVFCentroidIndex::search(const void *query, const IndexQueryMeta &qmeta,
   return 0;
 }
 
-uint32_t IVFCentroidIndex::search_nearest_centroid(const void *query,
-                                                   size_t len) {
+int IVFCentroidIndex::search_nearest_centroid(const void *query, size_t len,
+                                              uint32_t *id) try {
+  if (!query || !id) return IndexError_InvalidArgument;
+  *id = kInvalidID;
   //! Called in building index precedure, so transform the query is needless
   if (len != meta_.element_size()) {
     LOG_ERROR("Invalid query size actual: %zu, expected: %u", len,
               meta_.element_size());
-    return kInvalidID;
+    return IndexError_InvalidArgument;
   }
 
-  thread_local IndexSearcher::Context::Pointer context(
-      searcher_->create_context());
+  auto &context = [&]() -> IndexSearcher::Context::Pointer & {
+    std::lock_guard<std::mutex> lock(contexts_mutex_);
+    auto &slot = contexts_[std::this_thread::get_id()];
+    if (!slot) slot = searcher_->create_context();
+    return slot;
+  }();
+  if (!context) return IndexError_NoMemory;
   context->set_topk(1);
 
   IndexQueryMeta qmeta(meta_.data_type(), meta_.dimension());
   int ret = searcher_->search_impl(query, qmeta, context);
-  if (ret != 0 || context->result().empty()) {
+  if (ret != 0) {
     LOG_ERROR("Failed to search nearest centroid, with ret %d", ret);
-    return kInvalidID;
+    return ret;
   }
 
-  return static_cast<uint32_t>(context->result()[0].key());
+  if (context->result().empty()) return IndexError_Runtime;
+  *id = static_cast<uint32_t>(context->result()[0].key());
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
-uint32_t IVFCentroidIndex::transform_and_search_nearest_centroid(
+int IVFCentroidIndex::transform_and_search_nearest_centroid(
     const void *record, const IndexQueryMeta &rmeta,
-    IndexSearcher::Context::Pointer &ctx) const {
+    IndexSearcher::Context::Pointer &ctx, uint32_t *id) const try {
+  if (!record || !id || !ctx) return IndexError_InvalidArgument;
+  *id = kInvalidID;
   int ret = 0;
   if (reformer_) {
-    std::string buffer;
+    ailego::BudgetedStringWorkspace workspace;
+    workspace.reserve(
+        std::max<size_t>(rmeta.element_size(), meta_.element_size()));
+    auto &buffer = workspace.value;
     IndexQueryMeta ometa;
     ret = reformer_->convert(record, rmeta, &buffer, &ometa);
     if (ret != 0) {
       LOG_ERROR("Failed to transform querys by reformer");
-      return kInvalidID;
+      return ret;
     }
     ret = searcher_->search_impl(buffer.data(), ometa, ctx);
   } else {
     ret = searcher_->search_impl(record, rmeta, ctx);
   }
-  if (ret != 0 || ctx->result().empty()) {
+  if (ret != 0) {
     LOG_ERROR("Failed to search in centroid index for %s",
               IndexError::What(ret));
-    return kInvalidID;
+    return ret;
   }
 
-  return static_cast<uint32_t>(ctx->result()[0].key());
+  if (ctx->result().empty()) return IndexError_Runtime;
+  *id = static_cast<uint32_t>(ctx->result()[0].key());
+  return 0;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 IndexHolder::Pointer IVFCentroidIndex::quantize_holder(
@@ -478,13 +503,27 @@ int IVFCentroidIndex::build_index(
 int IVFCentroidIndex::build(const IndexCluster::CentroidList &centroid_list) {
   index_building_ = true;
   //! Build and dump the index
-  IndexDumper::Pointer dumper = IndexFactory::CreateDumper("MemoryDumper");
+  const bool paged = ailego::MemoryLimitPool::get_instance().capacity() != 0;
+  IndexDumper::Pointer dumper =
+      IndexFactory::CreateDumper(paged ? "FileDumper" : "MemoryDumper");
   if (!dumper) {
     LOG_ERROR("Failed to create MemoryDumper");
     return IndexError_NoExist;
   }
   path_ = IVFUtility::GenerateRandomPath(kTempralPathPrefix);
-  int ret = dumper->create(path_);
+  int ret = 0;
+  if (paged) {
+    std::string prefix;
+    ret = TemporaryBufferStorage::DefaultPrefix("zvec-centroid-index", &prefix);
+    if (ret == 0)
+      ret = TemporaryBufferStorage::CreateEmpty(prefix, &dump_file_);
+    if (ret != 0) return ret;
+    // Reuse our exclusively owned file for the standard serialized format.
+    ret = dump_file_->storage()->close();
+    if (ret != 0) return ret;
+    path_ = dump_file_->path();
+  }
+  ret = dumper->create(path_);
   if (ret != 0) {
     LOG_ERROR("IndexDumper create path %s failed", path_.c_str());
     return ret;
@@ -492,26 +531,34 @@ int IVFCentroidIndex::build(const IndexCluster::CentroidList &centroid_list) {
   ret = this->build_index(centroid_list, dumper);
   ivf_check_error_code(ret);
 
-  auto rope = IndexMemory::Instance()->open(path_);
-  if (!rope) {
-    LOG_ERROR("Open memory path %s failed.", path_.c_str());
-    return ret;
+  if (paged) {
+    ailego::File file;
+    if (!file.open(path_.c_str(), true, false)) return IndexError_OpenFile;
+    size_ = file.size();
+    data_ = nullptr;
+  } else {
+    auto rope = IndexMemory::Instance()->open(path_);
+    if (!rope) {
+      LOG_ERROR("Open memory path %s failed.", path_.c_str());
+      return ret;
+    }
+    if (rope->count() != 1) {
+      LOG_ERROR("Graph Rope block count not equal with 1.");
+      return ret;
+    }
+    (*rope)[0].read(0, &data_, 0);
+    size_ = (*rope)[0].size();
   }
-  if (rope->count() != 1) {
-    LOG_ERROR("Graph Rope block count not equal with 1.");
-    return ret;
-  }
-  (*rope)[0].read(0, &data_, 0);
-  size_ = (*rope)[0].size();
-
   //! Load the index
-  IndexStorage::Pointer container =
-      IndexFactory::CreateStorage("MemoryReadStorage");
+  IndexStorage::Pointer container = IndexFactory::CreateStorage(
+      paged ? "BufferReadStorage" : "MemoryReadStorage");
   if (!container) {
     LOG_ERROR("Failed to create MemoryReadStorage");
     return IndexError_NoExist;
   }
-  ret = container->init(ailego::Params());
+  ailego::Params storage_params;
+  storage_params.set("proxima.buffer.read_storage.warmup_mode", "none");
+  ret = container->init(storage_params);
   ivf_check_with_msg(ret, "Failed to initialize MemoryReadStorage for %s",
                      IndexError::What(ret));
   ret = container->open(path_, false);
@@ -573,6 +620,10 @@ int IVFCentroidIndex::load(const IndexStorage::Pointer &container,
   }
 
   searcher_class_ = meta_.searcher_name();
+  {
+    std::lock_guard<std::mutex> lock(contexts_mutex_);
+    contexts_.clear();
+  }
   params.get(PARAM_IVF_SEARCHER_OPTIMIZER, &searcher_class_);
   params.get(PARAM_IVF_SEARCHER_OPTIMIZER_PARAMS, &searcher_params_);
   searcher_ = IndexFactory::CreateSearcher(searcher_class_);
@@ -635,6 +686,19 @@ IndexTrainer::Pointer IVFCentroidIndex::prepare_trainer(
   IndexBundle::Pointer bundle;
   IndexCluster::Serialize(meta_, level1_centroids, &bundle);
   return std::make_shared<FakeClusterTrainer>(meta_, bundle);
+}
+
+int IVFCentroidIndex::read_dump(size_t offset, void *out, size_t bytes) const {
+  if (offset > size_ || bytes > size_ - offset || (!out && bytes))
+    return IndexError_InvalidArgument;
+  if (!bytes) return 0;
+  if (!dump_file_) {
+    std::memcpy(out, static_cast<const char *>(data_) + offset, bytes);
+    return 0;
+  }
+  ailego::File file;
+  if (!file.open(path_.c_str(), true, false)) return IndexError_OpenFile;
+  return file.read(offset, out, bytes) == bytes ? 0 : IndexError_ReadData;
 }
 
 }  // namespace core

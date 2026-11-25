@@ -18,36 +18,49 @@ from .doc import Doc
 from .schema import CollectionSchema
 
 
-def convert_to_cpp_doc(doc: Doc, collection_schema: CollectionSchema) -> _Doc:
+def convert_to_cpp_doc(
+    doc: Doc, collection_schema: CollectionSchema, *, _memory=None
+) -> _Doc:
     if not doc or not collection_schema:
         return None
 
-    _doc = _Doc()
+    _doc = _memory.new_doc() if _memory is not None else _Doc()
 
     # set pk
     try:
-        _doc.set_pk(doc.id)
-    except TypeError:
+        if _memory is None:
+            _doc.set_pk(doc.id)
+        else:
+            _memory.set_pk(_doc, doc.id)
+    except (TypeError, UnicodeError):
         explain_utf8_conversion_error(doc.id, "Invalid doc: id")
         raise
 
     # set scalar fields
     for k, v in doc.fields.items():
-        field_schema = collection_schema.field(k)
+        native_name = _memory.field_name(k) if _memory is not None else k
+        field_schema = collection_schema.field(native_name)
         if not field_schema:
             raise ValueError(
                 f"Invalid schema: {format_name_for_error(k)} not found in collection schema"
             )
-        _doc.set_any(k, field_schema._get_object(), v)
+        if _memory is None:
+            _doc.set_any(k, field_schema._get_object(), v)
+        else:
+            _memory.set_any(_doc, native_name, field_schema._get_object(), v)
 
     # set vector fields
     for k, v in doc.vectors.items():
-        vector_schema = collection_schema.vector(k)
+        native_name = _memory.field_name(k) if _memory is not None else k
+        vector_schema = collection_schema.vector(native_name)
         if not vector_schema:
             raise ValueError(
                 f"Invalid schema: {format_name_for_error(k)} not found in collection schema"
             )
-        _doc.set_any(k, vector_schema._get_object(), v)
+        if _memory is None:
+            _doc.set_any(k, vector_schema._get_object(), v)
+        else:
+            _memory.set_any(_doc, native_name, vector_schema._get_object(), v)
     return _doc
 
 

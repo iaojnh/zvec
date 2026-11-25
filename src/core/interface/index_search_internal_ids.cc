@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <ailego/pattern/scope_guard.h>
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/interface/index.h>
@@ -24,7 +25,7 @@ namespace zvec::core_interface {
 namespace {
 
 bool RequiresSearchFallback(const BaseIndexQueryParam::Pointer &search_param) {
-  return search_param->refiner_param || search_param->bf_pks ||
+  return search_param->refiner_param || search_param->bf_keys() ||
          search_param->is_linear;
 }
 
@@ -46,7 +47,7 @@ void CopySearchResult(const SearchResult &result, size_t topk,
 
 int Index::search_internal_ids(const VectorData &vector_data,
                                const BaseIndexQueryParam::Pointer &search_param,
-                               int64_t *output_ids, float *output_scores) {
+                               int64_t *output_ids, float *output_scores) try {
   if (!output_ids || !search_param || search_param->topk == 0) {
     return core::IndexError_InvalidArgument;
   }
@@ -60,29 +61,35 @@ int Index::search_internal_ids(const VectorData &vector_data,
   }
 
   const size_t topk = search_param->topk;
-  if (search_param->refiner_param && !search_param->bf_pks &&
+  if (search_param->refiner_param && !search_param->bf_keys() &&
       !search_param->is_linear) {
     const int ret = _search_refine_internal_ids(vector_data, search_param,
                                                 output_ids, output_scores);
     if (ret != core::IndexError_NotImplemented) return ret;
   }
   if (RequiresSearchFallback(search_param)) {
-    thread_local SearchResult result;
+    SearchResult result;
     const int ret = search(vector_data, search_param, &result);
     if (ret != 0) return ret;
     CopySearchResult(result, topk, output_ids, output_scores);
     return 0;
   }
 
-  if (!is_trained_ && train() != 0) {
-    LOG_ERROR("Failed to train index");
-    return core::IndexError_Runtime;
+  if (!is_trained_) {
+    const int ret = train();
+    if (ret != 0) return ret;
   }
-  auto &context = acquire_context();
+  auto &context = acquire_context(true);
+  AILEGO_DEFER([&] { release_context(); });
   if (!context) return core::IndexError_Runtime;
+  AILEGO_DEFER([&] {
+    context->reset();
+    context->reset_filter();
+    context->reset_group_by();
+  });
 
   int ret = _prepare_for_search(vector_data, search_param, context);
-  std::string transformed_query;
+  ailego::BudgetedStringWorkspace transformed_query;
   const void *query = nullptr;
   core::IndexQueryMeta query_meta;
   if (ret == 0) {
@@ -90,13 +97,19 @@ int Index::search_internal_ids(const VectorData &vector_data,
                                &query_meta);
   }
 
-  thread_local std::vector<uint64_t> keys;
+  // The engine writes standard vectors. Their capacity remains admitted
+  // until the caller's ID and score buffers have been filled.
+  ailego::MemoryReservation keys_memory;
+  std::vector<uint64_t> keys;
+  ailego::MemoryReservation scores_memory;
+  std::vector<float> score_buffer;
   std::vector<float> *scores = nullptr;
-  if (output_scores) {
-    thread_local std::vector<float> score_buffer;
-    scores = &score_buffer;
-  }
   if (ret == 0) {
+    ailego::ReserveVectorCapacity(keys, keys_memory, topk);
+    if (output_scores) {
+      ailego::ReserveVectorCapacity(score_buffer, scores_memory, topk);
+      scores = &score_buffer;
+    }
     ret = streamer_->search_candidates_impl(query, query_meta, keys, context,
                                             scores);
   }
@@ -122,8 +135,9 @@ int Index::search_internal_ids(const VectorData &vector_data,
       }
     }
   }
-  context->reset();
   return ret;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int Index::_search_refine_internal_ids(
@@ -150,31 +164,39 @@ int Index::_search_refine_internal_ids(
   const auto *flat =
       dynamic_cast<const core::FlatStreamer<32> *>(reference->streamer_.get());
   if (!flat) return core::IndexError_NotImplemented;
-  if ((!is_trained_ && train() != 0) ||
-      (!reference->is_trained_ && reference->train() != 0)) {
-    return core::IndexError_Runtime;
+  if (!is_trained_) {
+    const int ret = train();
+    if (ret != 0) return ret;
   }
-  auto &context = acquire_context();
+  if (!reference->is_trained_) {
+    const int ret = reference->train();
+    if (ret != 0) return ret;
+  }
+  auto &context = acquire_context(true);
+  AILEGO_DEFER([&] { release_context(); });
   if (!context) return core::IndexError_Runtime;
+  AILEGO_DEFER([&] {
+    context->reset();
+    context->reset_filter();
+    context->reset_group_by();
+  });
   int ret = _prepare_for_search(vector_data, search_param, context);
   if (ret != 0) {
-    context->reset();
     return ret;
   }
   const int coarse_topk = _get_coarse_search_topk(search_param);
   if (coarse_topk < 0) {
-    context->reset();
     return coarse_topk;
   }
   context->set_topk(coarse_topk);
   context->set_fetch_vector(false);
 
-  // Only capacity is retained across calls, never pointers into an index.
-  // This path invokes no user filter/group callbacks and is non-reentrant
-  // within a thread, as is the existing candidate/context scratch.
-  thread_local std::string coarse_query_storage;
-  thread_local std::string reference_query_storage;
-  thread_local std::vector<uint64_t> keys;
+  ailego::BudgetedStringWorkspace coarse_query_storage;
+  ailego::BudgetedStringWorkspace reference_query_storage;
+  ailego::MemoryReservation keys_memory;
+  std::vector<uint64_t> keys;
+  ailego::ReserveVectorCapacity(keys, keys_memory,
+                                static_cast<size_t>(coarse_topk));
   const void *query = nullptr;
   core::IndexQueryMeta query_meta;
   ret = _prepare_dense_query(vector_data, &coarse_query_storage, &query,
@@ -184,10 +206,16 @@ int Index::_search_refine_internal_ids(
         _execute_dense_search(query, query_meta, search_param, context, &keys);
   }
   if (ret == 0) {
-    auto &reference_context = reference->acquire_context();
+    auto &reference_context = reference->acquire_context(true);
+    AILEGO_DEFER([&] { reference->release_context(); });
     if (!reference_context) {
       ret = core::IndexError_Runtime;
     } else {
+      AILEGO_DEFER([&] {
+        reference_context->reset();
+        reference_context->reset_filter();
+        reference_context->reset_group_by();
+      });
       // Pooled Flat contexts may have served a different query/index. The
       // radius is applied to coarse candidates, not the reference metric.
       reference_context->set_fetch_vector(false);
@@ -206,10 +234,10 @@ int Index::_search_refine_internal_ids(
           reference_context->reset();
           std::vector<std::vector<uint64_t>> candidates(1);
           candidates[0].swap(keys);
-          thread_local SearchResult result;
+          AILEGO_DEFER([&] { candidates[0].swap(keys); });
+          SearchResult result;
           ret = reference->_refine_dense_candidates(vector_data, search_param,
                                                     candidates, &result);
-          candidates[0].swap(keys);
           if (ret == 0) {
             CopySearchResult(result, search_param->topk, output_ids,
                              output_scores);
@@ -219,10 +247,8 @@ int Index::_search_refine_internal_ids(
               vector_data, output_ids, output_scores, search_param->topk);
         }
       }
-      reference_context->reset();
     }
   }
-  context->reset();
   return ret;
 }
 

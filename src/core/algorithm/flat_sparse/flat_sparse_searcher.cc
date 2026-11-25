@@ -104,28 +104,40 @@ int FlatSparseSearcher::search_bf_by_p_keys_impl(
                    qmeta, count, context);
 }
 
+int FlatSparseSearcher::get_sparse_vector(uint64_t key,
+                                          IndexSparseDocument &result) const {
+  if (state_ != STATE_LOADED) return IndexError_NoIndexLoaded;
+  return entity_.decode_sparse_vector(key, result);
+}
+
 int FlatSparseSearcher::get_sparse_vector(
     uint64_t key, uint32_t *sparse_count, std::string *sparse_indices_buffer,
-    std::string *sparse_values_buffer) const {
+    std::string *sparse_values_buffer) const try {
   if (state_ != STATE_LOADED) {
     LOG_ERROR("Failed to get sparse vector, load container first!");
     return IndexError_NoIndexLoaded;
   }
 
-  std::string sparse_data;
+  IndexStorage::MemoryBlock sparse_data;
+  uint32_t sparse_length = 0;
 
-  int ret = entity_.get_sparse_vector(key, &sparse_data);
+  int ret =
+      entity_.get_sparse_vector_ptr_by_key(key, sparse_data, &sparse_length);
   if (ailego_unlikely(ret != 0)) {
     LOG_ERROR("Failed to get sparse vector, key=%zu, ret=%s", (size_t)key,
               IndexError::What(ret));
     return ret;
   }
 
-  SparseUtility::ReverseSparseFormat(sparse_data, sparse_count,
-                                     sparse_indices_buffer,
-                                     sparse_values_buffer, meta_.unit_size());
+  SparseUtility::ReverseSparseFormatToExternal(
+      sparse_data.data(), sparse_count, sparse_indices_buffer,
+      sparse_values_buffer, meta_.unit_size());
 
   return 0;
+} catch (const FlatSparseEntity::ReadError &error) {
+  return error.status;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 FlatSparseSearcher::ContextPointer FlatSparseSearcher::create_context() const {
@@ -155,12 +167,12 @@ FlatSparseSearcher::create_sparse_provider() const {
           entity, meta_, "FlatSparseSearcher"));
 }
 
-int FlatSparseSearcher::do_search(
-    const uint32_t *sparse_count, const uint32_t *sparse_indices,
-    const void *sparse_query, bool with_p_keys,
-    const std::vector<std::vector<uint64_t>> &p_keys,
-    const IndexQueryMeta &qmeta, uint32_t count,
-    ContextPointer &context) const {
+int FlatSparseSearcher::do_search(const uint32_t *sparse_count,
+                                  const uint32_t *sparse_indices,
+                                  const void *sparse_query, bool with_p_keys,
+                                  IndexKeyBatchView p_keys,
+                                  const IndexQueryMeta &qmeta, uint32_t count,
+                                  ContextPointer &context) const {
   if (state_ != STATE_LOADED) {
     LOG_ERROR("Failed to do search, load container first!");
     return IndexError_NoIndexLoaded;

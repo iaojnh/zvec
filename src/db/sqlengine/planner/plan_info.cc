@@ -13,17 +13,755 @@
 // limitations under the License.
 
 #include "plan_info.h"
+#include <algorithm>
+#include <atomic>
+#include <limits>
+#include <mutex>
+#include <arrow/acero/query_context.h>
 #include <arrow/api.h>
+#include <arrow/io/interfaces.h>
+#include <arrow/util/align_util.h>
+#include <arrow/util/async_generator.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/pattern/expected.hpp>
 #include "db/common/error_code.h"
+#include "db/common/global_resource.h"
+#include "db/index/storage/parquet_memory_pool.h"
+#include "db/index/storage/resident_record_batch_reader.h"
 
 namespace zvec::sqlengine {
 
-Result<std::unique_ptr<arrow::RecordBatchReader>>
-PlanInfo::execute_to_reader() {
-  auto res = arrow::acero::DeclarationToReader(plan_);
+namespace {
+struct ReadAheadSourceOptions : arrow::acero::SourceNodeOptions {
+  ReadAheadSourceOptions(
+      std::shared_ptr<arrow::Schema> schema,
+      arrow::AsyncGenerator<std::optional<arrow::compute::ExecBatch>> generator,
+      std::shared_ptr<std::atomic<bool>> stopped,
+      std::shared_ptr<std::atomic<bool>> resident)
+      : SourceNodeOptions(std::move(schema), std::move(generator),
+                          arrow::compute::Ordering::Implicit()),
+        stopped(std::move(stopped)),
+        resident(std::move(resident)) {}
+  std::shared_ptr<std::atomic<bool>> stopped;
+  std::shared_ptr<std::atomic<bool>> resident;
+};
+
+arrow::acero::BackpressureOptions SourceBackpressure(size_t max_queued_bytes) {
+  if (!max_queued_bytes) return {};
+  // Arrow pauses strictly above its watermark. Pause when the byte limit is
+  // reached, before another whole batch can overlap consumer-held buffers and
+  // completed Futures still forwarding earlier batches.
+  const auto resume = std::max<size_t>(1, max_queued_bytes / 2);
+  const auto pause = std::max<size_t>(resume, max_queued_bytes - 1);
+  return {resume, pause};
+}
+
+arrow::Result<arrow::acero::QueryOptions> QueryOptions(arrow::MemoryPool *pool,
+                                                       bool budgeted) {
+  arrow::acero::QueryOptions options;
+  options.memory_pool = pool;
+  if (budgeted) {
+    auto &resources = GlobalResource::Instance();
+    options.custom_cpu_executor = resources.arrow_query_thread_pool();
+    options.custom_io_executor = resources.arrow_io_thread_pool();
+    if (!options.custom_cpu_executor || !options.custom_io_executor)
+      return arrow::Status::OutOfMemory("Managed Arrow executors unavailable");
+  } else {
+    options.custom_cpu_executor = arrow::internal::GetCpuThreadPool();
+  }
+  return options;
+}
+
+// Arrow's generic source queues delivery tasks before the sink can pause it.
+// A ready generator can therefore enqueue its entire scan. Deliver one batch
+// before pulling another and await backpressure without blocking an executor.
+// This bounds source read-ahead, not the size of a batch or a blocking
+// operator.
+class BoundedSource : public arrow::acero::ExecNode {
+ public:
+  using Batch = std::optional<arrow::compute::ExecBatch>;
+  BoundedSource(arrow::acero::ExecPlan *plan,
+                const arrow::acero::SourceNodeOptions &options)
+      : ExecNode(plan, {}, {}, options.output_schema),
+        generator_(options.generator),
+        ordering_(options.ordering) {
+    if (auto *async = dynamic_cast<const AsyncSourceNodeOptions *>(&options))
+      finish_ = async->finish;
+    if (auto *reader = dynamic_cast<const ReadAheadSourceOptions *>(&options)) {
+      reader_stopped_ = reader->stopped;
+      reader_resident_ = reader->resident;
+    }
+  }
+  const char *kind_name() const override {
+    return "ZvecBoundedSource";
+  }
+  const arrow::compute::Ordering &ordering() const override {
+    return ordering_;
+  }
+  arrow::Status InputReceived(ExecNode *, arrow::compute::ExecBatch) override {
+    return arrow::Status::Invalid("Source has no inputs");
+  }
+  arrow::Status InputFinished(ExecNode *, int) override {
+    return arrow::Status::Invalid("Source has no inputs");
+  }
+  arrow::Status StartProducing() override {
+    ARROW_ASSIGN_OR_RAISE(
+        auto done, plan_->query_context()->BeginExternalTask("zvec source"));
+    if (!done.is_valid()) return arrow::Status::OK();
+    arrow::CallbackOptions options;
+    options.executor = plan_->query_context()->executor();
+    options.should_schedule = arrow::ShouldSchedule::IfDifferentExecutor;
+    arrow::Loop([this, options]() -> arrow::Future<arrow::ControlFlow<int>> {
+      if (stopped()) return finish_deliveries();
+      return pull().Then([this](const Batch &batch) { return consume(batch); },
+                         [this](const arrow::Status &error)
+                             -> arrow::Future<arrow::ControlFlow<int>> {
+                           return fail_deliveries(error);
+                         },
+                         options);
+    }).AddCallback([this, done](const arrow::Result<int> &result) mutable {
+      // A failed delivery can end the loop while the next read is in flight.
+      // Await both local work and nested plans before reporting completion.
+      if (reader_stopped_)
+        reader_stopped_->store(true, std::memory_order_release);
+      finish_work().AddCallback(
+          [this, done, status = result.status(),
+           count = result.ok() ? *result : 0](
+              const arrow::Status &local_cleanup) mutable {
+            if (status.ok()) status = local_cleanup;
+            auto finished =
+                finish_ ? finish_() : arrow::Future<>::MakeFinished();
+            finished.AddCallback(
+                [this, done, status,
+                 count](const arrow::Status &nested_cleanup) mutable {
+                  generator_ = {};
+                  finish_ = {};
+                  if (status.ok()) status = nested_cleanup;
+                  if (status.ok()) status = output_->InputFinished(this, count);
+                  done.MarkFinished(status);
+                });
+          });
+    });
+    return arrow::Status::OK();
+  }
+  void PauseProducing(ExecNode *, int32_t counter) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (counter <= counter_ || stopped_) return;
+    counter_ = counter;
+    if (resume_.is_finished()) resume_ = arrow::Future<>::Make();
+  }
+  void ResumeProducing(ExecNode *, int32_t counter) override {
+    arrow::Future<> wake;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (counter <= counter_) return;
+      counter_ = counter;
+      wake = resume_;
+      resume_ = arrow::Future<>::MakeFinished();
+    }
+    if (!wake.is_finished()) wake.MarkFinished();
+  }
+
+ protected:
+  arrow::Status StopProducingImpl() override {
+    arrow::Future<> wake;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopped_ = true;
+      if (reader_stopped_)
+        reader_stopped_->store(true, std::memory_order_release);
+      wake = resume_;
+      resume_ = arrow::Future<>::MakeFinished();
+    }
+    if (!wake.is_finished()) wake.MarkFinished();
+    return arrow::Status::OK();
+  }
+
+ private:
+  bool stopped() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return stopped_;
+  }
+  arrow::Future<Batch> pull() try {
+    if (prefetched_.is_valid()) {
+      auto ready = std::move(prefetched_);
+      prefetched_ = {};
+      return ready;
+    }
+    return generator_();
+  } catch (const std::bad_alloc &) {
+    return arrow::Status::OutOfMemory("Source allocation failed");
+  } catch (const std::exception &error) {
+    return arrow::Status::ExecutionError(error.what());
+  }
+  arrow::Future<arrow::ControlFlow<int>> consume(const Batch &next) try {
+    if (!next || stopped()) return finish_deliveries();
+    const bool legacy = plan_->query_context()->options().use_legacy_batching;
+    if (!legacy && parallel_batch(*next)) {
+      if (!deliveries_.empty() &&
+          (delivery_bytes_ >= delivery_window_bytes_ ||
+           next_delivery_bytes_ > delivery_window_bytes_ - delivery_bytes_)) {
+        return drain_deliveries().Then(
+            [this, next]() { return consume(next); });
+      }
+      return queue_delivery(*next);
+    }
+    if (!deliveries_.empty()) {
+      return drain_deliveries().Then([this, next]() { return consume(next); });
+    }
+    int64_t offset = 0;
+    do {
+      const int64_t size =
+          legacy ? next->length
+                 : std::min<int64_t>(next->length - offset,
+                                     arrow::acero::ExecPlan::kMaxBatchSize);
+      ARROW_RETURN_NOT_OK(deliver(next->Slice(offset, size), count_++));
+      offset += size;
+    } while (offset < next->length && !stopped());
+    return await_resume();
+  } catch (const std::bad_alloc &) {
+    return fail_deliveries(
+        arrow::Status::OutOfMemory("Source delivery allocation failed"));
+  } catch (const std::exception &error) {
+    return fail_deliveries(arrow::Status::ExecutionError(error.what()));
+  }
+  arrow::Future<arrow::ControlFlow<int>> await_resume() {
+    arrow::Future<> resume;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      resume = resume_;
+    }
+    return resume.Then(
+        []() -> arrow::ControlFlow<int> { return arrow::Continue(); });
+  }
+  arrow::Future<> drain_deliveries() {
+    auto finished = arrow::AllFinished(deliveries_);
+    deliveries_.clear();
+    delivery_bytes_ = 0;
+    return finished;
+  }
+  arrow::Future<arrow::ControlFlow<int>> finish_deliveries() {
+    return finish_work().Then(
+        [this]() -> arrow::ControlFlow<int> { return arrow::Break(count_); });
+  }
+  arrow::Future<> finish_work() {
+    auto deliveries = drain_deliveries();
+    if (!prefetched_.is_valid()) return deliveries;
+    auto read = std::move(prefetched_);
+    prefetched_ = {};
+    // Cancellation must await even an unused read, without surfacing a read
+    // error from a batch that the consumer never requested.
+    auto stopped_read =
+        read.Then([](const Batch &) {}, [](const arrow::Status &) {});
+    return arrow::AllFinished({deliveries, stopped_read});
+  }
+  arrow::Future<arrow::ControlFlow<int>> fail_deliveries(
+      const arrow::Status &error) {
+    return finish_work().Then(
+        [error]() -> arrow::Future<arrow::ControlFlow<int>> { return error; },
+        [error](const arrow::Status &)
+            -> arrow::Future<arrow::ControlFlow<int>> { return error; });
+  }
+  bool parallel_batch(const arrow::compute::ExecBatch &batch) {
+    // Publish a cold batch through the consumer before starting another cold
+    // read. Only ready batches use the parallel delivery window.
+    if (reader_resident_ && !reader_resident_->load(std::memory_order_acquire))
+      return false;
+    // Ready managed batches can use a bounded delivery window. Under pressure
+    // retain inline delivery; the shared allocator still governs every buffer.
+    if (plan_->query_context()->memory_pool() !=
+            detail::GetParquetQueryMemoryPool().get() ||
+        plan_->query_context()->executor()->GetCapacity() <= 1 ||
+        batch.length <= 0 ||
+        batch.length > arrow::acero::ExecPlan::kMaxBatchSize ||
+        batch.values.size() > 4)
+      return false;
+    size_t bytes = 0;
+    std::array<const arrow::ArrayData *, 8> pending{};
+    size_t count = 0, visited = 0;
+    for (const auto &value : batch.values) {
+      if (!value.is_array()) return false;
+      pending[count++] = value.array().get();
+    }
+    while (count) {
+      const auto &array = *pending[--count];
+      if (++visited > pending.size() || array.dictionary ||
+          array.buffers.size() > 3 ||
+          (!array.child_data.empty() && array.type->id() != arrow::Type::LIST))
+        return false;
+      for (const auto &buffer : array.buffers) {
+        if (!buffer) continue;
+        const auto size = static_cast<size_t>(buffer->size());
+        if (size > std::numeric_limits<size_t>::max() - bytes) return false;
+        bytes += size;
+      }
+      for (const auto &child : array.child_data) {
+        if (!child || count == pending.size()) return false;
+        pending[count++] = child.get();
+      }
+    }
+    // Tiny fixed-width batches cost less to deliver inline than to schedule.
+    // Small-row batches of large strings still have enough work to overlap.
+    if (batch.length < 1024 && bytes < 64 * 1024) return false;
+    const size_t available =
+        ailego::MemoryLimitPool::get_instance().prefetch_available();
+    if (!visited || !available || bytes > available / 2) return false;
+    // Count the complete backing conservatively, but bound the sum of queued
+    // batches instead of assuming 64 equally large backings. A large resident
+    // slice can then use a smaller window without losing all parallelism.
+    next_delivery_bytes_ = bytes;
+    delivery_window_bytes_ = available / 2;
+    if (!delivery_metadata_) {
+      try {
+        auto metadata = std::make_shared<ailego::MemoryReservation>();
+        // Futures, task captures and <=4 primitive Datum references per slot.
+        metadata->add_array(kMaxDeliveries, 2048);
+        deliveries_.reserve(kMaxDeliveries);
+        delivery_metadata_ = std::move(metadata);
+      } catch (const std::bad_alloc &) {
+        return false;  // Optional parallel delivery; retain serial fallback.
+      }
+    }
+    return true;
+  }
+  arrow::Future<arrow::ControlFlow<int>> queue_delivery(
+      const arrow::compute::ExecBatch &batch) {
+    auto done = arrow::Future<>::Make();
+    deliveries_.push_back(done);
+    delivery_bytes_ += next_delivery_bytes_;
+    const int index = count_++;
+    auto submitted = arrow::Status::OK();
+    try {
+      submitted = plan_->query_context()->executor()->Spawn(
+          [this, metadata = delivery_metadata_,
+           owned = arrow::compute::ExecBatch(batch), index, done]() mutable {
+            auto status = arrow::Status::OK();
+            try {
+              status = deliver(std::move(owned), index);
+            } catch (const std::bad_alloc &) {
+              status = arrow::Status::OutOfMemory("Source delivery allocation");
+            } catch (const std::exception &error) {
+              status = arrow::Status::ExecutionError(error.what());
+            }
+            owned.values.clear();
+            metadata.reset();
+            done.MarkFinished(status);
+          });
+    } catch (const std::bad_alloc &) {
+      submitted = arrow::Status::OutOfMemory("Source task allocation");
+    }
+    if (!submitted.ok()) done.MarkFinished(submitted);
+    if (!submitted.ok() || deliveries_.size() == kMaxDeliveries ||
+        delivery_bytes_ >= delivery_window_bytes_) {
+      // Overlap the next bounded reader group with this delivery window.
+      // At most one read Future exists, and shutdown always awaits it.
+      if (submitted.ok() && !stopped()) prefetched_ = pull();
+      return drain_deliveries().Then([this]() { return await_resume(); });
+    }
+    // Observe sink backpressure after every enqueue, not just a full window.
+    return await_resume();
+  }
+  arrow::Status deliver(arrow::compute::ExecBatch batch, int index) {
+    const auto handling =
+        plan_->query_context()->options().unaligned_buffer_handling.value_or(
+            arrow::acero::GetDefaultUnalignedBufferHandling());
+    for (auto &value : batch.values) {
+      if (!value.is_array() ||
+          handling == arrow::acero::UnalignedBufferHandling::kIgnore)
+        continue;
+      if (arrow::util::CheckAlignment(*value.array(),
+                                      arrow::util::kValueAlignment))
+        continue;
+      if (handling == arrow::acero::UnalignedBufferHandling::kError)
+        return arrow::Status::Invalid("Unaligned source buffer");
+      if (handling == arrow::acero::UnalignedBufferHandling::kReallocate) {
+        ARROW_ASSIGN_OR_RAISE(value,
+                              arrow::util::EnsureAlignment(
+                                  value.array(), arrow::util::kValueAlignment,
+                                  plan_->query_context()->memory_pool()));
+      } else
+        LOG_WARN("Unaligned source buffer");
+    }
+    if (!ordering_.is_unordered()) batch.index = index;
+    return output_->InputReceived(this, std::move(batch));
+  }
+  static constexpr size_t kMaxDeliveries = 64;
+  size_t delivery_bytes_{0};
+  size_t next_delivery_bytes_{0};
+  size_t delivery_window_bytes_{0};
+  arrow::Future<Batch> prefetched_;
+  std::vector<arrow::Future<>> deliveries_;
+  std::shared_ptr<ailego::MemoryReservation> delivery_metadata_;
+  arrow::AsyncGenerator<Batch> generator_;
+  std::function<arrow::Future<>()> finish_;
+  arrow::compute::Ordering ordering_;
+  std::mutex mutex_;
+  bool stopped_{false};
+  std::shared_ptr<std::atomic<bool>> reader_stopped_;
+  std::shared_ptr<std::atomic<bool>> reader_resident_;
+  int32_t counter_{0};
+  int count_{0};
+  arrow::Future<> resume_ = arrow::Future<>::MakeFinished();
+};
+
+arrow::Result<arrow::acero::Declaration> bound_sources(
+    arrow::acero::Declaration plan,
+    arrow::internal::Executor *managed_io = nullptr) {
+  static const auto registered =
+      arrow::acero::default_exec_factory_registry()->AddFactory(
+          "zvec_bounded_source",
+          [](arrow::acero::ExecPlan *exec,
+             std::vector<arrow::acero::ExecNode *> inputs,
+             const arrow::acero::ExecNodeOptions &options)
+              -> arrow::Result<arrow::acero::ExecNode *> {
+            const auto *source =
+                dynamic_cast<const arrow::acero::SourceNodeOptions *>(&options);
+            if (!inputs.empty() || !source || !source->generator ||
+                !source->output_schema)
+              return arrow::Status::Invalid("Invalid bounded source options");
+            return exec->EmplaceNode<BoundedSource>(exec, *source);
+          });
+  ARROW_RETURN_NOT_OK(registered);
+  if (plan.factory_name == "record_batch_reader_source") {
+    auto *options =
+        dynamic_cast<arrow::acero::RecordBatchReaderSourceNodeOptions *>(
+            plan.options.get());
+    if (!options || !options->reader)
+      return arrow::Status::Invalid("Missing source reader");
+    auto reader = options->reader;
+    auto *executor = managed_io ? managed_io : options->io_executor;
+    if (!executor) executor = arrow::io::default_io_context().executor();
+    struct ReadAhead {
+      std::shared_ptr<arrow::RecordBatchReader> reader;
+      std::vector<std::shared_ptr<arrow::RecordBatch>> ready;
+      std::shared_ptr<ailego::MemoryReservation> metadata;
+      size_t next{0};
+      bool finished{false};
+      arrow::Status error;
+      std::atomic<bool> stopped{false};
+      std::atomic<bool> resident{false};
+    };
+    auto input = std::make_shared<ReadAhead>();
+    input->reader = reader;
+    auto reader_stopped =
+        std::shared_ptr<std::atomic<bool>>(input, &input->stopped);
+    auto reader_resident =
+        std::shared_ptr<std::atomic<bool>>(input, &input->resident);
+    const bool managed =
+        managed_io &&
+        GlobalResource::Instance().arrow_query_thread_pool()->GetCapacity() > 1;
+    arrow::AsyncGenerator<BoundedSource::Batch> generator =
+        [input, executor, managed, reader_stopped,
+         reader_resident]() -> arrow::Future<BoundedSource::Batch> {
+      // The generator is pulled serially. Publishing the I/O Future also
+      // publishes this bounded queue before its next CPU-side pull.
+      if (reader_stopped->load(std::memory_order_acquire))
+        return BoundedSource::Batch{};
+      if (input->next < input->ready.size()) {
+        auto batch = std::move(input->ready[input->next++]);
+        reader_resident->store(true, std::memory_order_release);
+        return BoundedSource::Batch{arrow::compute::ExecBatch(*batch)};
+      }
+      input->ready.clear();
+      input->next = 0;
+      if (!input->error.ok()) return input->error;
+      if (input->finished) return BoundedSource::Batch{};
+      auto future = executor->Submit(
+          [input, managed, reader_stopped,
+           reader_resident]() -> arrow::Result<BoundedSource::Batch> {
+            try {
+              if (reader_stopped->load(std::memory_order_acquire))
+                return BoundedSource::Batch{};
+              std::shared_ptr<arrow::RecordBatch> batch;
+              bool resident = false;
+              if (managed) {
+                ARROW_ASSIGN_OR_RAISE(
+                    resident, zvec::ReadNextResident(*input->reader, &batch));
+              }
+              if (!resident)
+                ARROW_RETURN_NOT_OK(input->reader->ReadNext(&batch));
+              reader_resident->store(resident, std::memory_order_release);
+              if (!batch) return BoundedSource::Batch{};
+              const auto can_prepare = [](const arrow::RecordBatch &value) {
+                if (value.num_rows() <= 0 || value.num_columns() > 4)
+                  return false;
+                size_t bytes = 0;
+                for (const auto &array : value.columns()) {
+                  if (array->data()->dictionary ||
+                      !array->data()->child_data.empty())
+                    return false;
+                  for (const auto &buffer : array->data()->buffers) {
+                    if (!buffer) continue;
+                    const auto size = static_cast<size_t>(buffer->size());
+                    if (size > std::numeric_limits<size_t>::max() - bytes)
+                      return false;
+                    bytes += size;
+                  }
+                }
+                return bytes >= 64 * 1024 &&
+                       bytes <= ailego::MemoryLimitPool::get_instance()
+                                        .prefetch_available() /
+                                    64;
+              };
+              if (managed && resident && can_prepare(*batch) &&
+                  !reader_stopped->load(std::memory_order_acquire)) {
+                try {
+                  if (!input->metadata) {
+                    auto metadata =
+                        std::make_shared<ailego::MemoryReservation>();
+                    metadata->add_array(16, 2048);
+                    input->ready.reserve(15);
+                    input->metadata = std::move(metadata);
+                  }
+                  // Prepare only already decoded batches. A cold miss must
+                  // return the first batch promptly, rather than decoding a
+                  // whole group before the consumer can receive or cancel it.
+                  // Every new view still requires shared budget admission.
+                  for (int i = 0; i < 15; ++i) {
+                    if (reader_stopped->load(std::memory_order_acquire) ||
+                        !can_prepare(*batch))
+                      break;
+                    std::shared_ptr<arrow::RecordBatch> next;
+                    auto ready = zvec::ReadNextResident(*input->reader, &next);
+                    if (!ready.ok()) {
+                      input->error = ready.status();
+                      break;
+                    }
+                    if (!*ready) break;
+                    if (!next) {
+                      input->finished = true;
+                      break;
+                    }
+                    const bool keep_preparing = can_prepare(*next);
+                    input->ready.push_back(std::move(next));
+                    if (!keep_preparing) break;
+                  }
+                } catch (const std::bad_alloc &) {
+                  // Failure before read-ahead admission leaves the first batch
+                  // valid and uses ordinary one-batch pulls on the next
+                  // request.
+                  if (input->metadata)
+                    input->error =
+                        arrow::Status::OutOfMemory("Source read-ahead");
+                }
+              }
+              return BoundedSource::Batch{arrow::compute::ExecBatch(*batch)};
+            } catch (const std::bad_alloc &) {
+              return arrow::Status::OutOfMemory(
+                  "Source reader allocation failed");
+            } catch (const std::exception &error) {
+              return arrow::Status::ExecutionError(error.what());
+            }
+          });
+      if (!future.ok()) return future.status();
+      return std::move(*future);
+    };
+    if (managed) {
+      plan.options = std::make_shared<ReadAheadSourceOptions>(
+          reader->schema(), std::move(generator), std::move(reader_stopped),
+          std::move(reader_resident));
+    } else {
+      plan.options = std::make_shared<arrow::acero::SourceNodeOptions>(
+          reader->schema(), std::move(generator),
+          arrow::compute::Ordering::Implicit());
+    }
+    plan.factory_name = "source";
+  }
+  if (plan.factory_name == "source") plan.factory_name = "zvec_bounded_source";
+  for (auto &input : plan.inputs) {
+    if (auto *child = std::get_if<arrow::acero::Declaration>(&input)) {
+      ARROW_ASSIGN_OR_RAISE(*child, bound_sources(*child, managed_io));
+    }
+  }
+  return plan;
+}
+
+class AsyncPlanStream {
+ public:
+  using Batch = std::optional<arrow::compute::ExecBatch>;
+  ~AsyncPlanStream() {
+    if (plan && started && !plan->finished().is_finished()) {
+      plan->StopProducing();
+      // Destruction can run on the sole CPU worker: never wait here for tasks
+      // queued on that worker. Keep the plan alive until cancellation finishes.
+      plan->finished().AddCallback([keep = plan](const arrow::Status &) {});
+    }
+  }
+  std::shared_ptr<arrow::acero::ExecPlan> plan;
+  arrow::AsyncGenerator<Batch> generator;
+  bool started{false};
+};
+
+bool has_async_source(const arrow::acero::Declaration &plan) {
+  if (dynamic_cast<const AsyncSourceNodeOptions *>(plan.options.get()))
+    return true;
+  for (const auto &input : plan.inputs) {
+    if (auto *child = std::get_if<arrow::acero::Declaration>(&input)) {
+      if (has_async_source(*child)) return true;
+    }
+  }
+  return false;
+}
+
+// DeclarationToReader's sink has no backpressure in our Arrow version. Use an
+// explicit sink for potentially unbounded scans. This limits queued output, not
+// an individual batch, in-flight I/O, or memory held by upstream operators.
+class BoundedPlanReader : public arrow::RecordBatchReader {
+ public:
+  static arrow::Result<std::unique_ptr<arrow::RecordBatchReader>> Make(
+      const arrow::acero::Declaration &declaration, size_t max_queued_bytes,
+      arrow::MemoryPool *pool, bool budgeted) {
+    ARROW_ASSIGN_OR_RAISE(auto options, QueryOptions(pool, budgeted));
+    arrow::compute::ExecContext context(pool, options.custom_cpu_executor);
+    ARROW_ASSIGN_OR_RAISE(auto plan,
+                          arrow::acero::ExecPlan::Make(options, context));
+    ARROW_ASSIGN_OR_RAISE(
+        auto source, bound_sources(declaration, options.custom_io_executor));
+    arrow::AsyncGenerator<std::optional<arrow::compute::ExecBatch>> generator;
+    std::shared_ptr<arrow::Schema> schema;
+    auto with_sink = arrow::acero::Declaration::Sequence(
+        {source,
+         {"sink",
+          arrow::acero::SinkNodeOptions{
+              &generator, &schema, SourceBackpressure(max_queued_bytes)}}});
+    ARROW_RETURN_NOT_OK(with_sink.AddToPlan(plan.get()));
+    ARROW_RETURN_NOT_OK(plan->Validate());
+    auto reader =
+        arrow::acero::MakeGeneratorReader(schema, std::move(generator), pool);
+    auto result = std::make_unique<BoundedPlanReader>(plan, std::move(reader));
+    plan->StartProducing();
+    result->started_ = true;
+    return result;
+  }
+
+  BoundedPlanReader(std::shared_ptr<arrow::acero::ExecPlan> plan,
+                    std::shared_ptr<arrow::RecordBatchReader> reader)
+      : plan_(std::move(plan)),
+        reader_(std::move(reader)),
+        schema_(reader_->schema()) {}
+
+  ~BoundedPlanReader() override {
+    if (started_) static_cast<void>(Close());
+  }
+
+  std::shared_ptr<arrow::Schema> schema() const override {
+    return schema_;
+  }
+
+  arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override {
+    if (!reader_) return arrow::Status::Invalid("Document ID reader is closed");
+    auto status = reader_->ReadNext(batch);
+    if (!status.ok()) {
+      static_cast<void>(Close());
+      return status;
+    }
+    if (!*batch) return plan_->finished().status();
+    return status;
+  }
+
+  arrow::Status Close() override {
+    if (!reader_) return arrow::Status::OK();
+    plan_->StopProducing();
+    auto status = plan_->finished().status();
+    // Release queued batches only after upstream tasks have stopped.
+    reader_.reset();
+    // An explicit early close is successful cancellation, not a query error.
+    return status.IsCancelled() ? arrow::Status::OK() : status;
+  }
+
+ private:
+  std::shared_ptr<arrow::acero::ExecPlan> plan_;
+  std::shared_ptr<arrow::RecordBatchReader> reader_;
+  std::shared_ptr<arrow::Schema> schema_;
+  bool started_{false};
+};
+}  // namespace
+
+Result<PlanStream> PlanInfo::execute_to_generator(size_t max_queued_bytes) {
+  auto make = [&]() -> arrow::Result<PlanStream> {
+    auto stream = std::make_shared<AsyncPlanStream>();
+    auto *pool = budgeted_ ? detail::GetParquetQueryMemoryPool().get()
+                           : arrow::default_memory_pool();
+    ARROW_ASSIGN_OR_RAISE(auto options, QueryOptions(pool, budgeted_));
+    ARROW_ASSIGN_OR_RAISE(auto source,
+                          bound_sources(plan_, options.custom_io_executor));
+    arrow::compute::ExecContext context(pool, options.custom_cpu_executor);
+    ARROW_ASSIGN_OR_RAISE(stream->plan,
+                          arrow::acero::ExecPlan::Make(options, context));
+    auto with_sink = arrow::acero::Declaration::Sequence(
+        {source,
+         {"sink", arrow::acero::SinkNodeOptions{
+                      &stream->generator, nullptr,
+                      SourceBackpressure(max_queued_bytes)}}});
+    ARROW_RETURN_NOT_OK(with_sink.AddToPlan(stream->plan.get()));
+    ARROW_RETURN_NOT_OK(stream->plan->Validate());
+    stream->started = true;
+    stream->plan->StartProducing();
+    PlanStream result;
+    result.generator = [stream] {
+      return stream->generator().Then(
+          [stream](const AsyncPlanStream::Batch &batch)
+              -> arrow::Future<AsyncPlanStream::Batch> {
+            if (batch)
+              return arrow::Future<AsyncPlanStream::Batch>::MakeFinished(batch);
+            return stream->plan->finished().Then(
+                [] { return AsyncPlanStream::Batch{}; });
+          });
+    };
+    result.close = [stream] {
+      stream->plan->StopProducing();
+      return stream->plan->finished();
+    };
+    return result;
+  };
+  auto result = make();
+  if (!result.ok()) {
+    if (result.status().IsOutOfMemory())
+      return tl::make_unexpected(
+          Status(StatusCode::RESOURCE_EXHAUSTED, result.status().ToString()));
+    return tl::make_unexpected(
+        Status::InternalError(result.status().ToString()));
+  }
+  return std::move(*result);
+}
+
+Status PlanInfo::project(const std::vector<std::string> &columns) {
+  if (schema_->field_names() == columns) return Status::OK();
+  std::vector<arrow::compute::Expression> expressions;
+  std::vector<std::shared_ptr<arrow::Field>> fields;
+  for (const auto &name : columns) {
+    auto field = schema_->GetFieldByName(name);
+    if (!field) {
+      return Status::InternalError("Segment output is missing field: ", name);
+    }
+    expressions.push_back(arrow::compute::field_ref(name));
+    fields.push_back(std::move(field));
+  }
+  plan_ = arrow::acero::Declaration{
+      "project",
+      {std::move(plan_)},
+      arrow::acero::ProjectNodeOptions{std::move(expressions), columns}};
+  schema_ = arrow::schema(std::move(fields));
+  return Status::OK();
+}
+
+Result<std::unique_ptr<arrow::RecordBatchReader>> PlanInfo::execute_to_reader(
+    size_t max_queued_bytes) {
+  auto *pool = budgeted_ ? detail::GetParquetQueryMemoryPool().get()
+                         : arrow::default_memory_pool();
+  if (budgeted_ && !max_queued_bytes) max_queued_bytes = 64 * 1024;
+  // An unbudgeted parent reaching its limit must also await cancellation of
+  // nested segment streams. Arrow's generic source cannot run our finalizer.
+  // A zero queue limit retains the existing unbounded sink behavior.
+  auto res =
+      max_queued_bytes || has_async_source(plan_)
+          ? BoundedPlanReader::Make(plan_, max_queued_bytes, pool, budgeted_)
+          : arrow::acero::DeclarationToReader(plan_, true, pool);
   if (!res.ok()) {
+    if (res.status().IsOutOfMemory())
+      return tl::make_unexpected(
+          Status(StatusCode::RESOURCE_EXHAUSTED, res.status().ToString()));
     return tl::make_unexpected(Status::InternalError(
         "execute plan_info failed: ", res.status().ToString()));
   }

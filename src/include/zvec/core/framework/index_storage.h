@@ -483,6 +483,20 @@ class IndexStorage : public IndexModule {
       size_t size{0};
     };
 
+    struct ReadChunk {
+      size_t offset;
+      size_t size;
+    };
+    using ReadChunks = ailego::BudgetedVector<ReadChunk>;
+    // Immutable logical read ranges, relative to this segment. Backends that
+    // support them can cache the same units that the algorithm consumes.
+    virtual bool supports_read_chunks() const {
+      return false;
+    }
+    virtual int set_read_chunks(const ReadChunks &) {
+      return 0;
+    }
+
     //! A bounded-lifetime scatter read. Page-backed implementations may
     //! return independently pinned spans; contiguous backends use fallback.
     struct ScatterBlock {
@@ -767,6 +781,16 @@ class IndexStorage : public IndexModule {
       return IndexError_WriteData;
     }
 
+    //! Best-effort lookahead with bounded-queue backpressure. False leaves the
+    //! range with the caller to retry after consuming an earlier read. Legacy
+    //! backends retain their prefetch behavior and never request a retry.
+    //! Appended so existing method slots remain stable.
+    virtual bool try_prefetch(size_t offset, size_t len,
+                              CachePriority priority = CachePriority::kLow) {
+      prefetch(offset, len, priority);
+      return true;
+    }
+
     class PreparedWrite {
      public:
       virtual ~PreparedWrite() = default;
@@ -862,6 +886,12 @@ class IndexStorage : public IndexModule {
 
   virtual std::string file_path() const {
     return "";
+  }
+
+  //! Allow an algorithm to prepare its immutable working set at load time.
+  //! Kept at the end of the vtable; explicit no-warmup storage remains lazy.
+  virtual bool automatic_warmup_enabled() const {
+    return false;
   }
 
  protected:

@@ -73,13 +73,13 @@ class CombinedVectorColumnIndexer {
    * Each block has its own local ID space, and this filter translates
    * block-level IDs to segment-level IDs before checking the inner filter.
    */
-  class BlockOffsetFilter : public IndexFilter {
+  class BlockOffsetFilter : public CheckedIndexFilter {
    public:
     BlockOffsetFilter(const IndexFilter *inner_filter, uint64_t offset)
         : inner_filter_(inner_filter), offset_(offset) {}
 
-    bool is_filtered(uint64_t id) const override {
-      return inner_filter_->is_filtered(id + offset_);
+    Result<bool> is_filtered_checked(uint64_t id) const override {
+      return inner_filter_->is_filtered_checked(id + offset_);
     }
 
    private:

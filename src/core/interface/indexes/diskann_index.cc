@@ -16,10 +16,13 @@
 #include <mutex>
 #include <string>
 #include <ailego/pattern/defer.h>
+#include <ailego/pattern/scope_guard.h>
 #include <zvec/core/interface/index.h>
 #if DISKANN_SUPPORTED
 #include "algorithm/diskann/diskann_params.h"
+#include "turbo/quantizer/quantizer.h"
 #include "utility/utility_params.h"
+#include "buffered_input.h"
 #include "holder_builder.h"
 #endif
 
@@ -137,11 +140,16 @@ int DiskAnnIndex::create_and_init_streamer(const BaseIndexParam &param) {
 
 int DiskAnnIndex::open(const std::string &file_path,
                        StorageOptions storage_options) try {
+  if (is_open_) return core::IndexError_NoReady;
   if (storage_options.read_only && storage_options.create_new) {
     LOG_ERROR("Cannot create storage for a read-only index");
     return core::IndexError_Runtime;
   }
-  if (is_open_) return core::IndexError_NoReady;
+  if (streamer_needs_init_) {
+    const int ret = storage_options.create_new ? reset_build_pipeline(param_)
+                                               : reinitialize_streamer();
+    if (ret != 0) return ret;
+  }
   core::IndexStorage::Pointer storage;
   ailego::Params storage_params;
   file_path_ = file_path;
@@ -163,7 +171,7 @@ int DiskAnnIndex::open(const std::string &file_path,
     }
     case StorageOptions::StorageType::kBufferPool: {
       storage_params.set(core::BUFFER_READ_STORAGE_WARMUP_MODE,
-                         core::BUFFER_READ_STORAGE_WARMUP_NONE);
+                         core::BUFFER_READ_STORAGE_WARMUP_AUTO);
       storage = core::IndexFactory::CreateStorage("BufferReadStorage");
       if (storage == nullptr) {
         LOG_ERROR("Failed to create BufferReadStorage");
@@ -183,22 +191,36 @@ int DiskAnnIndex::open(const std::string &file_path,
     }
   }
 
-  if (!storage_options.create_new) {
-    int ret = storage->open(file_path_, false);
-    if (ret != 0) {
-      LOG_ERROR("Failed to open storage, path: %s, err: %s", file_path_.c_str(),
-                core::IndexError::What(ret));
-      return ret == core::IndexError_NoMemory ? ret : core::IndexError_Runtime;
-    }
-    if (!streamer_) return core::IndexError_Runtime;
-    ret = streamer_->open(storage);
-    if (ret != 0) {
-      LOG_ERROR("Failed to open streamer, path: %s", file_path_.c_str());
-      return ret == core::IndexError_NoMemory ? ret : core::IndexError_Runtime;
-    }
-    is_trained_ = true;
+  // A fresh builder is created at train/merge time, after open selected the
+  // storage mode. Temporary build pages share the same pool as source pages;
+  // mmap keeps the existing in-memory construction path.
+  proxima_index_params_.set(
+      core::PARAM_DISKANN_BUILDER_BUFFERED_BUILD,
+      storage_options.type == StorageOptions::StorageType::kBufferPool);
+  proxima_index_params_.set(core::PARAM_DISKANN_BUILDER_BUILD_STORAGE_PATH,
+                            file_path_ + ".build");
+  if (storage_options.create_new && turbo_quantizer_) {
+    turbo_quantizer_->set_buffered_training(
+        storage_options.type == StorageOptions::StorageType::kBufferPool);
   }
+
   storage_ = std::move(storage);
+  auto reset_failed_storage = ailego::ScopeGuard::Make([&] {
+    if (!is_open_) storage_.reset();
+  });
+  if (!storage_options.create_new) {
+    const int ret = open_trained_storage(file_path_);
+    if (ret != 0) return ret;
+    is_trained_ = true;
+  } else {
+    if (storage_options.type == StorageOptions::StorageType::kBufferPool) {
+      buffered_input_ = std::make_shared<BufferedInput>(input_vector_meta_,
+                                                        file_path_ + ".input");
+    }
+    build_stage_ = BuildStage::kCollecting;
+    is_trained_ = false;
+  }
+  streamer_needs_init_ = false;
   is_open_ = true;
   return 0;
 } catch (const std::bad_alloc &) {
@@ -206,6 +228,20 @@ int DiskAnnIndex::open(const std::string &file_path,
 }
 
 int DiskAnnIndex::generate_holder() {
+  if (buffered_input_) {
+    const int prepared = buffered_input_->prepare();
+    if (prepared != 0) return prepared;
+    core::IndexHolder::Pointer input = buffered_input_;
+    if (converter_) {
+      const int ret =
+          core::IndexConverter::TrainAndTransform(converter_, input);
+      if (ret != 0) return ret;
+      input = converter_->result();
+      if (!input) return core::IndexError_Runtime;
+    }
+    holder_ = std::move(input);
+    return 0;
+  }
   return BuildMultiPassHolder(param_.data_type, param_.dimension, doc_cache_,
                               converter_, &holder_);
 }
@@ -216,16 +252,19 @@ int DiskAnnIndex::add(const VectorData &vector, uint32_t doc_id) {
     LOG_ERROR("this diskann index is trained or has a pending build");
     return core::IndexError_Runtime;
   }
+  if (!is_open_ || is_read_only_) return core::IndexError_NoReady;
   if (!std::holds_alternative<DenseVector>(vector.vector)) {
     LOG_ERROR("Invalid vector data");
     return core::IndexError_Runtime;
   }
   const DenseVector &dense_vector = std::get<DenseVector>(vector.vector);
+  if (!dense_vector.data) return core::IndexError_InvalidArgument;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (buffered_input_) return buffered_input_->add(doc_id, dense_vector.data);
   std::string out_vector_buffer = std::string(
       static_cast<const char *>(dense_vector.data),
       input_vector_meta_.dimension() * input_vector_meta_.unit_size());
 
-  std::lock_guard<std::mutex> lock(mutex_);
   if (doc_cache_.size() <= doc_id) {
     doc_cache_.resize(doc_id + 1, std::make_pair(kInvalidKey, std::string{}));
   }
@@ -310,16 +349,23 @@ int DiskAnnIndex::dump_and_open() {
   is_trained_ = true;
   converter_.reset();
   holder_.reset();
+  buffered_input_.reset();
   decltype(doc_cache_)().swap(doc_cache_);
   return 0;
 }
 
 int DiskAnnIndex::_dense_fetch(const uint32_t doc_id,
-                               VectorDataBuffer *vector_data_buffer) {
+                               VectorDataBuffer *vector_data_buffer) try {
   if (is_trained_) {
     return Index::_dense_fetch(doc_id, vector_data_buffer);
   } else {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (buffered_input_) {
+      DenseVectorBuffer result;
+      int ret = buffered_input_->fetch(doc_id, &result);
+      if (ret == 0) vector_data_buffer->vector_buffer = std::move(result);
+      return ret;
+    }
     if (doc_id >= doc_cache_.size()) return core::IndexError_OutOfRange;
     if (doc_cache_[doc_id].first == kInvalidKey)
       return core::IndexError_NoExist;
@@ -329,6 +375,8 @@ int DiskAnnIndex::_dense_fetch(const uint32_t doc_id,
     vector_data_buffer->vector_buffer = std::move(dense_vector_buffer);
     return 0;
   }
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int DiskAnnIndex::_prepare_for_search(

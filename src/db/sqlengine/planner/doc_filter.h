@@ -17,6 +17,7 @@
 #include <memory>
 #include <arrow/acero/api.h>
 #include <arrow/chunked_array.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/db/status.h>
 #include "db/index/column/inverted_column/inverted_search_result.h"
 #include "db/index/common/index_filter.h"
@@ -26,7 +27,7 @@
 
 namespace zvec::sqlengine {
 
-class DocFilter : public IndexFilter {
+class DocFilter : public CheckedIndexFilter {
  public:
   using Ptr = std::shared_ptr<DocFilter>;
 
@@ -42,21 +43,24 @@ class DocFilter : public IndexFilter {
 
   Status compute_filter();
 
-  bool is_filtered(uint64_t id) const override;
+  Result<bool> is_filtered_checked(uint64_t id) const override;
 
   //! When invert cardinality <= \p ratio * doc_count, extract the ids and
   //! clear invert_filter_ so the caller drives evaluation by ids instead of
   //! bitmap-checking. Ratio is per-caller (vector vs FTS use different
   //! GlobalConfig knobs) because per-candidate cost differs.
-  std::optional<std::vector<uint64_t>> get_bf_by_keys_and_update(float ratio);
+  //! The caller keeps keys_memory until the returned ids are released. If
+  //! admission fails, keep the bitmap filter and skip this optimization.
+  std::optional<std::vector<uint64_t>> get_bf_by_keys_and_update(
+      float ratio, ailego::MemoryReservation &keys_memory);
 
   bool empty() const;
 
  private:
   friend class zvec::test::ForwardFilterReadTest;
 
-  std::optional<bool> get_forward_bit(uint64_t id) const;
-  std::optional<bool> is_matched_by_forward_filter(uint64_t id) const;
+  Result<bool> get_forward_bit(uint64_t id) const;
+  Result<bool> is_matched_by_forward_filter(uint64_t id) const;
 
  private:
   Segment::Ptr segment_;

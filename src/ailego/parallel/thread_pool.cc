@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/parallel/thread_pool.h>
+#include <zvec/ailego/parallel/worker_memory.h>
 
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <pthread.h>
@@ -88,24 +89,32 @@ uint32_t SafeWorkerCount() noexcept {
 
 }  // namespace
 
+uint32_t ThreadPool::count_for_request(uint32_t size) noexcept {
+  return std::min(std::max(size, 1u), SafeWorkerCount());
+}
+
 ThreadPool::ThreadPool() : ThreadPool(SafeWorkerCount(), false) {}
 
 ThreadPool::ThreadPool(uint32_t size, bool binding) {
-  const uint32_t max_size = SafeWorkerCount();
-  const uint32_t safe_size = std::min(std::max(size, 1u), max_size);
+  const uint32_t safe_size = count_for_request(size);
   if (safe_size != size) {
     LOG_WARN(
         "ThreadPool worker count[%u] is outside supported range[1, %u], "
         "clamped to %u",
-        size, max_size, safe_size);
+        size, SafeWorkerCount(), safe_size);
   }
 
+  // Global DB pools are created before the RSS target is published and have
+  // their own fixed reservation. Later/local pools (including PQ sub-pools)
+  // must admit additional stacks before starting any worker.
+  auto memory = std::make_shared<WorkerMemoryLease>(safe_size);
   try {
     // Avoid vector reallocations after workers have started. If thread creation
     // still fails, stop and join the workers already created before rethrowing.
     pool_.reserve(safe_size);
     for (uint32_t i = 0u; i < safe_size; ++i) {
-      pool_.emplace_back(&ThreadPool::worker, this);
+      pool_.emplace_back([this, memory] { worker(); });
+      memory->worker_started();
     }
     if (binding) {
       this->bind();

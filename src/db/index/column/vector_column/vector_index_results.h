@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <zvec/ailego/buffer/memory_reservation.h>
 #include <zvec/core/framework/index_document.h>
 #include "db/common/typedef.h"
 #include "db/index/column/common/index_results.h"
@@ -99,11 +100,24 @@ class VectorIndexResults : public IndexResults {
   //       reverted_vector_list_(std::move(reverted_vector_list)) {}
   VectorIndexResults(bool is_sparse, core::IndexDocumentList &&doc_list,
                      std::vector<std::string> &&reverted_vector_list,
-                     std::vector<std::string> &&reverted_sparse_values_list)
-      : is_sparse_(is_sparse),
+                     std::vector<std::string> &&reverted_sparse_values_list,
+                     ailego::MemoryReservation reservation = {})
+      : reverted_memory_(std::move(reservation)),
+        is_sparse_(is_sparse),
         docs_(std::move(doc_list)),
         reverted_vector_list_(std::move(reverted_vector_list)),
         reverted_sparse_values_list_(std::move(reverted_sparse_values_list)) {}
+
+  VectorIndexResults(const VectorIndexResults &) = default;
+  VectorIndexResults(VectorIndexResults &&) noexcept = default;
+  VectorIndexResults &operator=(VectorIndexResults rhs) {
+    reverted_memory_.swap(rhs.reverted_memory_);
+    std::swap(is_sparse_, rhs.is_sparse_);
+    docs_.swap(rhs.docs_);
+    reverted_vector_list_.swap(rhs.reverted_vector_list_);
+    reverted_sparse_values_list_.swap(rhs.reverted_sparse_values_list_);
+    return *this;
+  }
 
  public:
   IndexResults::IteratorUPtr create_iterator() override {
@@ -128,6 +142,9 @@ class VectorIndexResults : public IndexResults {
   std::vector<std::string> &reverted_sparse_values_list() {
     return reverted_sparse_values_list_;
   }
+  ailego::MemoryReservation take_reverted_memory() {
+    return std::move(reverted_memory_);
+  }
 
 
  private:
@@ -136,6 +153,7 @@ class VectorIndexResults : public IndexResults {
   }
 
  private:
+  ailego::MemoryReservation reverted_memory_;
   bool is_sparse_;
   core::IndexDocumentList docs_{};
   std::vector<std::string> reverted_vector_list_{};
@@ -144,6 +162,16 @@ class VectorIndexResults : public IndexResults {
 
 class GroupVectorIndexResults : public IndexResults {
  public:
+  GroupVectorIndexResults(const GroupVectorIndexResults &) = default;
+  GroupVectorIndexResults(GroupVectorIndexResults &&) noexcept = default;
+  GroupVectorIndexResults &operator=(GroupVectorIndexResults rhs) {
+    reverted_memory_.swap(rhs.reverted_memory_);
+    groups_.swap(rhs.groups_);
+    reverted_vector_list_.swap(rhs.reverted_vector_list_);
+    reverted_sparse_values_list_.swap(rhs.reverted_sparse_values_list_);
+    std::swap(count_, rhs.count_);
+    return *this;
+  }
   class GroupVectorIterator : public IndexResults::Iterator {
    public:
     GroupVectorIterator(const GroupVectorIndexResults *rs) : rs_(rs) {}
@@ -238,8 +266,10 @@ class GroupVectorIndexResults : public IndexResults {
   GroupVectorIndexResults(
       core::IndexGroupDocumentList &&group_list,
       std::vector<std::vector<std::string>> &&reverted_vector_list,
-      std::vector<std::vector<std::string>> &&reverted_sparse_values_list)
-      : groups_(std::move(group_list)),
+      std::vector<std::vector<std::string>> &&reverted_sparse_values_list,
+      ailego::MemoryReservation reservation = {})
+      : reverted_memory_(std::move(reservation)),
+        groups_(std::move(group_list)),
         reverted_vector_list_(std::move(reverted_vector_list)),
         reverted_sparse_values_list_(std::move(reverted_sparse_values_list)) {
     init_count();
@@ -267,6 +297,9 @@ class GroupVectorIndexResults : public IndexResults {
   std::vector<std::vector<std::string>> &reverted_sparse_values_list() {
     return reverted_sparse_values_list_;
   }
+  ailego::MemoryReservation take_reverted_memory() {
+    return std::move(reverted_memory_);
+  }
 
  private:
   const core::IndexDocument &document(size_t group_index,
@@ -282,6 +315,7 @@ class GroupVectorIndexResults : public IndexResults {
   }
 
  private:
+  ailego::MemoryReservation reverted_memory_;
   core::IndexGroupDocumentList groups_{};
   std::vector<std::vector<std::string>> reverted_vector_list_{};
   std::vector<std::vector<std::string>> reverted_sparse_values_list_{};

@@ -276,7 +276,7 @@ zvec_doc_t *zvec_test_create_doc(uint64_t doc_id,
   size_t field_count = 0;
   zvec_error_code_t ret = zvec_collection_schema_get_all_field_names(
       schema, &field_names, &field_count);
-  if (ret != ZVEC_OK || !field_names) {
+  if (ret != ZVEC_OK) {
     zvec_doc_destroy(doc);
     return NULL;
   }
@@ -575,13 +575,7 @@ zvec_doc_t *zvec_test_create_doc(uint64_t doc_id,
     */
   }
 
-  // Free field names array (individual strings are freed by the API)
-  if (field_names) {
-    for (size_t i = 0; i < field_count; i++) {
-      free((char *)field_names[i]);
-    }
-    free(field_names);
-  }
+  zvec_free(field_names);
 
   return doc;
 }
@@ -605,7 +599,7 @@ zvec_doc_t *zvec_test_create_doc_null(uint64_t doc_id,
   size_t field_count = 0;
   zvec_error_code_t ret = zvec_collection_schema_get_all_field_names(
       schema, &field_names, &field_count);
-  if (ret != ZVEC_OK || !field_names) {
+  if (ret != ZVEC_OK) {
     zvec_doc_destroy(doc);
     return NULL;
   }
@@ -727,25 +721,13 @@ zvec_doc_t *zvec_test_create_doc_null(uint64_t doc_id,
 
     if (err != ZVEC_OK) {
       // Free field names array before returning
-      if (field_names) {
-        for (size_t cleanup_index = 0; cleanup_index < field_count;
-             cleanup_index++) {
-          free((char *)field_names[cleanup_index]);
-        }
-        free(field_names);
-      }
+      zvec_free(field_names);
       zvec_doc_destroy(doc);
       return NULL;
     }
   }
 
-  // Free field names array (individual strings are freed by the API)
-  if (field_names) {
-    for (size_t i = 0; i < field_count; i++) {
-      free((char *)field_names[i]);
-    }
-    free(field_names);
-  }
+  zvec_free(field_names);
 
   return doc;
 }

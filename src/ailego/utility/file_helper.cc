@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <system_error>
 #include <zvec/ailego/utility/file_helper.h>
@@ -57,6 +58,16 @@ namespace ailego {
 namespace {
 
 thread_local std::error_code g_last_fs_error;
+
+struct TemporaryDirectoryState {
+  std::mutex mutex;
+  fs::path path;
+};
+
+TemporaryDirectoryState &TemporaryDirectory() {
+  static TemporaryDirectoryState state;
+  return state;
+}
 
 void ClearFsError() {
   g_last_fs_error.clear();
@@ -332,6 +343,53 @@ bool FileHelper::GetWorkingDirectory(std::string *path) {
   return !path->empty();
 }
 
+bool FileHelper::SetTemporaryDirectory(const std::string &path) {
+  ClearFsError();
+  fs::path resolved;
+  if (!path.empty()) {
+    if (path.find('\0') != std::string::npos) {
+      SetFsError(std::make_error_code(std::errc::invalid_argument));
+      return false;
+    }
+    std::error_code error;
+    resolved = fs::canonical(PathFromUtf8(path), error);
+    if (!error && !fs::is_directory(resolved, error) && !error)
+      error = std::make_error_code(std::errc::not_a_directory);
+    if (error) {
+      SetFsError(error);
+      return false;
+    }
+  }
+  auto &state = TemporaryDirectory();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.path = std::move(resolved);
+  return true;
+}
+
+bool FileHelper::GetTemporaryDirectory(std::string *path) {
+  ClearFsError();
+  if (!path) {
+    SetFsError(std::make_error_code(std::errc::invalid_argument));
+    return false;
+  }
+  fs::path directory;
+  {
+    auto &state = TemporaryDirectory();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    directory = state.path;
+  }
+  std::error_code error;
+  if (directory.empty()) directory = fs::temp_directory_path(error);
+  if (!error && !fs::is_directory(directory, error) && !error)
+    error = std::make_error_code(std::errc::not_a_directory);
+  if (error) {
+    SetFsError(error);
+    return false;
+  }
+  *path = PathToUtf8(directory);
+  return true;
+}
+
 bool FileHelper::GetFileSize(const char *path, size_t *psz) {
   return GetFileSizeImpl(PathFromUtf8(path), psz);
 }
@@ -350,10 +408,25 @@ bool FileHelper::MakePath(const char *path) {
 
 StagedPath::~StagedPath() {
   if (directory_.empty()) return;
+  // File stages can be discarded without allocating even after index OOM.
+#if defined(_WIN32) || defined(_WIN64)
+  (void)::DeleteFileW(native_path_.c_str());
+  if (::RemoveDirectoryW(native_directory_.c_str()) ||
+      ::GetLastError() != ERROR_DIR_NOT_EMPTY) {
+    return;
+  }
+#else
+  (void)::unlink(path_.c_str());
+  if (::rmdir(directory_.c_str()) == 0 ||
+      (errno != ENOTEMPTY && errno != EEXIST)) {
+    return;
+  }
+#endif
+  // An abandoned collection may still own a directory or publication lease.
+  // This path is private and cannot remove a competing or published target.
   try {
     FileHelper::RemoveDirectory(directory_.c_str());
   } catch (...) {
-    // This path is private. Cleanup failure cannot remove a published file.
   }
 }
 
@@ -396,14 +469,20 @@ bool StagedPath::prepare(const std::string &destination) {
     const auto unique = sequence.fetch_add(1, std::memory_order_relaxed);
     auto directory = parent / (".zvec-create-" + std::to_string(stamp) + "-" +
                                std::to_string(unique));
+    auto private_file = directory / "data";
     auto private_directory = FileHelper::PathToUtf8(directory);
-    auto private_path = FileHelper::PathToUtf8(directory / "data");
+    auto private_path = FileHelper::PathToUtf8(private_file);
 #if defined(_WIN32) || defined(_WIN64)
-    std::error_code error;
-    const bool created = fs::create_directory(directory, error);
-    if (!created && error && error != std::errc::file_exists) {
-      SetFsError(error);
-      return false;
+    auto native_directory = directory.native();
+    auto native_path = private_file.native();
+    const bool created =
+        ::CreateDirectoryW(native_directory.c_str(), nullptr) != 0;
+    if (!created) {
+      const DWORD error = GetLastError();
+      if (error != ERROR_ALREADY_EXISTS && error != ERROR_FILE_EXISTS) {
+        SetFsError(std::error_code(error, std::system_category()));
+        return false;
+      }
     }
 #else
     const bool created = ::mkdir(directory.c_str(), S_IRWXU) == 0;
@@ -412,6 +491,10 @@ bool StagedPath::prepare(const std::string &destination) {
     if (created) {
       directory_.swap(private_directory);
       path_.swap(private_path);
+#if defined(_WIN32) || defined(_WIN64)
+      native_directory_.swap(native_directory);
+      native_path_.swap(native_path);
+#endif
       return true;
     }
   }

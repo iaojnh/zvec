@@ -115,6 +115,16 @@ TEST_F(BufferReadStorageTest, SequentialPreservesExistingWarmupBehavior) {
   EXPECT_EQ(payload_, actual);
 }
 
+TEST_F(BufferReadStorageTest, AutoDefersPopulationToTheAlgorithm) {
+  auto storage = create_storage(BUFFER_READ_STORAGE_WARMUP_AUTO);
+  ASSERT_NE(storage, nullptr);
+  ASSERT_EQ(0, storage->open(file_path_, false));
+  EXPECT_TRUE(storage->automatic_warmup_enabled());
+  EXPECT_EQ(0u, ailego::PoolPayloadBudget::get_instance().stats().page_used);
+  auto lazy = create_storage(BUFFER_READ_STORAGE_WARMUP_NONE);
+  EXPECT_FALSE(lazy->automatic_warmup_enabled());
+}
+
 TEST_F(BufferReadStorageTest, ResidentScatterReadReturnsPinnedPageSpans) {
   auto storage = create_storage(BUFFER_READ_STORAGE_WARMUP_SEQUENTIAL);
   ASSERT_NE(storage, nullptr);
@@ -222,6 +232,8 @@ TEST_F(BufferReadStorageTest, PoolWithoutRoomForMetadataFallsBackToBypass) {
 }
 
 TEST_F(BufferReadStorageTest, CachePressureFallsBackToOwnedRead) {
+  constexpr size_t kReadSize = 64;
+  constexpr size_t kResultCharge = 4096;
   auto storage = create_storage(BUFFER_READ_STORAGE_WARMUP_NONE);
   ASSERT_NE(storage, nullptr);
   ASSERT_EQ(0, storage->open(file_path_, false));
@@ -229,15 +241,34 @@ TEST_F(BufferReadStorageTest, CachePressureFallsBackToOwnedRead) {
   ASSERT_NE(segment, nullptr);
 
   auto &pool = ailego::PoolPayloadBudget::get_instance();
-  const size_t external_charge = pool.available() - 4096;
-  ASSERT_GT(external_charge, 0u);
+  ASSERT_GT(pool.available(), kResultCharge);
+  const size_t external_charge = pool.available() - kResultCharge;
   ASSERT_TRUE(pool.try_charge_external(external_charge));
   AILEGO_DEFER([&] { pool.release_external(external_charge); });
 
+  // Leave room for the owned result only. A read-only direct I/O request can
+  // fall back to the buffered descriptor without an extra alignment buffer.
+  ASSERT_EQ(kResultCharge, pool.available());
+  const auto before_read = pool.stats();
   IndexStorage::MemoryBlock block;
-  ASSERT_EQ(64u, segment->read(0, block, 64));
-  EXPECT_EQ(0, std::memcmp(payload_.data(), block.data(), 64));
+  ASSERT_EQ(kReadSize, segment->read(0, block, kReadSize));
+  ASSERT_NE(nullptr, block.data());
+  EXPECT_EQ(0, std::memcmp(payload_.data(), block.data(), kReadSize));
   EXPECT_EQ(IndexStorage::MemoryBlock::MBT_HEAP_SCRATCH, block.type_);
+  const auto after_read = pool.stats();
+  EXPECT_EQ(before_read.page_used, after_read.page_used);
+  EXPECT_EQ(before_read.external_used + kResultCharge, after_read.external_used);
+  EXPECT_EQ(0u, pool.available());
+
+  block.reset();
+  EXPECT_EQ(before_read.external_used, pool.stats().external_used);
+  ASSERT_EQ(kResultCharge, pool.available());
+
+  ASSERT_TRUE(pool.try_charge_external(kResultCharge));
+  AILEGO_DEFER([&] { pool.release_external(kResultCharge); });
+  EXPECT_EQ(0u, segment->read(0, block, kReadSize));
+  EXPECT_EQ(IndexError_NoMemory, segment->read_error());
+  EXPECT_EQ(nullptr, block.data());
 }
 
 TEST_F(BufferReadStorageTest, MemoryBlockKeepsPoolAliveAfterStorageClose) {

@@ -27,7 +27,8 @@ import zvec
 
 @pytest.fixture(scope="module", autouse=True)
 def initialize():
-    zvec.init(memory_limit_mb=512, query_threads=2, optimize_threads=2)
+    # Reuse the configuration selected by earlier modules in this worker.
+    zvec.init()
 
 
 def _schema(kind="flat"):

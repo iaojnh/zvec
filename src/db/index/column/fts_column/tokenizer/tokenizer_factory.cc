@@ -24,8 +24,9 @@
 
 namespace zvec::fts {
 
-Result<TokenizerPipelinePtr> TokenizerFactory::create(
-    const FtsIndexParams &params) {
+namespace {
+
+Result<ailego::JsonObject> ParseTokenizerExtras(const FtsIndexParams &params) {
   // Parse extra_params JSON string into a JsonObject.
   // Empty string is treated as an empty object; malformed JSON fails.
   ailego::JsonObject extra_json;
@@ -43,13 +44,37 @@ Result<TokenizerPipelinePtr> TokenizerFactory::create(
     }
     extra_json = parsed.as_object();
   }
+  return extra_json;
+}
 
+}  // namespace
+
+Status TokenizerFactory::validate(const FtsIndexParams &params) {
+  auto extras = ParseTokenizerExtras(params);
+  if (!extras) return extras.error();
+  auto filters = create_filters(params, *extras);
+  if (!filters) return filters.error();
+  if (params.tokenizer_name == "jieba")
+    return JiebaTokenizer::validate_config(*extras);
   TokenizerPtr tokenizer;
-  auto status = create_tokenizer(params.tokenizer_name, extra_json, &tokenizer);
-  if (!status.ok()) {
-    return tl::make_unexpected(std::move(status));
-  }
+  return create_tokenizer(params.tokenizer_name, *extras, &tokenizer);
+}
 
+Result<TokenizerPipelinePtr> TokenizerFactory::create(
+    const FtsIndexParams &params) {
+  auto extras = ParseTokenizerExtras(params);
+  if (!extras) return tl::make_unexpected(extras.error());
+  auto filters = create_filters(params, *extras);
+  if (!filters) return tl::make_unexpected(filters.error());
+  TokenizerPtr tokenizer;
+  auto status = create_tokenizer(params.tokenizer_name, *extras, &tokenizer);
+  if (!status.ok()) return tl::make_unexpected(std::move(status));
+  return std::make_shared<TokenizerPipeline>(std::move(tokenizer),
+                                             std::move(*filters));
+}
+
+Result<std::vector<TokenFilterPtr>> TokenizerFactory::create_filters(
+    const FtsIndexParams &params, const ailego::JsonObject &extra_json) {
   std::vector<TokenFilterPtr> filters;
   for (const auto &filter_name : params.filters) {
     TokenFilterPtr filter = create_filter(filter_name);
@@ -63,9 +88,7 @@ Result<TokenizerPipelinePtr> TokenizerFactory::create(
     }
     filters.push_back(std::move(filter));
   }
-
-  return std::make_shared<TokenizerPipeline>(std::move(tokenizer),
-                                             std::move(filters));
+  return filters;
 }
 
 std::vector<Token> TokenizerPipeline::process(const std::string &text) const {

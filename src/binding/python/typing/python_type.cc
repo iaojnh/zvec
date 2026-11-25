@@ -187,7 +187,7 @@ Used by the `Status` class to indicate success or failure reason.
       .value("UNKNOWN", StatusCode::UNKNOWN);
 
   // bind status
-  py::class_<Status>(m, "Status", R"pbdoc(
+  py::class_<Status, std::shared_ptr<Status>>(m, "Status", R"pbdoc(
 Represents the outcome of a Zvec operation.
 
 A `Status` object is either OK (success) or carries an error code and message.
