@@ -513,8 +513,8 @@ IndexSearcher::Context::Pointer HnswSparseSearcher::create_context() const {
     LOG_ERROR("Failed to create search context entity");
     return Context::Pointer();
   }
-  HnswSparseContext *ctx =
-      new (std::nothrow) HnswSparseContext(metric_, search_ctx_entity);
+  auto ctx = std::unique_ptr<HnswSparseContext>(
+      new (std::nothrow) HnswSparseContext(metric_, search_ctx_entity));
   if (ailego_unlikely(ctx == nullptr)) {
     LOG_ERROR("Failed to new HnswSparseContext");
     return Context::Pointer();
@@ -531,11 +531,10 @@ IndexSearcher::Context::Pointer HnswSparseSearcher::create_context() const {
   if (ailego_unlikely(ctx->init(HnswSparseContext::kSparseSearcherContext)) !=
       0) {
     LOG_ERROR("Init HnswSparseContext failed");
-    delete ctx;
     return Context::Pointer();
   }
 
-  return Context::Pointer(ctx);
+  return ctx;
 }
 
 IndexSearcher::SparseProvider::Pointer

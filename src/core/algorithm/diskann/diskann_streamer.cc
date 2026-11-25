@@ -533,8 +533,8 @@ IndexSearcher::Context::Pointer DiskAnnStreamer::create_context() const {
     return Context::Pointer();
   }
 
-  DiskAnnContext *ctx = new (std::nothrow)
-      DiskAnnContext(meta_, measure_, search_ctx_entity, data_quantizer_);
+  auto ctx = std::unique_ptr<DiskAnnContext>(new (std::nothrow) DiskAnnContext(
+      meta_, measure_, search_ctx_entity, data_quantizer_));
   if (ctx == nullptr) {
     LOG_ERROR("Failed to allocate DiskAnn Context");
     return Context::Pointer();
@@ -544,7 +544,6 @@ IndexSearcher::Context::Pointer DiskAnnStreamer::create_context() const {
           search_ctx_entity->pq_chunk_num(), meta_.element_size(),
           diskann_indexer_->requires_io_context())) != 0) {
     LOG_ERROR("Init DiskAnn Context failed");
-    delete ctx;
 
     return Context::Pointer();
   }
@@ -552,7 +551,7 @@ IndexSearcher::Context::Pointer DiskAnnStreamer::create_context() const {
   ctx->set_list_size(list_size_);
   ctx->set_magic(magic_);
 
-  return Context::Pointer(ctx);
+  return ctx;
 }
 
 INDEX_FACTORY_REGISTER_STREAMER(DiskAnnStreamer);
