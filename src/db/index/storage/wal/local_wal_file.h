@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <deque>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -62,6 +63,9 @@ class LocalWalFile : public WalFile {
   int append(std::string &&data) override;
   int prepare_for_read() override;
   std::string next() override;
+  Status read_status() const override {
+    return read_status_;
+  }
 
  public:
   int open(const WalOptions &wal_option) override;
@@ -92,6 +96,12 @@ class LocalWalFile : public WalFile {
   std::atomic<uint64_t> docs_count_{0UL};
   WalHeader header_;
 
+  // The persisted length is uint32_t; writing and recovery accept the same
+  // representable payload sizes, including existing documents above 4 MiB.
+  static constexpr size_t kMaxRecordSize =
+      (std::numeric_limits<uint32_t>::max)();
+  Status read_status_;
+  bool append_failed_{false};
   bool opened_{false};
   bool read_only_{false};
 };

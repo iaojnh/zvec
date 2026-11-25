@@ -102,6 +102,7 @@ Status Version::Save(const std::string &path, const Version &version) {
   }
 
   ofs.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
+  ofs.close();
   if (!ofs.good()) {
     LOG_ERROR("Failed to serialize manifest to file: %s", path.c_str());
     return Status::InternalError("Failed to serialize manifest to file");

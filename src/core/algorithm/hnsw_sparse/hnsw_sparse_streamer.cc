@@ -221,6 +221,10 @@ int HnswSparseStreamer::cleanup() {
 
   LOG_INFO("HnswSparseStreamer cleanup");
 
+  return abort_open();
+}
+
+int HnswSparseStreamer::abort_open() {
   meta_.clear();
   metric_.reset();
   stats_.clear();
@@ -375,8 +379,8 @@ IndexStreamer::Context::Pointer HnswSparseStreamer::create_context() const {
     LOG_ERROR("CreateContext clone init failed");
     return Context::Pointer();
   }
-  HnswSparseContext *ctx =
-      new (std::nothrow) HnswSparseContext(metric_, entity);
+  auto ctx = std::unique_ptr<HnswSparseContext>(
+      new (std::nothrow) HnswSparseContext(metric_, entity));
   if (ailego_unlikely(ctx == nullptr)) {
     LOG_ERROR("Failed to new HnswSparseContext");
     return Context::Pointer();
@@ -395,11 +399,10 @@ IndexStreamer::Context::Pointer HnswSparseStreamer::create_context() const {
   if (ailego_unlikely(ctx->init(HnswSparseContext::kSparseStreamerContext)) !=
       0) {
     LOG_ERROR("Init HnswSparseContext failed");
-    delete ctx;
     return Context::Pointer();
   }
 
-  return Context::Pointer(ctx);
+  return ctx;
 }
 
 IndexStreamer::SparseProvider::Pointer

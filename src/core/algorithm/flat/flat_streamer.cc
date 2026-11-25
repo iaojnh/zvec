@@ -163,10 +163,15 @@ int FlatStreamer<BATCH_SIZE>::cleanup() {
     this->close();
   }
 
+  LOG_DEBUG("FlatStreamer cleanup");
+  return abort_open();
+}
+
+template <size_t BATCH_SIZE>
+int FlatStreamer<BATCH_SIZE>::abort_open() {
   entity_.reset();
   quantizer_.reset();
 
-  LOG_DEBUG("FlatStreamer cleanup");
   state_ = STATE_INIT;
   return 0;
 }

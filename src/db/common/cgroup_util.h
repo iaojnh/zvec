@@ -33,7 +33,6 @@
 #include <unistd.h>
 #elif defined(_WIN32) || defined(_WIN64)
 #define PLATFORM_WINDOWS 1
-#include <windows.h>
 #endif
 
 namespace zvec {
@@ -60,7 +59,6 @@ class CgroupUtil {
   // Static member variables to store the computed values
   static int cpu_cores_;
   static uint64_t memory_limit_;
-  static bool initialized_;
 
   // Other member variables for tracking state
   static unsigned long long last_idle_time_;
@@ -74,7 +72,7 @@ class CgroupUtil {
   static void update_cpu_cores();
   static bool read_cpu_cgroup();
   static void update_memory_limit();
-  static bool read_memory_cgroup();
+  static void read_memory_cgroup();
   static void initialize_cpu_stats();
 
 #if defined(PLATFORM_LINUX)

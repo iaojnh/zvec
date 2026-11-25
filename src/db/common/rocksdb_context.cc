@@ -21,6 +21,7 @@
 #include <rocksdb/table.h>
 #include <rocksdb/utilities/checkpoint.h>
 #include <zvec/ailego/logger/logger.h>
+#include "db/common/native_worker_memory.h"
 
 
 namespace zvec {
@@ -242,7 +243,7 @@ Status RocksdbContext::validate_and_set_db_path(const std::string &db_path,
 void RocksdbContext::prepare_options(
     std::shared_ptr<rocksdb::MergeOperator> merge_op) {
   // Increase parallelism with default thread count (typically 16)
-  create_opts_.IncreaseParallelism();
+  create_opts_.IncreaseParallelism(detail::kRocksDbBackgroundThreads);
 
   // Optimize for level-based compaction style with default setting
   create_opts_.OptimizeLevelStyleCompaction();

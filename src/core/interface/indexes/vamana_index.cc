@@ -20,6 +20,10 @@
 
 namespace zvec::core_interface {
 
+BaseIndexParam::Pointer VamanaIndex::get_param() const {
+  return std::make_shared<VamanaIndexParam>(param_);
+}
+
 int VamanaIndex::merge(const std::vector<Index::Pointer> &indexes,
                        const IndexFilter &filter, const MergeOptions &options) {
   int ret = Index::merge(indexes, filter, options);

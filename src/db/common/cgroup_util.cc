@@ -13,33 +13,220 @@
 // limitations under the License.
 
 #include "db/common/cgroup_util.h"
+#include <algorithm>
 #include <charconv>
+#include <iterator>
+#include <limits>
+#include <mutex>
 #include <sstream>
 #include <system_error>
+#include "db/common/cgroup_memory.h"
+
+#if defined(PLATFORM_WINDOWS)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace zvec {
 
 // Static member definitions
 int CgroupUtil::cpu_cores_ = 0;
 uint64_t CgroupUtil::memory_limit_ = 0;
-bool CgroupUtil::initialized_ = false;
 unsigned long long CgroupUtil::last_idle_time_ = 0;
 unsigned long long CgroupUtil::last_total_time_ = 0;
 std::chrono::steady_clock::time_point CgroupUtil::last_cpu_check_;
 
-#define ZVEC_CGROUP_MEMORY_UNLIMITED (9223372036854771712ULL)
+namespace {
+
+bool HasController(const std::string &list, const std::string &name) {
+  std::istringstream stream(list);
+  std::string token;
+  while (std::getline(stream, token, ','))
+    if (token == name) return true;
+  return false;
+}
+
+bool ParseMemoryBytes(const std::string &text, uint64_t *bytes) {
+  std::istringstream stream(text);
+  std::string token, trailing;
+  if (!(stream >> token) || stream >> trailing) return false;
+  const auto parsed =
+      std::from_chars(token.data(), token.data() + token.size(), *bytes);
+  return parsed.ec == std::errc{} && parsed.ptr == token.data() + token.size();
+}
+
+// Kernel paths are absolute. Never let malformed metadata or a cgroup outside
+// the visible namespace escape the mount through a dot component.
+bool ValidCgroupPath(const std::string &path) {
+  if (path.empty() || path.front() != '/' ||
+      path.find('\0') != std::string::npos)
+    return false;
+  std::istringstream stream(path);
+  std::string part;
+  while (std::getline(stream, part, '/'))
+    if (part == "." || part == "..") return false;
+  return path.size() == 1 || path.back() != '/';
+}
+
+std::string DecodeMountPath(const std::string &path) {
+  std::string decoded;
+  for (size_t i = 0; i < path.size(); ++i) {
+    if (path[i] == '\\') {
+      // mountinfo escapes whitespace and backslashes as octal triplets.
+      if (i + 3 >= path.size()) return {};
+      unsigned value = 0;
+      for (size_t j = 1; j <= 3; ++j) {
+        if (path[i + j] < '0' || path[i + j] > '7') return {};
+        value = value * 8 + path[i + j] - '0';
+      }
+      if (value == 0 || value > 255) return {};
+      decoded += static_cast<char>(value);
+      i += 3;
+    } else {
+      decoded += path[i];
+    }
+  }
+  return decoded;
+}
+
+bool ReadMemoryBytes(const detail::CgroupFileReader &read_file,
+                     const std::string &path, uint64_t *bytes) {
+  std::string text;
+  return read_file(path, &text) && ParseMemoryBytes(text, bytes);
+}
+
+std::string ChildPath(const std::string &parent, const std::string &child) {
+  return parent == "/" ? "/" + child : parent + "/" + child;
+}
+
+void ReadHierarchyLimits(const std::string &leaf, const std::string &mount,
+                         bool v2, const detail::CgroupFileReader &read_file,
+                         uint64_t *limit) {
+  std::string directory = leaf;
+  while (true) {
+    uint64_t value = 0;
+    // Old v1 kernels can disable hierarchical accounting. Their parent limit
+    // does not constrain descendants unless memory.use_hierarchy is enabled.
+    const bool applies =
+        v2 || directory == leaf ||
+        (ReadMemoryBytes(
+             read_file, ChildPath(directory, "memory.use_hierarchy"), &value) &&
+         value == 1);
+    if (applies) {
+      if (ReadMemoryBytes(
+              read_file,
+              ChildPath(directory, v2 ? "memory.max" : "memory.limit_in_bytes"),
+              &value))
+        *limit = (std::min)(*limit, value);
+      if (!v2) {
+        // The kernel's v1 effective limit also covers ancestors hidden above
+        // a subtree mount. It respects memory.use_hierarchy on older kernels.
+        std::string text;
+        if (read_file(ChildPath(directory, "memory.stat"), &text)) {
+          std::istringstream lines(text);
+          std::string line;
+          while (std::getline(lines, line)) {
+            std::istringstream fields(line);
+            std::string key, rest;
+            if (fields >> key && key == "hierarchical_memory_limit" &&
+                std::getline(fields, rest) && ParseMemoryBytes(rest, &value))
+              *limit = (std::min)(*limit, value);
+          }
+        }
+      }
+    }
+    if (directory == mount) break;
+    const auto separator = directory.rfind('/');
+    directory.resize(separator == 0 ? 1 : separator);
+  }
+}
+
+}  // namespace
+
+uint64_t detail::CgroupMemoryLimit(uint64_t physical_bytes,
+                                   const std::string &membership,
+                                   const std::string &mountinfo,
+                                   const CgroupFileReader &read_file) {
+  // Limits may only tighten detected physical RAM. This also handles v1's
+  // page-rounded, very large unlimited sentinel without assuming a page size.
+  uint64_t limit = physical_bytes;
+  std::string v1_path, v2_path, line;
+  std::istringstream groups(membership);
+  while (std::getline(groups, line)) {
+    const auto first = line.find(':');
+    if (first == std::string::npos) continue;
+    const auto second = line.find(':', first + 1);
+    if (second == std::string::npos) continue;
+    const auto path = line.substr(second + 1);
+    if (!ValidCgroupPath(path)) continue;
+    const auto controllers = line.substr(first + 1, second - first - 1);
+    if (line.substr(0, first) == "0" && controllers.empty()) v2_path = path;
+    if (HasController(controllers, "memory")) v1_path = path;
+  }
+
+  std::istringstream mounts(mountinfo);
+  while (std::getline(mounts, line)) {
+    const auto separator = line.find(" - ");
+    if (separator == std::string::npos) continue;
+    std::istringstream fields(line.substr(0, separator));
+    std::string id, parent, device, root, mount, options;
+    if (!(fields >> id >> parent >> device >> root >> mount >> options))
+      continue;
+    std::istringstream filesystem(line.substr(separator + 3));
+    std::string type, source, super_options;
+    if (!(filesystem >> type >> source >> super_options)) continue;
+    const bool v2 = type == "cgroup2";
+    if (!v2 && (type != "cgroup" || !HasController(super_options, "memory")))
+      continue;
+    const auto &path = v2 ? v2_path : v1_path;
+    if (path.empty()) continue;
+    root = DecodeMountPath(root);
+    mount = DecodeMountPath(mount);
+    if (!ValidCgroupPath(root) || !ValidCgroupPath(mount)) continue;
+    // A bind mount can expose only part of the hierarchy. Match whole path
+    // components, not prefixes such as /tenant versus /tenant-other.
+    std::string suffix;
+    if (root == "/") {
+      suffix = path.substr(1);
+    } else if (path == root) {
+      suffix.clear();
+    } else if (path.size() > root.size() &&
+               path.compare(0, root.size(), root) == 0 &&
+               path[root.size()] == '/') {
+      suffix = path.substr(root.size() + 1);
+    } else {
+      continue;
+    }
+    ReadHierarchyLimits(suffix.empty() ? mount : ChildPath(mount, suffix),
+                        mount, v2, read_file, &limit);
+    // Inspect every matching mount: a broader view may reveal an ancestor
+    // hidden above a bind mount of the current cgroup.
+  }
+  if (membership.empty() || mountinfo.empty()) {
+    // Retain the old root-only fallback when proc metadata is unavailable.
+    // Do not guess a root if readable metadata identifies a different group.
+    uint64_t value = 0;
+    for (const auto *path : {"/sys/fs/cgroup/memory.max",
+                             "/sys/fs/cgroup/memory/memory.limit_in_bytes"}) {
+      if (ReadMemoryBytes(read_file, path, &value))
+        limit = (std::min)(limit, value);
+    }
+  }
+  return limit;
+}
 
 // Static initialization method
 void CgroupUtil::initialize() {
-  if (initialized_) {
-    return;
-  }
-
-  update_cpu_cores();
-  update_memory_limit();
-  initialize_cpu_stats();
-
-  initialized_ = true;
+  // Concurrent ConfigData construction must wait for the entire hierarchy
+  // scan, never observe the physical-memory ceiling before it is tightened.
+  static std::once_flag once;
+  std::call_once(once, [] {
+    update_cpu_cores();
+    update_memory_limit();
+    initialize_cpu_stats();
+  });
 }
 
 int CgroupUtil::get_cpu_limit() {
@@ -187,10 +374,6 @@ bool CgroupUtil::parse_cpu_max(const std::string &cpu_max, int *cpu_cores) {
 }
 
 void CgroupUtil::update_memory_limit() {
-  if (read_memory_cgroup()) {
-    return;
-  }
-
 #if defined(PLATFORM_MACOS)
   uint64_t mem;
   size_t len = sizeof(mem);
@@ -207,6 +390,7 @@ void CgroupUtil::update_memory_limit() {
   } else {
     memory_limit_ = 0;
   }
+  read_memory_cgroup();
 #elif defined(PLATFORM_WINDOWS)
   MEMORYSTATUSEX statex;
   statex.dwLength = sizeof(statex);
@@ -218,39 +402,21 @@ void CgroupUtil::update_memory_limit() {
 #endif
 }
 
-bool CgroupUtil::read_memory_cgroup() {
+void CgroupUtil::read_memory_cgroup() {
 #if defined(PLATFORM_LINUX)
-  // cgroup v2
-  std::ifstream file("/sys/fs/cgroup/memory.max");
-  if (file.is_open()) {
-    uint64_t limit;
-    file >> limit;
-    file.close();
-
-    if (limit != std::numeric_limits<uint64_t>::max() && limit != 0 &&
-        limit != ZVEC_CGROUP_MEMORY_UNLIMITED) {
-      memory_limit_ = limit;
-      return true;
-    } else {
-      return false;
-    }
-  }
-
-  // cgroup v1
-  std::ifstream v1_file("/sys/fs/cgroup/memory/memory.limit_in_bytes");
-  if (v1_file.is_open()) {
-    uint64_t limit;
-    v1_file >> limit;
-    v1_file.close();
-
-    if (limit < std::numeric_limits<uint64_t>::max() &&
-        limit != ZVEC_CGROUP_MEMORY_UNLIMITED) {
-      memory_limit_ = limit;
-      return true;
-    }
-  }
+  const auto read_file = [](const std::string &path, std::string *text) {
+    std::ifstream file(path);
+    if (!file.is_open()) return false;
+    text->assign(std::istreambuf_iterator<char>(file),
+                 std::istreambuf_iterator<char>());
+    return !file.bad();
+  };
+  std::string membership, mountinfo;
+  read_file("/proc/self/cgroup", &membership);
+  read_file("/proc/self/mountinfo", &mountinfo);
+  memory_limit_ = detail::CgroupMemoryLimit(memory_limit_, membership,
+                                            mountinfo, read_file);
 #endif
-  return false;
 }
 
 void CgroupUtil::initialize_cpu_stats() {

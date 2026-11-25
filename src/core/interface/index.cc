@@ -17,8 +17,10 @@
 #include <cmath>
 #include <limits>
 #include <new>
+#include <ailego/pattern/defer.h>
 #include <magic_enum/magic_enum.hpp>
 #include <turbo/quantizer/quantizer.h>
+#include <zvec/ailego/io/file.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_storage.h>
@@ -532,10 +534,57 @@ int Index::init(const BaseIndexParam &param) {
 }
 
 
-int Index::open(const std::string &file_path, StorageOptions storage_options) {
+int Index::open(const std::string &file_path,
+                StorageOptions storage_options) try {
   if (storage_options.read_only && storage_options.create_new) {
     LOG_ERROR("Cannot create storage for a read-only index");
     return core::IndexError_Runtime;
+  }
+  if (is_open_) return core::IndexError_NoReady;
+  bool opened = false;
+  // Persisted metadata may replace the entire quantization pipeline. Keep
+  // one consistent snapshot, including failures partway through preparation.
+  auto previous_reformer = reformer_;
+  auto previous_converter = converter_;
+  auto previous_metric = metric_;
+  auto previous_quantizer = turbo_quantizer_;
+  auto previous_params = proxima_index_params_;
+  auto previous_meta = proxima_index_meta_;
+  const auto previous_input_meta = input_vector_meta_;
+  const auto previous_streamer_meta = streamer_vector_meta_;
+  const bool previous_pending_training = pending_quantizer_training_;
+  ailego::File::Identity created_file;
+  AILEGO_DEFER([&] {
+    if (!opened) {
+      if (reformer_) reformer_->unload();
+      if (streamer_) streamer_->abort_open();
+      if (storage_) storage_->close();
+      streamer_.reset();
+      storage_.reset();
+      reformer_ = std::move(previous_reformer);
+      converter_ = std::move(previous_converter);
+      metric_ = std::move(previous_metric);
+      turbo_quantizer_ = std::move(previous_quantizer);
+      // Move the owned metadata back without allocating during OOM cleanup.
+      proxima_index_params_ = std::move(previous_params);
+      proxima_index_meta_ = std::move(previous_meta);
+      input_vector_meta_ = previous_input_meta;
+      streamer_vector_meta_ = previous_streamer_meta;
+      pending_quantizer_training_ = previous_pending_training;
+      if (created_file.valid &&
+          !ailego::File::DeleteIfSame(file_path, created_file)) {
+        LOG_ERROR("Failed to remove incomplete index file %s",
+                  file_path.c_str());
+      }
+    }
+  });
+  if (!streamer_) {
+    // Derived indexes retain concrete build parameters. The base param_ is
+    // sliced and cannot reconstruct a type-specific streamer after rollback.
+    const auto param = get_param();
+    if (!param) return core::IndexError_NoMemory;
+    const int ret = create_and_init_streamer(*param);
+    if (ret != 0) return ret;
   }
   ailego::Params storage_params;
   if (storage_options.create_new &&
@@ -592,11 +641,14 @@ int Index::open(const std::string &file_path, StorageOptions storage_options) {
       return core::IndexError_Unsupported;
   }
 
-  const core::IndexStorage::OpenOptions open_options{storage_options.create_new,
-                                                     storage_options.read_only};
-  int ret = storage_options.type == StorageOptions::StorageType::kBufferPool
-                ? storage_->open(file_path, open_options)
-                : storage_->open(file_path, storage_options.create_new);
+  const core::IndexStorage::OpenOptions open_options{
+      storage_options.create_new, storage_options.read_only, &created_file,
+      /*defer_publication=*/true};
+  const bool read_only_mmap =
+      storage_options.type == StorageOptions::StorageType::kMMAP &&
+      storage_options.read_only;
+  int ret = read_only_mmap ? storage_->open(file_path, false)
+                           : storage_->open(file_path, open_options);
   if (ret != 0) {
     LOG_ERROR("Failed to open storage, path: %s, err: %s", file_path.c_str(),
               core::IndexError::What(ret));
@@ -606,11 +658,13 @@ int Index::open(const std::string &file_path, StorageOptions storage_options) {
   if (ret != 0) {
     return ret;
   }
-  if (!pending_quantizer_training_ &&
-      (streamer_ == nullptr ||
-       streamer_->open(storage_, storage_options.read_only) != 0)) {
-    LOG_ERROR("Failed to open streamer, path: %s", file_path.c_str());
-    return core::IndexError_Runtime;
+  if (!pending_quantizer_training_) {
+    if (!streamer_) return core::IndexError_NoReady;
+    ret = streamer_->open(storage_, storage_options.read_only);
+    if (ret != 0) {
+      LOG_ERROR("Failed to open streamer, path: %s", file_path.c_str());
+      return ret;
+    }
   }
 
   // If a converter exists but reformer was not created during init() because
@@ -654,21 +708,33 @@ int Index::open(const std::string &file_path, StorageOptions storage_options) {
         return core::IndexError_Runtime;
       }
     }
-    if (reformer_->load(storage_) != 0) {
+    ret = reformer_->load(storage_);
+    if (ret != 0) {
       LOG_ERROR("Failed to load reformer, path: %s", file_path.c_str());
-      return core::IndexError_Runtime;
+      return ret;
     }
   }
 
-  // TODO: context pool
-  if (!pending_quantizer_training_ && !init_context()) {
-    LOG_ERROR("Failed to init context");
-    return core::IndexError_Runtime;
+  // A context cached for another index cannot validate this open.
+  core::IndexContext::Pointer context;
+  if (!pending_quantizer_training_) {
+    context = streamer_->create_context();
+    if (!context) return core::IndexError_Runtime;
   }
 
+  ret = storage_->publish_creation();
+  if (ret != 0) return ret;
+  if (context) {
+    context_index_ = (magic_enum::enum_integer(param_.index_type) - 1) * 2 +
+                     static_cast<size_t>(is_sparse_);
+    context_list[context_index_] = std::move(context);
+  }
+  opened = true;
   is_open_ = true;
   is_read_only_ = storage_options.read_only;
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int Index::close() {

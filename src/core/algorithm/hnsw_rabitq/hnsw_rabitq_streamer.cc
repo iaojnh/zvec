@@ -247,6 +247,10 @@ int HnswRabitqStreamer::cleanup() {
 
   LOG_INFO("HnswRabitqStreamer cleanup");
 
+  return abort_open();
+}
+
+int HnswRabitqStreamer::abort_open() {
   meta_.clear();
   metric_.reset();
   stats_.clear();
@@ -471,8 +475,8 @@ IndexStreamer::Context::Pointer HnswRabitqStreamer::create_context() const {
     LOG_ERROR("CreateContext clone init failed");
     return Context::Pointer();
   }
-  HnswRabitqContext *ctx =
-      new (std::nothrow) HnswRabitqContext(meta_.dimension(), metric_, entity);
+  auto ctx = std::unique_ptr<HnswRabitqContext>(
+      new (std::nothrow) HnswRabitqContext(meta_.dimension(), metric_, entity));
   if (ailego_unlikely(ctx == nullptr)) {
     LOG_ERROR("Failed to new HnswRabitqContext");
     return Context::Pointer();
@@ -490,7 +494,6 @@ IndexStreamer::Context::Pointer HnswRabitqStreamer::create_context() const {
 
   if (ailego_unlikely(ctx->init(HnswRabitqContext::kStreamerContext)) != 0) {
     LOG_ERROR("Init HnswRabitqContext failed");
-    delete ctx;
     return Context::Pointer();
   }
   uint32_t estimate_doc_count = 0;
@@ -501,7 +504,7 @@ IndexStreamer::Context::Pointer HnswRabitqStreamer::create_context() const {
   }
   ctx->check_need_adjuct_ctx(std::max(entity_.doc_cnt(), estimate_doc_count));
 
-  return Context::Pointer(ctx);
+  return ctx;
 }
 
 IndexProvider::Pointer HnswRabitqStreamer::create_provider() const {

@@ -350,10 +350,25 @@ bool FileHelper::MakePath(const char *path) {
 
 StagedPath::~StagedPath() {
   if (directory_.empty()) return;
+  // File stages can be discarded without allocating even after index OOM.
+#if defined(_WIN32) || defined(_WIN64)
+  (void)::DeleteFileW(native_path_.c_str());
+  if (::RemoveDirectoryW(native_directory_.c_str()) ||
+      ::GetLastError() != ERROR_DIR_NOT_EMPTY) {
+    return;
+  }
+#else
+  (void)::unlink(path_.c_str());
+  if (::rmdir(directory_.c_str()) == 0 ||
+      (errno != ENOTEMPTY && errno != EEXIST)) {
+    return;
+  }
+#endif
+  // An abandoned collection may still own a directory or publication lease.
+  // This path is private and cannot remove a competing or published target.
   try {
     FileHelper::RemoveDirectory(directory_.c_str());
   } catch (...) {
-    // This path is private. Cleanup failure cannot remove a published file.
   }
 }
 
@@ -396,14 +411,20 @@ bool StagedPath::prepare(const std::string &destination) {
     const auto unique = sequence.fetch_add(1, std::memory_order_relaxed);
     auto directory = parent / (".zvec-create-" + std::to_string(stamp) + "-" +
                                std::to_string(unique));
+    auto private_file = directory / "data";
     auto private_directory = FileHelper::PathToUtf8(directory);
-    auto private_path = FileHelper::PathToUtf8(directory / "data");
+    auto private_path = FileHelper::PathToUtf8(private_file);
 #if defined(_WIN32) || defined(_WIN64)
-    std::error_code error;
-    const bool created = fs::create_directory(directory, error);
-    if (!created && error && error != std::errc::file_exists) {
-      SetFsError(error);
-      return false;
+    auto native_directory = directory.native();
+    auto native_path = private_file.native();
+    const bool created =
+        ::CreateDirectoryW(native_directory.c_str(), nullptr) != 0;
+    if (!created) {
+      const DWORD error = GetLastError();
+      if (error != ERROR_ALREADY_EXISTS && error != ERROR_FILE_EXISTS) {
+        SetFsError(std::error_code(error, std::system_category()));
+        return false;
+      }
     }
 #else
     const bool created = ::mkdir(directory.c_str(), S_IRWXU) == 0;
@@ -412,6 +433,10 @@ bool StagedPath::prepare(const std::string &destination) {
     if (created) {
       directory_.swap(private_directory);
       path_.swap(private_path);
+#if defined(_WIN32) || defined(_WIN64)
+      native_directory_.swap(native_directory);
+      native_path_.swap(native_path);
+#endif
       return true;
     }
   }
