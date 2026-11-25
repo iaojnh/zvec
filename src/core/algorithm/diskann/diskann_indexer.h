@@ -73,6 +73,10 @@ class DiskAnnIndexer {
   void emplace_candidate(DiskAnnContext *ctx, TopkHeap &heap, diskann_id_t id,
                          float distance, const void *src) const {
     if (!AcceptsCandidate(heap, distance)) return;
+    if (ctx->fetch_vector() && !ctx->group_by_search() && src) {
+      ctx->emplace_vector_candidate(id, distance, src);
+      return;
+    }
     heap.emplace(id, VectorInfo(distance, ctx->fetch_vector() ? src : nullptr,
                                 meta_.element_size()));
   }

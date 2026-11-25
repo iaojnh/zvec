@@ -67,6 +67,22 @@ class TopkResultBuilder {
 
   //! Construct a flat result list from the top-k heap.
   inline void topk_to_single_result(uint32_t idx) {
+    topk_to_single_result(idx, [&](IndexDocumentList &docs, HeapT &heap,
+                                    uint32_t size) {
+      docs.clear();
+      docs.reserve(size);
+      for (uint32_t i = 0; i < size; ++i) {
+        auto &entry = heap.mutable_at(i);
+        const float score = derived().result_score(entry.second);
+        if (score > derived().threshold()) break;
+        derived().emplace_result_doc(docs, entry.first, score, entry.second);
+      }
+    });
+  }
+
+ protected:
+  template <typename Build>
+  void topk_to_single_result(uint32_t idx, Build build) {
     HeapT &heap = derived().topk_heap();
     if (ailego_unlikely(heap.size() == 0)) {
       return;
@@ -81,21 +97,10 @@ class TopkResultBuilder {
     while (accepted < size && !(derived().result_score(heap[accepted].second) >
                                 derived().threshold()))
       ++accepted;
-    size = accepted;
-    results[idx].clear();
-    // Reserve only accepted results; output owns each payload reservation.
-    results[idx].reserve(size);
-
-    for (uint32_t i = 0; i < size; ++i) {
-      float score = derived().result_score(heap.mutable_at(i).second);
-      if (score > derived().threshold()) {
-        break;
-      }
-      derived().emplace_result_doc(results[idx], heap[i].first, score,
-                                   heap.mutable_at(i).second);
-    }
+    build(results[idx], heap, accepted);
   }
 
+ public:
   //! Construct grouped result lists from the per-group top-k heaps.
   inline void topk_to_group_result(uint32_t idx) {
     auto &group_results = derived().mutable_group_results();

@@ -17,6 +17,7 @@
 #include <new>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include "diskann_params.h"
+#include "diskann_result_payloads.h"
 #include "diskann_util.h"
 
 namespace zvec {
@@ -29,6 +30,60 @@ DiskAnnContext::DiskAnnContext(const IndexMeta &meta,
     : IndexContext(measure),
       dc_(entity.get(), meta, measure, data_quantizer),
       entity_{entity} {}
+
+void DiskAnnContext::emplace_vector_candidate(diskann_id_t id, float score,
+                                              const void *src) {
+  diskann_id_t slot = topk_heap_.full() ? topk_heap_.front().second.vector_slot_
+                                      : kInvalidId;
+  if (slot == kInvalidId) {
+    slot = static_cast<diskann_id_t>(candidate_vectors_.size());
+    auto &candidate = candidate_vectors_.emplace_back();
+    candidate.memory.add_for_allocation(size_t{element_size_} + 1, [&] {
+      candidate.bytes.resize(element_size_);
+    });
+  }
+  std::memcpy(candidate_vectors_[slot].bytes.data(), src, element_size_);
+  topk_heap_.emplace(id, VectorInfo(score, slot));
+}
+
+void DiskAnnContext::topk_to_result(uint32_t idx) {
+  using Builder = TopkResultBuilder<DiskAnnContext, TopkHeap>;
+  if (!fetch_vector_ || group_by_search()) {
+    Builder::topk_to_result(idx);
+    return;
+  }
+  auto release = ailego::ScopeGuard::Make([&] { release_candidates(); });
+  Builder::topk_to_single_result(idx, [&](IndexDocumentList &docs,
+                                          TopkHeap &heap, uint32_t size) {
+    DiskAnnResultPayloads batch(size);
+    IndexDocumentList result;
+    result.reserve(size);
+    for (uint32_t i = 0; i < size; ++i) {
+      auto &entry = heap.mutable_at(i);
+      diskann_key_t key;
+      const int ret = entity_->read_key(entry.first, &key);
+      if (ret != 0) {
+        set_error_code(ret);
+        return;
+      }
+      const auto slot = entry.second.vector_slot_;
+      if (slot == kInvalidId) {
+        result.emplace_back(key, entry.second.dist_, entry.first);
+        continue;
+      }
+      auto &candidate = candidate_vectors_[slot];
+      using Payload = VectorInfo::Payload;
+      auto payload = std::allocate_shared<Payload>(
+          DiskAnnResultPayloads::Allocator<Payload>{},
+          std::move(candidate.bytes), Payload::BatchAdmitted{});
+      batch.attach_vector(std::move(candidate.memory));
+      result.emplace_back(key, entry.second.dist_, entry.first,
+                          std::move(payload));
+    }
+    batch.commit();
+    docs.swap(result);
+  });
+}
 
 int DiskAnnContext::create_fetch_context(const IndexMeta &meta,
                                          const IndexMetric::Pointer &measure,

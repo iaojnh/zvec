@@ -235,7 +235,7 @@ class DiskAnnContext : public IndexContext,
   }
 
   inline void clear() {
-    topk_heap_.release();
+    release_candidates();
     for (auto &it : results_) {
       it.clear();
     }
@@ -246,7 +246,6 @@ class DiskAnnContext : public IndexContext,
     best_list_nodes_.clear();
     expanded_nodes_.clear();
     visit_filter_.clear();
-    group_topk_heaps_.clear();
     error_code_ = 0;
   }
 
@@ -334,10 +333,14 @@ class DiskAnnContext : public IndexContext,
     group_topk_heaps_.clear();
   }
 
-  // topk_to_result / topk_to_single_result / topk_to_group_result are provided
-  // by TopkResultBuilder via the hooks below (result_score,
-  // emplace_result_doc).
-  using TopkResultBuilder<DiskAnnContext, TopkHeap>::topk_to_result;
+  // TopkResultBuilder orders and filters the heap before materialization.
+  void topk_to_result(uint32_t idx);
+  void emplace_vector_candidate(diskann_id_t id, float score, const void *src);
+  void release_candidates() {
+    topk_heap_.release();
+    group_topk_heaps_.clear();
+    decltype(candidate_vectors_){}.swap(candidate_vectors_);
+  }
 
   void set_to_result(uint32_t idx, const std::vector<diskann_id_t> &result_ids,
                      const std::vector<float> &result_dists) {
@@ -400,6 +403,11 @@ class DiskAnnContext : public IndexContext,
   uint32_t element_rotated_size_{0};
   uint32_t list_size_{0};
 
+  struct VectorCandidate {
+    ailego::MemoryReservation memory;
+    std::string bytes;
+  };
+  ailego::BudgetedVector<VectorCandidate> candidate_vectors_;
   TopkHeap topk_heap_{};
 
   uint32_t group_topk_{0};

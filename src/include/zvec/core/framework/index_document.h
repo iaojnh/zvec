@@ -123,6 +123,10 @@ class IndexDocument {
   // Immutable after publication. Candidate heaps and returned documents share
   // one payload and one reservation, including copies retained by the caller.
   struct VectorPayload {
+    struct BatchAdmitted {};
+    VectorPayload(std::string bytes, BatchAdmitted) noexcept
+        : data(std::move(bytes)) {}
+
     VectorPayload(const void *src, size_t size) {
       if (size == SIZE_MAX) throw std::bad_alloc();
       auto &pool = ailego::MemoryLimitPool::get_instance();

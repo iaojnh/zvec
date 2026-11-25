@@ -30,14 +30,16 @@ constexpr diskann_key_t kInvalidKey = static_cast<diskann_key_t>(-1);
 struct VectorInfo {
   using Payload = IndexDocument::VectorPayload;
   float dist_;
+  diskann_id_t vector_slot_{kInvalidId};
   std::shared_ptr<Payload> vec_;
 
   VectorInfo() = default;
   VectorInfo(float dist) : dist_{dist} {}
+  VectorInfo(float dist, diskann_id_t slot) : dist_{dist}, vector_slot_{slot} {}
   VectorInfo(float dist, const void *src, size_t size) : dist_{dist} {
     if (src)
       vec_ = std::allocate_shared<Payload>(ailego::BudgetedAllocator<Payload>{},
-                                           src, size);
+                                         src, size);
   }
 };
 

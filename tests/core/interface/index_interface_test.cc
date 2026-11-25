@@ -1420,6 +1420,53 @@ TEST(IndexInterface, DiskAnnBufferPoolSearchAcrossBudgets) {
     });
     ASSERT_EQ(0, open_ret);
     EXPECT_EQ(metadata_bytes, memory_pool.metadata_used());
+    if (budget == kFullBudget) {
+      constexpr size_t kVectorBytes = kDimension * sizeof(float);
+      const VectorData input{DenseVector{values.data()}};
+      {
+        SearchResult result;
+        ASSERT_EQ(0, index->search(input, query_param, &result));
+        ASSERT_EQ(10u, result.doc_list_.size());
+        auto first = result.doc_list_[0];
+        auto second = result.doc_list_[1];
+        result.clear();
+        const size_t both_live = memory_pool.external_used();
+        first = {};
+        EXPECT_GE(both_live, memory_pool.external_used() + kVectorBytes + 1);
+        ASSERT_EQ(kVectorBytes, second.vector_string().size());
+        EXPECT_EQ(0, std::memcmp(second.vector_string().data(),
+                                 values.data() + second.key() * kDimension,
+                                 kVectorBytes));
+        const size_t second_live = memory_pool.external_used();
+        second = {};
+        EXPECT_GE(second_live, memory_pool.external_used() + kVectorBytes + 1);
+      }
+      SearchResult result;
+      {
+        // Most of the pool is already occupied, but this warm query fits.
+        constexpr size_t kHeadroom = 256UL << 10;
+        ASSERT_GT(memory_pool.available(), kHeadroom);
+        zvec::ailego::MemoryReservation pressure;
+        pressure.add(memory_pool.available() - kHeadroom);
+        ASSERT_EQ(0, index->search(input, query_param, &result));
+        ASSERT_EQ(10u, result.doc_list_.size());
+      }
+      const auto previous_vector = result.doc_list_.front().vector_string();
+      auto &rss = zvec::ailego::MemoryLimitPool::get_instance();
+      const auto previous_limit = rss.process_rss_limit();
+      {
+        auto restore = zvec::ailego::ScopeGuard::Make(
+            [&] { EXPECT_TRUE(rss.configure_process_rss_limit(previous_limit)); });
+        ASSERT_TRUE(rss.configure_process_rss_limit(1));
+        ASSERT_GT(rss.process_rss(), rss.process_rss_limit());
+        EXPECT_EQ(zvec::core::IndexError_NoMemory,
+                  index->search(input, query_param, &result));
+        EXPECT_TRUE(result.doc_list_.empty());
+      }
+      ASSERT_EQ(0, index->search(input, query_param, &result));
+      ASSERT_EQ(10u, result.doc_list_.size());
+      EXPECT_EQ(previous_vector, result.doc_list_.front().vector_string());
+    }
     for (size_t repeat = 0; repeat < 2; ++repeat) {
       for (size_t i = 0; i < baseline.size(); ++i) {
         Result actual;

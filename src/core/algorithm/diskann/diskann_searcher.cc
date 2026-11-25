@@ -273,8 +273,7 @@ int DiskAnnSearcher::search_impl(const void *query, const IndexQueryMeta &qmeta,
   }
   AILEGO_DEFER(diskann_indexer_.get(), &DiskAnnIndexer::release_io_ctx, ctx);
   auto release_candidates = ailego::ScopeGuard::Make([&] {
-    ctx->topk_heap().release();
-    ctx->group_topk_heaps().clear();
+    ctx->release_candidates();
     if (ret || ctx->error()) ctx->clear();
   });
   if (ailego_unlikely(!group_options_valid(ctx))) {
@@ -338,8 +337,7 @@ int DiskAnnSearcher::search_bf_impl(const void *query,
   }
   AILEGO_DEFER(diskann_indexer_.get(), &DiskAnnIndexer::release_io_ctx, ctx);
   auto release_candidates = ailego::ScopeGuard::Make([&] {
-    ctx->topk_heap().release();
-    ctx->group_topk_heaps().clear();
+    ctx->release_candidates();
     if (ret || ctx->error()) ctx->clear();
   });
   if (ailego_unlikely(!group_options_valid(ctx))) {
@@ -407,8 +405,7 @@ int DiskAnnSearcher::search_bf_by_p_keys_impl(
   }
   AILEGO_DEFER(diskann_indexer_.get(), &DiskAnnIndexer::release_io_ctx, ctx);
   auto release_candidates = ailego::ScopeGuard::Make([&] {
-    ctx->topk_heap().release();
-    ctx->group_topk_heaps().clear();
+    ctx->release_candidates();
     if (ret || ctx->error()) ctx->clear();
   });
   if (ailego_unlikely(!group_options_valid(ctx))) {

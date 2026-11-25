@@ -66,6 +66,16 @@ class MemoryReservation {
         ProcessRssBudget::HeapProjection::Full(charge, pending.commit()));
     bytes_ += charge;
   }
+  // Transfer an already allocated heap batch out of its pending admission.
+  static MemoryReservation commit_heap(
+      MemoryLimitPool::PendingAllocation &pending, size_t bytes) {
+    MemoryReservation result;
+    result.bytes_ = bytes;
+    result.projection_ =
+        ProcessRssBudget::HeapProjection::Full(bytes, pending.commit(bytes));
+    return result;
+  }
+
   void swap(MemoryReservation &rhs) noexcept {
     std::swap(bytes_, rhs.bytes_);
     std::swap(projection_, rhs.projection_);

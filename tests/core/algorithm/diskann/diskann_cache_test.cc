@@ -18,9 +18,11 @@
 #include <ailego/pattern/defer.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/core/framework/index_document.h>
 #include <zvec/core/framework/index_factory.h>
 #include "diskann_pq_read_batch.h"
 #include "diskann_params.h"
+#include "diskann_result_payloads.h"
 #include "diskann_util.h"
 #include "utility/utility_params.h"
 #include "../../../ailego/buffer/pool_payload_budget.h"
@@ -198,6 +200,25 @@ TEST_F(DiskAnnPqReadBatchTest, NoMemoryRollsBackEarlierViewsAndPins) {
 }
 
 }  // namespace
+
+TEST(DiskAnnResultPayloadsTest, PartialBatchReturnsUnpublishedCharges) {
+  auto &pool = zvec::ailego::PoolPayloadBudget::get_instance();
+  ASSERT_EQ(0, pool.init(16UL << 20));
+  const size_t before = pool.external_used();
+  using Payload = IndexDocument::VectorPayload;
+  {
+    DiskAnnResultPayloads batch(2);
+    zvec::ailego::MemoryReservation vector_memory;
+    std::string bytes;
+    vector_memory.add_for_allocation(257, [&] { bytes.resize(256, 'x'); });
+    auto payload = std::allocate_shared<Payload>(
+        DiskAnnResultPayloads::Allocator<Payload>{}, std::move(bytes),
+        Payload::BatchAdmitted{});
+    batch.attach_vector(std::move(vector_memory));
+    EXPECT_GT(pool.external_used(), before + 257);
+  }
+  EXPECT_EQ(before, pool.external_used());
+}
 
 TEST(DiskAnnCachePreloadTest, BoundsBatchByScratchBufferCapacity) {
   EXPECT_EQ(DiskAnnUtil::cache_load_batch_size(0), 1u);
