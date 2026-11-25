@@ -35,7 +35,10 @@ foreach(CC_SRCS ${ALL_TEST_SRCS})
         continue()
     endif()
     set(TEST_LIBRARY zvec_common)
-    if(CC_TARGET STREQUAL "native_image_memory_macos_test" OR
+    if(CC_TARGET STREQUAL "global_resource_test")
+        # Startup integration cases create collections through the DB API.
+        set(TEST_LIBRARY zvec zvec_core)
+    elseif(CC_TARGET STREQUAL "native_image_memory_macos_test" OR
            CC_TARGET STREQUAL "native_image_memory_windows_test")
         # Exercise the real reservation pool without unrelated DB components.
         set(TEST_LIBRARY zvec_ailego)
@@ -49,6 +52,9 @@ foreach(CC_SRCS ${ALL_TEST_SRCS})
         INCS .. ../../src
         LDFLAGS ${APPLE_FRAMEWORK_LIBS}
     )
+    if(CC_TARGET STREQUAL "global_resource_test")
+        db_test_force_load_core(${CC_TARGET})
+    endif()
     if(CC_TARGET STREQUAL "native_image_memory_macos_test" AND NOT IOS)
         add_dependencies(${CC_TARGET} native_image_memory_macos_fixture)
         target_compile_definitions(${CC_TARGET} PRIVATE

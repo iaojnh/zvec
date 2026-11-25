@@ -252,6 +252,14 @@ int HnswRabitqStreamer::cleanup() try {
 
   LOG_INFO("HnswRabitqStreamer cleanup");
 
+  return abort_open();
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+}
+
+int HnswRabitqStreamer::abort_open() try {
   meta_.clear();
   metric_.reset();
   stats_.clear();

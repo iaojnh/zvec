@@ -25,6 +25,10 @@
 
 namespace zvec::core_interface {
 
+BaseIndexParam::Pointer HNSWRabitqIndex::get_param() const {
+  return std::make_shared<HNSWRabitqIndexParam>(param_);
+}
+
 int HNSWRabitqIndex::create_and_init_streamer(const BaseIndexParam &param) {
 #if !RABITQ_SUPPORTED
   (void)param;

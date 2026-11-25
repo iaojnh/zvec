@@ -55,6 +55,13 @@ int FlatSparseStreamer::cleanup() {
   return 0;
 }
 
+int FlatSparseStreamer::abort_open() {
+  entity_.close();
+  meta_.clear();
+  state_ = STATE_INIT;
+  return 0;
+}
+
 int FlatSparseStreamer::open(IndexStorage::Pointer stg) {
   LOG_DEBUG("FlatSparseStreamer open");
 

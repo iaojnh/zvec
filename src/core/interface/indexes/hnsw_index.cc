@@ -97,12 +97,19 @@ const char *ResolveTurboQuantizerName(const QuantizerParam &quantizer_param,
 
 }  // namespace
 
+BaseIndexParam::Pointer HNSWIndex::get_param() const {
+  return std::make_shared<HNSWIndexParam>(param_);
+}
+
 int HNSWIndex::open(const std::string &file_path,
                     StorageOptions storage_options) {
+  const bool previous_legacy_pipeline = use_legacy_pipeline_;
   int ret = Index::open(file_path, storage_options);
   if (ret == 0) {
     file_path_ = file_path;
     storage_options_ = storage_options;
+  } else {
+    use_legacy_pipeline_ = previous_legacy_pipeline;
   }
   return ret;
 }

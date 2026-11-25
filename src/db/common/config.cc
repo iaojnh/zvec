@@ -23,7 +23,6 @@
 #include <zvec/db/config.h>
 #include <zvec/db/status.h>
 #include "db/common/constants.h"
-#include "db/common/global_resource.h"
 #include "db/common/mobile_memory.h"
 #include "cgroup_util.h"
 #include "global_resource.h"
@@ -57,6 +56,11 @@ GlobalConfig::ConfigData::ConfigData()
       optimize_thread_binding(false) {}
 
 Status GlobalConfig::validate(const ConfigData &config) const {
+  return validate_config(config, nullptr);
+}
+
+Status GlobalConfig::validate_config(const ConfigData &config,
+                                     std::string *validated_logger_type) const {
   if (!config.temporary_directory.empty()) {
     std::error_code error;
     if (config.temporary_directory.find('\0') != std::string::npos ||
@@ -152,9 +156,11 @@ Status GlobalConfig::validate(const ConfigData &config) const {
       return Status::InvalidArgument(
           "ConsoleLogger configuration must use ConsoleLogConfig");
     }
-  } else {
+  } else if (!ailego::Factory<ailego::Logger>::Has(logger_type.c_str())) {
     return Status::InvalidArgument("unsupported logger type: ", logger_type);
   }
+
+  if (validated_logger_type) *validated_logger_type = logger_type;
 
   return Status::OK();
 }
@@ -181,7 +187,8 @@ Status GlobalConfig::initialize(const ConfigData &config) {
   bool validation_failed = false;
   bool published_resources = false;
   try {
-    result = validate(config);
+    std::string logger_type;
+    result = validate_config(config, &logger_type);
     validation_failed = !result.ok();
 
     ConfigData effective_config;
@@ -193,11 +200,13 @@ Status GlobalConfig::initialize(const ConfigData &config) {
       // The public ConfigData remains mutable to preserve API compatibility.
       // Clone the built-in logger configurations so caller-side mutations
       // after Initialize() cannot silently modify the published snapshot.
-      if (auto file = std::dynamic_pointer_cast<FileLogConfig>(
-              effective_config.log_config)) {
+      if (logger_type == FILE_LOG_TYPE_NAME) {
+        const auto file = std::static_pointer_cast<FileLogConfig>(
+            effective_config.log_config);
         effective_config.log_config = std::make_shared<FileLogConfig>(*file);
-      } else if (auto console = std::dynamic_pointer_cast<ConsoleLogConfig>(
-                     effective_config.log_config)) {
+      } else if (logger_type == CONSOLE_LOG_TYPE_NAME) {
+        const auto console = std::static_pointer_cast<ConsoleLogConfig>(
+            effective_config.log_config);
         effective_config.log_config =
             std::make_shared<ConsoleLogConfig>(*console);
       }
@@ -210,12 +219,12 @@ Status GlobalConfig::initialize(const ConfigData &config) {
       const auto *file_config = dynamic_cast<const FileLogConfig *>(
           effective_config.log_config.get());
       static const std::string empty;
-      result = LogUtil::Init(file_config ? file_config->dir : empty,
-                             file_config ? file_config->basename : empty,
-                             int(effective_config.log_config->level),
-                             effective_config.log_config->get_logger_type(),
-                             file_config ? file_config->file_size : 0,
-                             file_config ? file_config->overdue_days : 0);
+      result =
+          LogUtil::Init(file_config ? file_config->dir : empty,
+                        file_config ? file_config->basename : empty,
+                        int(effective_config.log_config->level), logger_type,
+                        file_config ? file_config->file_size : 0,
+                        file_config ? file_config->overdue_days : 0);
     }
 
     if (result.ok()) {

@@ -3083,7 +3083,7 @@ Status CollectionImpl::recovery() {
     }
   }
   if (options_.read_only_ && replays_wal) {
-    return Status::InvalidArgument(
+    return Status::FailedPrecondition(
         "Collection requires WAL recovery; open with read_only=false "
         "once before read-only access.");
   }
@@ -3363,7 +3363,8 @@ Status CollectionImpl::create() {
       closed_ = true;
       segment_manager_.reset();
       release_write_resources();
-      if (ailego::File::IdentifyPath(owned_path_utf8) == identity &&
+      if (identity.valid &&
+          ailego::File::IdentifyPath(owned_path_utf8) == identity &&
           !ailego::FileHelper::RemoveDirectory(owned_path_utf8.c_str())) {
         LOG_ERROR("Failed to remove incomplete collection %s", path_.c_str());
       }

@@ -967,7 +967,7 @@ class ZVEC_AILEGO_API VecBufferPool {
   void stop_writeback();
   void drain_writeback();
   void writeback_loop();
-  bool flush_writeback_batch(std::vector<block_id_t> &page_ids, char *staging);
+  bool flush_writeback_batch(block_id_t *page_ids, size_t count, char *staging);
   bool flush_whole_pages(const block_id_t *page_ids, size_t count,
                          char *staging);
   bool flush_shared_page(block_id_t page_id);

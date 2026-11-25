@@ -220,6 +220,9 @@ class ZVEC_API GlobalConfig : public ailego::Singleton<GlobalConfig> {
   }
 
  private:
+  Status validate_config(const ConfigData &config,
+                         std::string *logger_type) const;
+
   enum class InitializationState : uint8_t {
     kUninitialized,
     kInitializing,

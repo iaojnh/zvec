@@ -102,6 +102,13 @@ class IndexStreamer : public IndexRunner {
                                   std::unique_ptr<PreparedAdd> *) {
     return IndexError_NotImplemented;
   }
+
+  //! Release an unsuccessful open without persisting streamer metadata.
+  //! The storage owner closes its handle afterwards. Streamers whose normal
+  //! cleanup performs allocating persistence must override this rollback hook.
+  virtual int abort_open() {
+    return cleanup();
+  }
 };
 
 }  // namespace core

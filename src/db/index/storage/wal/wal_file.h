@@ -34,7 +34,7 @@ struct WalOptions {
 
 class WalFile {
  public:
-  static constexpr size_t kMaxRecordSize = 4 * 1024 * 1024;
+  static constexpr size_t kMaxRecordSize = UINT32_MAX;
 
   //! Constructor
   WalFile() = default;

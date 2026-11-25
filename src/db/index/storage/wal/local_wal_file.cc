@@ -157,7 +157,7 @@ int LocalWalFile::prepare_for_read() {
   if (!file_.seek(0, ailego::File::Origin::Begin)) {
     return -1;
   }
-  int read_size = file_.read((void *)&header_, sizeof(header_));
+  size_t read_size = file_.read((void *)&header_, sizeof(header_));
   if (read_size != sizeof(header_)) {
     WLOG_ERROR("Wal read header error.");
     return -1;
@@ -220,7 +220,7 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
 
   const auto record_offset = file_.offset();
   if (record_offset < static_cast<ssize_t>(sizeof(header_))) return -1;
-  int read_size = 0;
+  size_t read_size = 0;
   int ret = -1;
 
   // A crash can leave any prefix of the last record. Only a short read at
@@ -228,7 +228,7 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
   // in complete records must still be reported as corruption.
   const auto repair_truncated_tail = [&] {
     const auto offset = file_.offset();
-    if (read_size < 0 || offset < record_offset ||
+    if (offset < record_offset ||
         static_cast<size_t>(offset) != file_.size())
       return false;
     // Recovery reopens this same WAL for append. Remove the incomplete tail
@@ -258,7 +258,7 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
         ret = 0;
         break;
       }
-      WLOG_ERROR("Wal read error. record.length_ error read_size[%d]",
+      WLOG_ERROR("Wal read error. record.length_ error read_size[%zu]",
                  read_size);
       break;
     }
@@ -269,14 +269,27 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
         ret = 0;
         break;
       }
-      WLOG_ERROR("Wal read error. record.crc_ error read_size[%d]", read_size);
+      WLOG_ERROR("Wal read error. record.crc_ error read_size[%zu]", read_size);
       break;
     }
 
     // resize may crash if record.length_ very large
-    if (record.length_ <= 0 || record.length_ > kMaxRecordSize) {
-      WLOG_ERROR("Wal read error. record.length_ value error read_size[%d]",
+    if (record.length_ == 0) {
+      WLOG_ERROR("Wal read error. record.length_ value error read_size[%zu]",
                  read_size);
+      break;
+    }
+
+    // Check the physical extent before allocating a potentially large record.
+    // A torn final payload needs no allocation and must still be repaired at
+    // its record boundary before the file can be reopened for append.
+    const auto payload_offset = file_.offset();
+    const size_t file_size = file_.size();
+    if (payload_offset < 0 || static_cast<size_t>(payload_offset) > file_size)
+      break;
+    if (record.length_ > file_size - static_cast<size_t>(payload_offset)) {
+      if (file_.seek(0, ailego::File::Origin::End) && repair_truncated_tail())
+        ret = 0;
       break;
     }
 
@@ -290,12 +303,12 @@ int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
     }
     read_size = file_.read((void *)const_cast<char *>(record.content_.data()),
                            record.length_);
-    if (read_size != (int)record.length_) {
+    if (read_size != record.length_) {
       if (repair_truncated_tail()) {
         ret = 0;
         break;
       }
-      WLOG_ERROR("Wal read error. record.content_ error read_size[%d]",
+      WLOG_ERROR("Wal read error. record.content_ error read_size[%zu]",
                  read_size);
       break;
     }

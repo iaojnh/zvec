@@ -5957,6 +5957,19 @@ Status SegmentImpl::recover(
 
   std::lock_guard<std::shared_mutex> lock(seg_mtx_);
 
+  auto recovery_status = id_map_->begin_recovery();
+  CHECK_RETURN_STATUS(recovery_status);
+  bool recovered = false;
+  AILEGO_DEFER([&] {
+    id_map_->discard_recovery();
+    if (!recovered && wal_file_) {
+      // A failed commit must not let the destructor flush partial replay into
+      // the manifest or deletion snapshot merely because append was opened.
+      wal_file_->close();
+      wal_file_.reset();
+    }
+  });
+
   // A new record string can touch fresh pages even when the shared
   // allowance already covers the same size. Claim materialization each time.
   while (true) {
@@ -6094,10 +6107,15 @@ Status SegmentImpl::recover(
   // optimize() flush the writing segment before sealing it; without an open
   // member WAL, flush() treats the recovered memory components as empty and
   // returns without persisting them.
-  return open_wal_file();
+  recovery_status = open_wal_file();
+  CHECK_RETURN_STATUS(recovery_status);
+  recovery_status = id_map_->commit_recovery();
+  CHECK_RETURN_STATUS(recovery_status);
+  recovered = true;
+  return Status::OK();
 } catch (const std::bad_alloc &) {
   return Status(StatusCode::RESOURCE_EXHAUSTED,
-                "Insufficient memory budget for WAL recovery");
+                "Insufficient memory to recover WAL");
 }
 
 Status SegmentImpl::open_wal_file() {

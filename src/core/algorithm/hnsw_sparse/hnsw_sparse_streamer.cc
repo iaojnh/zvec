@@ -228,6 +228,14 @@ int HnswSparseStreamer::cleanup() try {
 
   LOG_INFO("HnswSparseStreamer cleanup");
 
+  return abort_open();
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+}
+
+int HnswSparseStreamer::abort_open() try {
   meta_.clear();
   metric_.reset();
   stats_.clear();

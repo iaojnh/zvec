@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <future>
 #include <thread>
 #include <ailego/utility/memory_helper.h>
@@ -25,6 +26,8 @@
 #include <rocksdb/advanced_cache.h>
 #include <rocksdb/write_buffer_manager.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/io/file.h>
+#include <zvec/db/collection.h>
 #include <zvec/db/config.h>
 #include "db/common/native_image_memory.h"
 #include "db/common/native_worker_memory.h"
@@ -77,8 +80,9 @@ TEST(GlobalResourceStartupDeathTest, ExplicitStartupOwnsLazyPublication) {
                  GlobalConfig::Instance().query_thread_binding() &&
                  resources.query_thread_pool()->count() == 1;
         });
-        const bool waited = lazy_startup.wait_for(std::chrono::milliseconds(250))
-                            == std::future_status::timeout;
+        const bool waited =
+            lazy_startup.wait_for(std::chrono::milliseconds(250)) ==
+            std::future_status::timeout;
         resume.set_value();
         if (!explicit_startup.get().ok()) std::_Exit(1);
         if (!lazy_startup.get() || !waited) std::_Exit(2);
@@ -112,6 +116,147 @@ TEST(GlobalResourceStartupDeathTest,
         if (resources.initialize() == 0 || resources.initialized() ||
             resources.query_thread_pool() || resources.rocksdb_block_cache())
           std::_Exit(4);
+        std::_Exit(0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ::testing::FLAGS_gtest_death_test_style = previous_style;
+}
+
+TEST(GlobalResourceStartupDeathTest, ExplicitStartupCompletesLazyMemoryPolicy) {
+  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  for (const bool mmap : {false, true}) {
+    EXPECT_EXIT(
+        {
+          auto &pool = ailego::MemoryLimitPool::get_instance();
+          GlobalConfig::ConfigData config;
+          config.memory_limit_bytes = 512ULL << 20;
+          if (pool.init(config.memory_limit_bytes)) std::_Exit(1);
+          const auto path = std::filesystem::temp_directory_path() /
+                            ("zvec_late_rss_" +
+                             std::to_string(std::chrono::steady_clock::now()
+                                                .time_since_epoch()
+                                                .count()));
+          CollectionSchema schema("late_rss");
+          if (!schema
+                   .add_field(std::make_shared<FieldSchema>(
+                       "payload", DataType::STRING, false))
+                   .ok())
+            std::_Exit(2);
+          auto created = Collection::CreateAndOpen(path.u8string(), schema,
+                                                   {false, mmap, 1024 * 1024});
+          if (!created) std::_Exit(3);
+          auto &resources = GlobalResource::Instance();
+          auto *query = resources.query_thread_pool();
+          auto *optimize = resources.optimize_thread_pool();
+          if (!query || !optimize || pool.process_rss_limit() != 0)
+            std::_Exit(4);
+          if (!GlobalConfig::Instance().initialize(config).ok()) std::_Exit(5);
+          if (pool.process_rss_limit() != config.memory_limit_bytes ||
+              detail::NativeWorkerStackReservation().bytes() == 0 ||
+              resources.query_thread_pool() != query ||
+              resources.optimize_thread_pool() != optimize)
+            std::_Exit(6);
+          const size_t reserved =
+              detail::NativeWorkerStackReservation().bytes();
+          if (!GlobalConfig::Instance().initialize(config).ok() ||
+              resources.initialize() ||
+              detail::NativeWorkerStackReservation().bytes() != reserved)
+            std::_Exit(7);
+          if (!GlobalConfig::Instance()
+                   .set_memory_pressure(GlobalConfig::MemoryPressure::kCritical)
+                   .ok())
+            std::_Exit(8);
+          bool refused = false;
+          try {
+            ailego::ThreadPool temporary(1, false);
+          } catch (const std::bad_alloc &) {
+            refused = true;
+          }
+          if (!refused) std::_Exit(9);
+          if (!GlobalConfig::Instance()
+                   .set_memory_pressure(GlobalConfig::MemoryPressure::kNormal)
+                   .ok())
+            std::_Exit(10);
+          if (!created.value()->close().ok()) std::_Exit(11);
+          std::filesystem::remove_all(path);
+          std::_Exit(0);
+        },
+        ::testing::ExitedWithCode(0), "");
+  }
+  ::testing::FLAGS_gtest_death_test_style = previous_style;
+}
+
+TEST(GlobalResourceStartupDeathTest, RealResidentPressureRefusesWorkerUntilReleased) {
+  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        auto &pool = ailego::MemoryLimitPool::get_instance();
+        constexpr size_t kMiB = 1024 * 1024;
+        constexpr size_t held_bytes = 64 * kMiB;
+        if (pool.init(128 * kMiB) != 0) std::_Exit(1);
+        const size_t baseline = ailego::MemoryHelper::SelfRSS();
+        auto *memory = static_cast<char *>(ailego::File::MemoryMap(held_bytes, 0));
+        if (!memory) std::_Exit(2);
+        // Fault in real pages outside the cache budget, as a caller could.
+        auto *resident = static_cast<volatile char *>(memory);
+        const size_t page = ailego::MemoryHelper::PageSize();
+        for (size_t offset = 0; offset < held_bytes; offset += page)
+          resident[offset] = 1;
+        const size_t loaded = ailego::MemoryHelper::SelfRSS();
+        if (!baseline || loaded < baseline + held_bytes / 2) std::_Exit(3);
+        if (!pool.configure_process_rss_limit(baseline + held_bytes / 2))
+          std::_Exit(4);
+
+        bool refused = false;
+        try {
+          ailego::ThreadPool worker(1, false);
+        } catch (const std::bad_alloc &) {
+          refused = true;
+        }
+        if (!refused) std::_Exit(5);
+        if (!ailego::File::TryMemoryUnmap(memory, held_bytes)) std::_Exit(6);
+        for (size_t attempt = 0; attempt < 60; ++attempt) {
+          try {
+            ailego::ThreadPool worker(1, false);
+            bool executed = false;
+            worker.execute_and_wait([&] { executed = true; });
+            std::_Exit(executed ? 0 : 7);
+          } catch (const std::bad_alloc &) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          }
+        }
+        std::_Exit(8);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ::testing::FLAGS_gtest_death_test_style = previous_style;
+}
+
+TEST(GlobalResourceStartupDeathTest, FailedLatePolicyKeepsPublishedPoolsAlive) {
+  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        auto &pool = ailego::MemoryLimitPool::get_instance();
+        GlobalConfig::ConfigData config;
+        config.memory_limit_bytes = 512ULL << 20;
+        if (pool.init(config.memory_limit_bytes)) std::_Exit(1);
+        auto &resources = GlobalResource::Instance();
+        auto *query = resources.query_thread_pool();
+        auto *optimize = resources.optimize_thread_pool();
+        if (!query || !optimize) std::_Exit(2);
+        const auto occupied = pool.available();
+        if (!pool.try_charge_external(occupied)) std::_Exit(3);
+        if (GlobalConfig::Instance().initialize(config).ok()) std::_Exit(4);
+        pool.release_external(occupied);
+        if (resources.query_thread_pool() != query ||
+            resources.optimize_thread_pool() != optimize)
+          std::_Exit(5);
+        bool completed = false;
+        query->execute_and_wait([&] { completed = true; });
+        if (!completed) std::_Exit(6);
+        if (GlobalConfig::Instance().initialize(config).ok()) std::_Exit(7);
         std::_Exit(0);
       },
       ::testing::ExitedWithCode(0), "");

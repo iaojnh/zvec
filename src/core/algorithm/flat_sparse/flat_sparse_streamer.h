@@ -43,6 +43,8 @@ class FlatSparseStreamer : public IndexStreamer {
   //! Cleanup Streamer
   int cleanup() override;
 
+  int abort_open() override;
+
   //! Open index from file path
   int open(IndexStorage::Pointer stg) override;
 

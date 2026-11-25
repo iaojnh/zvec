@@ -380,6 +380,14 @@ int HnswStreamer::cleanup() try {
 
   LOG_INFO("HnswStreamer cleanup");
 
+  return abort_open();
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+}
+
+int HnswStreamer::abort_open() try {
   meta_.clear();
   metric_.reset();
   quantizer_.reset();

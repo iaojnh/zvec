@@ -66,6 +66,7 @@ IDMap::Ptr IDMap::CreateAndOpen(const std::string &collection_name,
 
 
 Status IDMap::close() {
+  discard_recovery();
   if (!opened_) {
     return Status::OK();
   }
@@ -81,6 +82,9 @@ Status IDMap::close() {
 
 
 Status IDMap::flush() {
+  if (recovery_changes_) {
+    return Status::FailedPrecondition("IDMap recovery is not committed");
+  }
   if (!opened_) {
     return Status::InternalError();
   }
@@ -100,6 +104,11 @@ Status IDMap::upsert(const std::string &key, uint64_t doc_id) {
     return Status::InternalError();
   }
 
+  if (recovery_changes_) {
+    (*recovery_changes_)[key] = doc_id;
+    return Status::OK();
+  }
+
   rocksdb::Slice value((const char *)&doc_id, sizeof(uint64_t));
   auto s = rocksdb_context_.put(key, value);
   if (s.ok()) {
@@ -114,12 +123,23 @@ Status IDMap::upsert(const std::string &key, uint64_t doc_id) {
 
 
 void IDMap::remove(const std::string &key) {
+  if (recovery_changes_) {
+    (*recovery_changes_)[key] = std::nullopt;
+    return;
+  }
   rocksdb_context_.remove(key);
 }
 
 
 Result<bool> IDMap::lookup(const std::string &key, uint64_t *doc_id) const {
   if (doc_id) *doc_id = INVALID_DOC_ID;
+  if (recovery_changes_) {
+    const auto it = recovery_changes_->find(key);
+    if (it != recovery_changes_->end()) {
+      if (doc_id) *doc_id = it->second.value_or(INVALID_DOC_ID);
+      return it->second.has_value();
+    }
+  }
   std::string value;
   const auto status =
       rocksdb_context_.db_->Get(rocksdb_context_.read_opts_, key, &value);
@@ -160,6 +180,13 @@ Status IDMap::multi_get(const std::vector<std::string> &keys,
 
   doc_ids->resize(keys.size());
   for (size_t i = 0; i < keys.size(); i++) {
+    if (recovery_changes_) {
+      const auto it = recovery_changes_->find(keys[i]);
+      if (it != recovery_changes_->end()) {
+        (*doc_ids)[i] = it->second.value_or(INVALID_DOC_ID);
+        continue;
+      }
+    }
     if (statuses[i].ok()) {
       (*doc_ids)[i] = *(uint64_t *)(pinnable_values[i].data());
     } else if (statuses[i].code() == rocksdb::Status::kNotFound) {
@@ -173,6 +200,38 @@ Status IDMap::multi_get(const std::vector<std::string> &keys,
   }
 
   return Status::OK();
+}
+
+Status IDMap::begin_recovery() {
+  if (!opened_ || rocksdb_context_.read_only() || recovery_changes_) {
+    return Status::FailedPrecondition("IDMap cannot start recovery");
+  }
+  recovery_changes_.emplace();
+  return Status::OK();
+}
+
+Status IDMap::commit_recovery() {
+  if (!recovery_changes_) {
+    return Status::FailedPrecondition("IDMap has no pending recovery");
+  }
+  rocksdb::WriteBatch batch;
+  for (const auto &[key, doc_id] : *recovery_changes_) {
+    const auto status =
+        doc_id ? batch.Put(key, rocksdb::Slice(
+                                    reinterpret_cast<const char *>(&*doc_id),
+                                    sizeof(uint64_t)))
+               : batch.Delete(key);
+    if (!status.ok()) return Status::InternalError(status.ToString());
+  }
+  const auto status =
+      rocksdb_context_.db_->Write(rocksdb_context_.write_opts_, &batch);
+  if (!status.ok()) return Status::InternalError(status.ToString());
+  discard_recovery();
+  return Status::OK();
+}
+
+void IDMap::discard_recovery() {
+  recovery_changes_.reset();
 }
 
 

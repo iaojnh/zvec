@@ -147,12 +147,27 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
         preserve_existing_pool
             ? memory_pool.capacity()
             : calculate_buffer_pool_memory_budget(memory_limit_bytes);
+    if (!preserve_existing_pool && !memory_policy_ready_ &&
+        memory_pool.process_rss_limit() != 0) {
+      // A lower-level RSS controller already owns live projections. Do not
+      // reset it or double-charge workers admitted through that controller.
+      LOG_ERROR("Cannot replace an independently configured RSS policy");
+      return -1;
+    }
     if (query_thread_pool_ && optimize_thread_pool_) {
       if (memory_limit_bytes_ == memory_limit_bytes &&
           query_thread_count_ == query_thread_count &&
           optimize_thread_count_ == optimize_thread_count &&
           query_thread_binding_ == query_thread_binding &&
           optimize_thread_binding_ == optimize_thread_binding) {
+        if (!preserve_existing_pool && !memory_policy_ready_) {
+          // These pools are already published. If policy admission fails,
+          // explicit startup must fail while existing callers retain their
+          // valid standalone resource handles.
+          reserve_native_memory(query_thread_pool_->count(),
+                                optimize_thread_pool_->count());
+          if (configure_memory_policy(memory_limit_bytes) != 0) return -1;
+        }
         return 0;
       }
       LOG_ERROR(
@@ -259,6 +274,7 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
         LOG_ERROR("Failed to sample process RSS for memory admission");
         return -1;
       }
+      memory_policy_ready_ = true;
     }
 
     // MakeEternal supports singleton destruction late at process exit. Its
@@ -299,6 +315,32 @@ int GlobalResource::initialize_locked(uint64_t memory_limit_bytes,
     LOG_ERROR("GlobalResource::initialize failed with an unknown exception");
   }
   return -1;
+}
+
+void GlobalResource::reserve_native_memory(uint32_t query_workers,
+                                           uint32_t optimize_workers) {
+  // Anchor in the product image rather than an inline caller's executable.
+  static const char image_anchor = 0;
+  detail::ReserveNativeImage(&image_anchor);
+  detail::ReserveNativeWorkerStacks(
+      query_workers, optimize_workers, optimize_thread_count_,
+      static_cast<size_t>(arrow_query_thread_pool_->GetCapacity()) +
+          static_cast<size_t>(arrow_io_thread_pool_->GetCapacity()));
+}
+
+int GlobalResource::configure_memory_policy(uint64_t memory_limit_bytes) {
+  // RSS includes native backing and caller memory. Exclude the permanent
+  // lifetime allowance from projections so native bytes are not counted twice.
+  const size_t permanent_backing =
+      detail::NativeImageReservation().bytes() +
+      detail::NativeWorkerStackReservation().bytes();
+  if (!ailego::MemoryLimitPool::get_instance().configure_process_rss_limit(
+          memory_limit_bytes, permanent_backing)) {
+    LOG_ERROR("Failed to sample process RSS for memory admission");
+    return -1;
+  }
+  memory_policy_ready_ = true;
+  return 0;
 }
 
 void GlobalResource::log_initialized() const noexcept try {

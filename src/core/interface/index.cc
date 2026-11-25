@@ -21,6 +21,7 @@
 #include <thread>
 #include <magic_enum/magic_enum.hpp>
 #include <turbo/quantizer/quantizer.h>
+#include <zvec/ailego/io/file.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_storage.h>
@@ -606,15 +607,36 @@ int Index::open(const std::string &file_path,
   }
   if (is_open_) return core::IndexError_NoReady;
   bool opened = false;
+  // Persisted metadata may replace the entire quantization pipeline. Keep
+  // one consistent snapshot, including failures partway through preparation.
+  auto previous_reformer = reformer_;
+  auto previous_converter = converter_;
+  auto previous_metric = metric_;
+  auto previous_quantizer = turbo_quantizer_;
+  auto previous_params = proxima_index_params_;
+  auto previous_meta = proxima_index_meta_;
+  const auto previous_input_meta = input_vector_meta_;
+  const auto previous_streamer_meta = streamer_vector_meta_;
+  const bool previous_pending_training = pending_quantizer_training_;
   ailego::File::Identity created_file;
   AILEGO_DEFER([&] {
     if (!opened) {
       contexts_->clear();
       if (reformer_) reformer_->unload();
-      if (streamer_) streamer_->cleanup();
+      if (streamer_) streamer_->abort_open();
       if (storage_) storage_->close();
       streamer_.reset();
       storage_.reset();
+      reformer_ = std::move(previous_reformer);
+      converter_ = std::move(previous_converter);
+      metric_ = std::move(previous_metric);
+      turbo_quantizer_ = std::move(previous_quantizer);
+      // Move the owned metadata back without allocating during OOM cleanup.
+      proxima_index_params_ = std::move(previous_params);
+      proxima_index_meta_ = std::move(previous_meta);
+      input_vector_meta_ = previous_input_meta;
+      streamer_vector_meta_ = previous_streamer_meta;
+      pending_quantizer_training_ = previous_pending_training;
       if (created_file.valid) {
         if (!ailego::File::DeleteIfSame(file_path, created_file)) {
           LOG_ERROR("Failed to remove incomplete index file %s",

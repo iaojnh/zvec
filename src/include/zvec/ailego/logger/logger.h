@@ -137,6 +137,9 @@ class ZVEC_AILEGO_API LoggerBroker {
   static int Register(Logger::Pointer logger, const ailego::Params &params) {
     auto previous = Register(nullptr);
     if (previous) previous->cleanup();
+    // Release the old instance before initializing a shared backend: its
+    // destructor may call cleanup again.
+    previous.reset();
     const int result = logger->init(params);
     Register(std::move(logger));
     return result;

@@ -134,6 +134,14 @@ int VamanaStreamer::cleanup() try {
 
   LOG_INFO("VamanaStreamer cleanup");
 
+  return abort_open();
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
+}
+
+int VamanaStreamer::abort_open() try {
   meta_.clear();
   metric_.reset();
   stats_.clear();
@@ -556,8 +564,8 @@ IndexStreamer::Context::Pointer VamanaStreamer::create_context() const {
     return Context::Pointer();
   }
 
-  VamanaContext *ctx =
-      new (std::nothrow) VamanaContext(meta_.dimension(), metric_, entity);
+  auto ctx = std::unique_ptr<VamanaContext>(
+      new (std::nothrow) VamanaContext(meta_.dimension(), metric_, entity));
   if (ailego_unlikely(ctx == nullptr)) {
     LOG_ERROR("Failed to new VamanaContext");
     return Context::Pointer();
@@ -573,16 +581,14 @@ IndexStreamer::Context::Pointer VamanaStreamer::create_context() const {
 
   if (ailego_unlikely(ctx->init(VamanaContext::kStreamerContext) != 0)) {
     LOG_ERROR("Init VamanaContext failed");
-    delete ctx;
     return Context::Pointer();
   }
 
   if (!ctx->check_need_adjuct_ctx(entity_->doc_cnt())) {
-    delete ctx;
     return Context::Pointer();
   }
 
-  return Context::Pointer(ctx);
+  return ctx;
 }
 
 IndexProvider::Pointer VamanaStreamer::create_provider() const {

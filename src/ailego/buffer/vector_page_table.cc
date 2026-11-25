@@ -178,11 +178,15 @@ VecBufferPool::~VecBufferPool() {
   // Finish queued writes before page buffers, latches, and descriptors go
   // away. The synchronous pass below catches any prior writeback error.
   stop_writeback();
-  // Flush dirty pages before releasing memory and descriptors.
-  (void)this->flush_all();
-  // Preserve final cache and writeback statistics after both persistence
-  // paths have drained.
-  log_stats();
+  try {
+    // Flush dirty pages before releasing memory and descriptors.
+    (void)this->flush_all();
+    // Preserve final statistics after both persistence paths have drained.
+    log_stats();
+  } catch (const std::bad_alloc &) {
+    // Writeback uses fixed workspace, but diagnostic sinks can allocate.
+    // An OOM diagnostic must not interrupt destruction during rollback.
+  }
   page_table_.force_evict_all_loaded();
   size_t writable_metadata_bytes = writeback_io_staging_charge_;
 #if defined(__linux__) && !defined(__ANDROID__)
@@ -1476,9 +1480,9 @@ void VecBufferPool::drain_writeback() {
 }
 
 void VecBufferPool::writeback_loop() {
-  std::vector<block_id_t> page_ids;
-  page_ids.reserve(kBlockingAioBatchSize);
+  std::array<block_id_t, kBlockingAioBatchSize> page_ids;
   while (true) {
+    size_t count = 0;
     {
       std::unique_lock<std::mutex> lock(writeback_mutex_);
       writeback_cv_.wait(lock, [this] {
@@ -1490,38 +1494,40 @@ void VecBufferPool::writeback_loop() {
         }
         continue;
       }
-      page_ids.clear();
-      while (!writeback_queue_.empty() &&
-             page_ids.size() < kBlockingAioBatchSize) {
-        page_ids.push_back(writeback_queue_.front());
+      while (!writeback_queue_.empty() && count < page_ids.size()) {
+        page_ids[count++] = writeback_queue_.front();
         writeback_queue_.pop_front();
       }
-      writeback_inflight_ += page_ids.size();
+      writeback_inflight_ += count;
     }
 
     try {
       std::lock_guard<std::mutex> flush_lock(writeback_flush_mutex_);
-      flush_writeback_batch(page_ids, writeback_staging_);
+      flush_writeback_batch(page_ids.data(), count, writeback_staging_);
     } catch (...) {
-      writeback_failures_.fetch_add(page_ids.size(), std::memory_order_relaxed);
+      writeback_failures_.fetch_add(count, std::memory_order_relaxed);
       int expected = 0;
       (void)writeback_error_.compare_exchange_strong(
           expected, EIO, std::memory_order_release, std::memory_order_relaxed);
-      LOG_ERROR("VecBufferPool writeback threw: file[%s], pages[%zu]",
-                file_name_.c_str(), page_ids.size());
+      try {
+        LOG_ERROR("VecBufferPool writeback threw: file[%s], pages[%zu]",
+                  file_name_.c_str(), count);
+      } catch (const std::bad_alloc &) {
+        // Still release pending ownership if an OOM diagnostic also fails.
+      }
     }
 
-    for (block_id_t page_id : page_ids) {
-      page_table_.clear_writeback_pending(page_id);
+    for (size_t i = 0; i < count; ++i) {
+      page_table_.clear_writeback_pending(page_ids[i]);
     }
-    writeback_pending_.fetch_sub(page_ids.size(), std::memory_order_relaxed);
-    for (block_id_t page_id : page_ids) {
-      (void)page_table_.reclaim_clean_block(page_id);
+    writeback_pending_.fetch_sub(count, std::memory_order_relaxed);
+    for (size_t i = 0; i < count; ++i) {
+      (void)page_table_.reclaim_clean_block(page_ids[i]);
     }
 
     {
       std::lock_guard<std::mutex> lock(writeback_mutex_);
-      writeback_inflight_ -= page_ids.size();
+      writeback_inflight_ -= count;
       if (writeback_queue_.empty() && writeback_inflight_ == 0) {
         writeback_drained_cv_.notify_all();
       }
@@ -1692,30 +1698,29 @@ bool VecBufferPool::flush_shared_page(block_id_t page_id) {
   return false;
 }
 
-bool VecBufferPool::flush_writeback_batch(std::vector<block_id_t> &page_ids,
+bool VecBufferPool::flush_writeback_batch(block_id_t *page_ids, size_t count,
                                           char *staging) {
   if (writeback_quarantined()) return false;
-  std::sort(page_ids.begin(), page_ids.end());
-  page_ids.erase(std::unique(page_ids.begin(), page_ids.end()), page_ids.end());
+  std::sort(page_ids, page_ids + count);
+  count = std::unique(page_ids, page_ids + count) - page_ids;
 
   if (!has_unaligned_metadata_.load(std::memory_order_acquire)) {
-    return flush_whole_pages(page_ids.data(), page_ids.size(), staging);
+    return flush_whole_pages(page_ids, count, staging);
   }
   // Keep shared pages out of both contiguous pwrite runs and io_uring batches.
   bool all_ok = true;
   size_t first = 0;
-  for (size_t i = 0; i < page_ids.size(); ++i) {
+  for (size_t i = 0; i < count; ++i) {
     if (!page_overlaps_metadata(page_ids[i] * kVectorPageSize)) continue;
     if (i != first &&
-        !flush_whole_pages(page_ids.data() + first, i - first, staging)) {
+        !flush_whole_pages(page_ids + first, i - first, staging)) {
       all_ok = false;
     }
     if (!flush_shared_page(page_ids[i])) all_ok = false;
     first = i + 1;
   }
-  if (first != page_ids.size() &&
-      !flush_whole_pages(page_ids.data() + first, page_ids.size() - first,
-                         staging)) {
+  if (first != count &&
+      !flush_whole_pages(page_ids + first, count - first, staging)) {
     all_ok = false;
   }
   return all_ok;
@@ -2786,21 +2791,23 @@ int VecBufferPool::flush_all() {
   int rc = 0;
   size_t total_dirty = 0;
   size_t failed_batches = 0;
-  std::vector<block_id_t> dirty_pages;
-  dirty_pages.reserve(kBlockingAioBatchSize);
+  // Failure cleanup can destroy a writable pool while allocations still
+  // fail. Keep synchronous writeback independent of heap workspace.
+  std::array<block_id_t, kBlockingAioBatchSize> dirty_pages;
+  size_t count = 0;
   for (size_t page_id = 0; page_id < total; ++page_id) {
     if (page_table_.is_block_dirty(page_id)) {
-      dirty_pages.push_back(page_id);
+      dirty_pages[count++] = page_id;
     }
-    if (dirty_pages.size() == kBlockingAioBatchSize ||
-        (page_id + 1 == total && !dirty_pages.empty())) {
-      total_dirty += dirty_pages.size();
-      if (!flush_writeback_batch(dirty_pages, writeback_staging_)) {
+    if (count == dirty_pages.size() || (page_id + 1 == total && count != 0)) {
+      total_dirty += count;
+      if (!flush_writeback_batch(dirty_pages.data(), count,
+                                 writeback_staging_)) {
         rc = -1;
         ++failed_batches;
         if (writeback_quarantined()) break;
       }
-      dirty_pages.clear();
+      count = 0;
     }
   }
 

@@ -375,6 +375,7 @@ class ZVEC_CORE_API Index {
 class ZVEC_CORE_API FlatIndex : public Index {
  public:
   FlatIndex() = default;
+  BaseIndexParam::Pointer get_param() const override;
 
   // External Flat supports raw row-major FP32 L2/IP. Register IDs after
   // writing the source; vector bytes and subsequent updates stay in the source.
@@ -503,6 +504,7 @@ class ZVEC_CORE_API IVFIndex : public Index {
 class ZVEC_CORE_API HNSWIndex : public Index {
  public:
   HNSWIndex() = default;
+  BaseIndexParam::Pointer get_param() const override;
 
   int open(const std::string &file_path,
            StorageOptions storage_options) override;
@@ -551,6 +553,7 @@ class ZVEC_CORE_API HNSWIndex : public Index {
 class ZVEC_CORE_API VamanaIndex : public Index {
  public:
   VamanaIndex() = default;
+  BaseIndexParam::Pointer get_param() const override;
 
   int merge(const std::vector<Index::Pointer> &indexes,
             const IndexFilter &filter,
@@ -575,6 +578,7 @@ class ZVEC_CORE_API VamanaIndex : public Index {
 class ZVEC_CORE_API HNSWRabitqIndex : public Index {
  public:
   HNSWRabitqIndex() = default;
+  BaseIndexParam::Pointer get_param() const override;
 
  protected:
   int create_and_init_streamer(const BaseIndexParam &param) override;

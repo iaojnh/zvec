@@ -143,6 +143,10 @@ ailego::Params MakeTurboQuantizerParams(const QuantizerParam &quantizer_param,
 
 }  // namespace
 
+BaseIndexParam::Pointer FlatIndex::get_param() const {
+  return std::make_shared<FlatIndexParam>(param_);
+}
+
 int FlatIndex::bind_vector_source(const core::VectorSource &source,
                                   core::IndexContext::Pointer &context) {
   if (!param_.use_external_vector) return core::IndexError_Unsupported;
