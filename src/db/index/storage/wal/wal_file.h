@@ -15,6 +15,7 @@
 
 #include <memory>
 #include <string>
+#include <zvec/db/status.h>
 
 
 namespace zvec {
@@ -48,6 +49,8 @@ class WalFile {
   virtual int append(std::string &&data) = 0;
   virtual int prepare_for_read() = 0;
   virtual std::string next() = 0;
+  // An empty result indicates EOF only when this status is OK.
+  virtual Status read_status() const = 0;
 
  public:
   //! Open and initialize WalFile

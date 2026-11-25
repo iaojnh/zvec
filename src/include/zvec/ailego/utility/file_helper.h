@@ -46,6 +46,11 @@ class ZVEC_AILEGO_API StagedPath {
   std::string destination_;
   std::string directory_;
   std::string path_;
+#if defined(_WIN32) || defined(_WIN64)
+  // Materialize native cleanup paths before creating the private directory.
+  std::wstring native_directory_;
+  std::wstring native_path_;
+#endif
 };
 
 /*! File Helper Module

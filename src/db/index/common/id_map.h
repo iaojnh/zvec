@@ -15,7 +15,9 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <zvec/ailego/io/file.h>
 #include <zvec/db/status.h>
@@ -58,6 +60,13 @@ class IDMap {
 
   Status flush();
 
+  // Recovery runs before publishing the collection, under its exclusive lock.
+  // Reads observe staged changes; persistent mappings change in one DB write
+  // only after the complete replay succeeds. No concurrent use is permitted.
+  Status begin_recovery();
+  Status commit_recovery();
+  void discard_recovery();
+
   Status upsert(const std::string &key, uint64_t doc_id);
 
   void remove(const std::string &key);
@@ -89,6 +98,8 @@ class IDMap {
   std::string working_dir_{};
 
   RocksdbContext rocksdb_context_{};
+  std::optional<std::unordered_map<std::string, std::optional<uint64_t>>>
+      recovery_changes_;
   bool opened_{false};
 };
 

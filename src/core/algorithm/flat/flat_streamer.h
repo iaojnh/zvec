@@ -48,6 +48,8 @@ class FlatStreamer : public IndexStreamer {
   //! Cleanup Streamer
   int cleanup() override;
 
+  int abort_open() override;
+
   //! Create a context
   IndexStreamer::Context::UPointer create_context() const override;
 

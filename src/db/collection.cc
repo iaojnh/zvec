@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -22,11 +23,13 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
 #include <vector>
 #include <ailego/io/file_lock.h>
+#include <ailego/pattern/defer.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/pattern/expected.hpp>
@@ -56,6 +59,7 @@
 #include "db/index/segment/segment.h"
 #include "db/index/segment/segment_helper.h"
 #include "db/index/segment/segment_manager.h"
+#include "db/index/storage/wal/wal_file.h"
 #include "db/sqlengine/sqlengine.h"
 #include "zvec/core/interface/index.h"
 
@@ -179,6 +183,7 @@ class CollectionImpl : public Collection {
   Status close_internal();
   Status close_locked();
   Status close_unsafe();
+  void release_resources();
 
   Status flush_unsafe();
 
@@ -363,6 +368,8 @@ class CollectionImpl : public Collection {
 
   // file lock
   ailego::File lock_file_;
+  std::unique_ptr<ailego::StagedPath> staged_creation_;
+  bool attaching_creation_{false};
 
   IDMap::Ptr id_map_;
   DeleteStore::Ptr delete_store_;
@@ -370,15 +377,152 @@ class CollectionImpl : public Collection {
   sqlengine::SQLEngine::Ptr sql_engine_;
 };
 
+namespace {
+
+std::string CreationMarkerPath(const std::string &path) {
+  return ailego::FileHelper::PathJoin(path, ".zvec-create-pending");
+}
+
+Status CheckCreationLease(const std::string &path) {
+  const auto marker_path = CreationMarkerPath(path);
+  if (!ailego::File::IsExist(marker_path)) return Status::OK();
+  ailego::File marker;
+  if (!marker.open(marker_path.c_str(), true)) {
+    return ailego::File::IsExist(marker_path)
+               ? Status::InternalError(
+                     "Failed to read collection creation marker")
+               : Status::OK();
+  }
+  std::array<char, 128> bytes;
+  const size_t length = marker.read(bytes.data(), bytes.size());
+  if (length == 0) return Status::OK();
+  const std::string_view name(bytes.data(), length);
+  constexpr std::string_view prefix = ".zvec-create-";
+  if (length == bytes.size() || name.size() <= prefix.size() ||
+      name.substr(0, prefix.size()) != prefix ||
+      name.substr(prefix.size()).find_first_not_of("0123456789-") !=
+          std::string_view::npos) {
+    return Status::InternalError("Invalid collection creation marker");
+  }
+  auto leaf = ailego::FileHelper::PathFromUtf8(path);
+  while (leaf.has_relative_path() &&
+         (!leaf.has_filename() || leaf.filename() == ".")) {
+    leaf = leaf.parent_path();
+  }
+  const auto lease_path = ailego::FileHelper::PathToUtf8(
+      leaf.parent_path() / std::string(name) / "owner");
+  ailego::File lease;
+  if (!lease.open(lease_path.c_str(), true)) {
+    return ailego::File::IsExist(lease_path)
+               ? Status::FailedPrecondition(
+                     "Collection creation is in progress")
+               : Status::OK();
+  }
+  return ailego::FileLock::TryLockShared(lease.native_handle())
+             ? Status::OK()
+             : Status::FailedPrecondition("Collection creation is in progress");
+}
+
+}  // namespace
+
 Result<Collection::Ptr> Collection::CreateAndOpen(
     const std::string &path, const CollectionSchema &schema,
-    const CollectionOptions &options) {
+    const CollectionOptions &options) try {
   auto collection = std::make_shared<CollectionImpl>(path, schema);
+  const auto marker = CreationMarkerPath(path);
+  const auto attach = [&](ailego::File lock,
+                          bool retry) -> Result<Collection::Ptr> {
+    auto opened = std::make_shared<CollectionImpl>(path);
+    opened->options_ = options;
+    opened->attaching_creation_ = true;
+    opened->lock_file_ = std::move(lock);
+    if (retry) {
+      auto s = CheckCreationLease(path);
+      CHECK_RETURN_STATUS_EXPECTED(s);
+      s = opened->acquire_file_lock(false);
+      CHECK_RETURN_STATUS_EXPECTED(s);
+      if (!ailego::File::IsExist(marker)) {
+        return tl::make_unexpected(
+            Status::InvalidArgument("Collection already exists: ", path));
+      }
+      auto version = VersionManager::Recovery(path);
+      if (!version) return tl::make_unexpected(version.error());
+      const auto stored = (*version)->get_current_version();
+      if (stored.schema() != *collection->schema_ ||
+          stored.schema().max_doc_count_per_segment() !=
+              collection->schema_->max_doc_count_per_segment() ||
+          stored.enable_mmap() != options.enable_mmap_) {
+        return tl::make_unexpected(
+            Status::InvalidArgument("Pending collection uses another schema "
+                                    "or storage mode: ",
+                                    path));
+      }
+    }
+    auto s = opened->open(options);
+    CHECK_RETURN_STATUS_EXPECTED(s);
+    if (!ailego::File::Delete(marker)) {
+      return tl::make_unexpected(Status::InternalError(
+          "Failed to complete collection creation: ", path));
+    }
+    return opened;
+  };
+  if (!options.read_only_ && FileHelper::PathSimpleValidation(path) &&
+      ailego::File::IsExist(marker)) {
+    collection->closed_ = true;
+    return attach(ailego::File{}, true);
+  }
 
   auto s = collection->open(options);
   CHECK_RETURN_STATUS_EXPECTED(s);
 
+  if (auto staged = std::move(collection->staged_creation_)) {
+    ailego::File publication_lease;
+    {
+      ailego::File marker_file;
+      const auto staged_marker = CreationMarkerPath(staged->path());
+      if (!marker_file.create_exclusive(staged_marker.c_str())) {
+        return tl::make_unexpected(Status::InternalError(
+            "Failed to record collection creation: ", path));
+      }
+#if defined(_WIN32) || defined(_WIN64)
+      // Windows cannot rename a directory while a child handle is open.
+      // The lock in the private parent stays live without blocking the rename.
+      const auto stage_root =
+          ailego::FileHelper::PathFromUtf8(staged->path()).parent_path();
+      const auto owner = ailego::FileHelper::PathToUtf8(stage_root / "owner");
+      const auto token = ailego::FileHelper::PathToUtf8(stage_root.filename());
+      if (!publication_lease.create_exclusive(owner.c_str()) ||
+          !ailego::FileLock::TryLock(publication_lease.native_handle()) ||
+          marker_file.write(token.data(), token.size()) != token.size()) {
+        return tl::make_unexpected(Status::InternalError(
+            "Failed to lock collection publication: ", path));
+      }
+#endif
+      if (!marker_file.flush()) {
+        return tl::make_unexpected(Status::InternalError(
+            "Failed to record collection creation: ", path));
+      }
+    }
+    // The LOCK inode moves with the new directory. Keep its exclusive lock
+    // through publication and attach so no competing opener can take it.
+    ailego::File lock;
+#if !defined(_WIN32) && !defined(_WIN64)
+    lock = std::move(collection->lock_file_);
+#endif
+    s = collection->close();
+    CHECK_RETURN_STATUS_EXPECTED(s);
+    if (!staged->publish()) {
+      return tl::make_unexpected(
+          Status::InternalError("Failed to publish collection ", path, ", ",
+                                ailego::FileHelper::GetLastErrorString()));
+    }
+    return attach(std::move(lock), false);
+  }
   return collection;
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(
+      Status(StatusCode::RESOURCE_EXHAUSTED,
+             "Insufficient memory to create collection"));
 }
 
 Result<Collection::Ptr> Collection::Open(const std::string &path,
@@ -494,10 +638,13 @@ Status CollectionImpl::close_unsafe() {
     }
   }
 
+  release_resources();
+  return result;
+}
+
+void CollectionImpl::release_resources() {
   query_internal_ids_fields_.clear();
   read_only_segments_.clear();
-
-  // always release resources regardless of flush outcome
   writing_segment_.reset();
   segment_manager_.reset();
   version_manager_.reset();
@@ -505,8 +652,6 @@ Status CollectionImpl::close_unsafe() {
   delete_store_.reset();
 
   lock_file_.close();
-
-  return result;
 }
 
 Status CollectionImpl::destroy() {
@@ -2283,8 +2428,21 @@ Status CollectionImpl::recovery() {
   }
 
   // get lock file
-  auto s = acquire_file_lock(false);
-  CHECK_RETURN_STATUS(s);
+  const auto marker = CreationMarkerPath(path_);
+  const bool pending_creation =
+      !attaching_creation_ && ailego::File::IsExist(marker);
+  if (pending_creation) {
+    CHECK_RETURN_STATUS(CheckCreationLease(path_));
+    if (options_.read_only_) {
+      return Status::FailedPrecondition(
+          "Collection creation requires a writable open: ", path_);
+    }
+  }
+  Status s;
+  if (!lock_file_.is_valid()) {
+    s = acquire_file_lock(false);
+    CHECK_RETURN_STATUS(s);
+  }
 
   // recovery version first
   auto version_manager = VersionManager::Recovery(path_);
@@ -2294,8 +2452,47 @@ Status CollectionImpl::recovery() {
 
   version_manager_ = version_manager.value();
   const auto v = version_manager_->get_current_version();
+  if (!v.writing_segment_meta() ||
+      !v.writing_segment_meta()->writing_forward_block().has_value()) {
+    return Status::InvalidArgument("Manifest has no writing segment: ", path_);
+  }
   schema_ = std::make_shared<CollectionSchema>(v.schema());
   options_.enable_mmap_ = v.enable_mmap();
+
+  // WAL recovery needs exclusive access and writable stores, even if the
+  // caller only wants to query. Reject before opening stores or cleaning
+  // crash residue under the read-only shared lock.
+  bool replays_wal = false;
+  if (const auto &meta = v.writing_segment_meta(); meta) {
+    if (const auto &block = meta->writing_forward_block(); block.has_value()) {
+      const auto wal_path =
+          FileHelper::MakeWalPath(path_, meta->id(), block->id());
+      replays_wal = FileHelper::FileExists(wal_path);
+      if (options_.read_only_ && replays_wal) {
+        // Inspect without write permission before any stores are opened. A
+        // valid header-only WAL has nothing to replay; existence alone does
+        // not imply that a read-only open needs recovery.
+        WalOptions wal_options;
+        wal_options.read_only = true;
+        WalFilePtr wal;
+        if (WalFile::CreateAndOpen(wal_path, wal_options, &wal) != 0 ||
+            wal->prepare_for_read() != 0) {
+          return Status::InternalError("Failed to inspect WAL for recovery: ",
+                                       wal_path);
+        }
+        replays_wal = wal->has_record();
+      }
+    }
+  }
+  if (options_.read_only_ && replays_wal) {
+    return Status::FailedPrecondition(
+        "Collection requires WAL recovery; open with read_only=false "
+        "once before read-only access.");
+  }
+  // Establish the shared budget before opening the collection's stores.
+  if (GlobalResource::Instance().initialize() != 0) {
+    return Status::InternalError("Failed to initialize shared memory budget");
+  }
   s = recover_idmap_and_delete_store();
   CHECK_RETURN_STATUS(s);
 
@@ -2338,7 +2535,11 @@ Status CollectionImpl::recovery() {
   writing_segment_ = writing_segment.value();
   segment_id_allocator_.store(v.next_segment_id());
 
-  // recover id map & delete store
+  if (pending_creation && ailego::File::IsExist(marker) &&
+      !ailego::File::Delete(marker)) {
+    return Status::InternalError("Failed to complete collection creation: ",
+                                 path_);
+  }
   return Status::OK();
 }
 
@@ -2474,15 +2675,50 @@ Status CollectionImpl::create() {
                                    "not exist");
   }
 
-  // check schema
   auto s = schema_->validate();
   CHECK_RETURN_STATUS(s);
-
-  if (!ailego::FileHelper::MakePath(path_.c_str())) {
-    return Status::InvalidArgument(
-        "create collection path failed: ", path_,
-        ", error: ", ailego::FileHelper::GetLastErrorString());
+  if (GlobalResource::Instance().initialize() != 0) {
+    return Status::InternalError("Failed to initialize shared memory budget");
   }
+
+  if (ailego::StagedPath::supported()) {
+    staged_creation_ = std::make_unique<ailego::StagedPath>();
+    if (!staged_creation_->prepare(path_)) {
+      return Status::InvalidArgument("Failed to stage collection ", path_, ", ",
+                                     ailego::FileHelper::GetLastErrorString());
+    }
+    path_ = staged_creation_->path();
+  }
+
+  namespace fs = std::filesystem;
+  auto owned_path = ailego::FileHelper::PathFromUtf8(path_);
+  while (owned_path.has_relative_path() &&
+         (!owned_path.has_filename() || owned_path.filename() == ".")) {
+    owned_path = owned_path.parent_path();
+  }
+  const auto owned_path_utf8 = ailego::FileHelper::PathToUtf8(owned_path);
+  std::error_code error;
+  const auto parent = owned_path.parent_path();
+  if (!parent.empty()) fs::create_directories(parent, error);
+  // Only the attempt that creates the leaf may discard its contents.
+  if (error || !fs::create_directory(owned_path, error)) {
+    if (!error) error = std::make_error_code(std::errc::file_exists);
+    return Status::InvalidArgument("create collection path failed: ", path_,
+                                   ", error: ", error.message());
+  }
+  const auto identity = ailego::File::IdentifyPath(owned_path_utf8);
+  bool created = false;
+  AILEGO_DEFER([&] {
+    if (!created) {
+      closed_ = true;
+      release_resources();
+      if (identity.valid &&
+          ailego::File::IdentifyPath(owned_path_utf8) == identity &&
+          !ailego::FileHelper::RemoveDirectory(owned_path_utf8.c_str())) {
+        LOG_ERROR("Failed to remove incomplete collection %s", path_.c_str());
+      }
+    }
+  });
 
   // init lock file
   s = acquire_file_lock(true);
@@ -2509,13 +2745,14 @@ Status CollectionImpl::create() {
   version.set_delete_snapshot_path_suffix(0);
   version.set_next_segment_id(1);
 
+  segment_manager_ = std::make_unique<SegmentManager>();
   version_manager_->apply(version);
   s = version_manager_->flush();
   CHECK_RETURN_STATUS(s);
 
   segment_id_allocator_.store(1);
-  segment_manager_ = std::make_unique<SegmentManager>();
 
+  created = true;
   return Status::OK();
 }
 
@@ -2531,10 +2768,7 @@ Status CollectionImpl::create_idmap_and_delete_store() {
   std::string delete_store_path =
       FileHelper::MakeFilePath(path_, FileID::DELETE_FILE, 0);
   delete_store_ = std::make_shared<DeleteStore>(schema_->name());
-  // when first create collection, delete store will flush a empty snapshot
-  delete_store_->flush(delete_store_path);
-
-  return Status::OK();
+  return delete_store_->flush(delete_store_path);
 }
 
 Status CollectionImpl::init_version_manager() {

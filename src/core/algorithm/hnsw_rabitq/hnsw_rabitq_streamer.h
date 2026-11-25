@@ -62,6 +62,8 @@ class HnswRabitqStreamer : public IndexStreamer {
   //! Cleanup Streamer
   int cleanup() override;
 
+  int abort_open() override;
+
   //! Create a context
   Context::Pointer create_context() const override;
 

@@ -142,6 +142,10 @@ ailego::Params MakeTurboQuantizerParams(const QuantizerParam &quantizer_param,
 
 }  // namespace
 
+BaseIndexParam::Pointer FlatIndex::get_param() const {
+  return std::make_shared<FlatIndexParam>(param_);
+}
+
 int FlatIndex::bind_vector_source(const core::VectorSource &source,
                                   core::IndexContext::Pointer &context) {
   if (!param_.use_external_vector) return core::IndexError_Unsupported;
@@ -184,6 +188,7 @@ int FlatIndex::search_with_source(
 
 int FlatIndex::open(const std::string &file_path,
                     StorageOptions storage_options) {
+  if (is_open_) return core::IndexError_NoReady;
   // Restore the persisted encoding while keeping the configured structural
   // meta for the streamer's open-time compatibility checks.
   if (turbo_quantizer_ != nullptr) {

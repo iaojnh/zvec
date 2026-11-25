@@ -370,6 +370,10 @@ int HnswStreamer::cleanup() {
 
   LOG_INFO("HnswStreamer cleanup");
 
+  return abort_open();
+}
+
+int HnswStreamer::abort_open() {
   meta_.clear();
   metric_.reset();
   quantizer_.reset();
@@ -849,8 +853,8 @@ IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
     LOG_ERROR("CreateContext clone init failed");
     return Context::Pointer();
   }
-  HnswContext *ctx =
-      new (std::nothrow) HnswContext(meta_.dimension(), metric_, entity);
+  auto ctx = std::unique_ptr<HnswContext>(
+      new (std::nothrow) HnswContext(meta_.dimension(), metric_, entity));
   if (ailego_unlikely(ctx == nullptr)) {
     LOG_ERROR("Failed to new HnswContext");
     return Context::Pointer();
@@ -870,7 +874,6 @@ IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
 
   if (ailego_unlikely(ctx->init(HnswContext::kStreamerContext)) != 0) {
     LOG_ERROR("Init HnswContext failed");
-    delete ctx;
     return Context::Pointer();
   }
   uint32_t estimate_doc_count = 0;
@@ -883,7 +886,7 @@ IndexStreamer::Context::Pointer HnswStreamer::create_context() const {
 
   if (build_vector_source_) ctx->set_vector_source(build_vector_source_);
 
-  return Context::Pointer(ctx);
+  return ctx;
 }
 
 IndexProvider::Pointer HnswStreamer::create_provider() const {

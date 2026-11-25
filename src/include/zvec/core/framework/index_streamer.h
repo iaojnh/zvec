@@ -76,6 +76,13 @@ class IndexStreamer : public IndexRunner {
 
   //! Retrieve meta of index
   virtual const IndexMeta &meta() const = 0;
+
+  //! Release an unsuccessful open without persisting streamer metadata.
+  //! The storage owner closes its handle afterwards. Streamers whose normal
+  //! cleanup performs allocating persistence must override this rollback hook.
+  virtual int abort_open() {
+    return cleanup();
+  }
 };
 
 }  // namespace core

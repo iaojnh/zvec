@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <zvec/db/status.h>
+
 #ifdef _MSC_VER
 #define _ALLOW_KEYWORD_MACROS
 #endif
@@ -21,10 +23,16 @@
 #undef private
 #undef protected
 
+#if defined(__linux__)
+#include <sys/resource.h>
+#include <csignal>
+#endif
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <gtest/gtest.h>
@@ -50,6 +58,102 @@ class WalFileTest : public testing::Test {
 
   void TearDown() override {}
 };
+
+TEST_F(WalFileTest, LargeRecordsRoundTripAcrossTheOldFourMiBBoundary) {
+  const std::string path = "./data.wal.large";
+  const size_t boundary = size_t{4} << 20;
+  const std::vector<size_t> sizes{boundary - 1, boundary, boundary + 1,
+                                  size_t{5} << 20};
+  WalFilePtr wal;
+  ASSERT_EQ(0, WalFile::CreateAndOpen(path, {0, true}, &wal));
+  for (size_t size : sizes) {
+    ASSERT_EQ(0, wal->append(std::string(size, 'x'))) << size;
+  }
+  ASSERT_EQ(0, wal->close());
+  ASSERT_EQ(0, WalFile::CreateAndOpen(path, {0, false, true}, &wal));
+  ASSERT_EQ(0, wal->prepare_for_read());
+  for (size_t size : sizes) {
+    EXPECT_EQ(std::string(size, 'x'), wal->next());
+    ASSERT_TRUE(wal->read_status().ok());
+  }
+  EXPECT_TRUE(wal->next().empty());
+  EXPECT_TRUE(wal->read_status().ok());
+}
+
+TEST_F(WalFileTest, WalRecoveryRemovesTornTailBeforeAppend) {
+  for (const auto tail_bytes : {2, 6, 9}) {
+    SCOPED_TRACE(tail_bytes);
+    const auto wal_path = "./data.wal.torn." + std::to_string(tail_bytes);
+    WalFilePtr wal;
+    ASSERT_EQ(0, WalFile::CreateAndOpen(wal_path, {0, true}, &wal));
+    ASSERT_EQ(0, wal->append("first"));
+    ASSERT_EQ(0, wal->flush());
+    const auto first_end = std::filesystem::file_size(wal_path);
+    ASSERT_EQ(0, wal->append("incomplete"));
+    ASSERT_EQ(0, wal->close());
+    std::filesystem::resize_file(wal_path, first_end + tail_bytes);
+
+    ASSERT_EQ(0, WalFile::CreateAndOpen(wal_path, {0, false, true}, &wal));
+    ASSERT_EQ(0, wal->prepare_for_read());
+    EXPECT_EQ("first", wal->next());
+    EXPECT_TRUE(wal->next().empty());
+    EXPECT_TRUE(wal->read_status().ok());
+    ASSERT_EQ(0, wal->close());
+    EXPECT_EQ(first_end + tail_bytes, std::filesystem::file_size(wal_path));
+
+    ASSERT_EQ(0, WalFile::CreateAndOpen(wal_path, {0, false}, &wal));
+    ASSERT_EQ(0, wal->prepare_for_read());
+    EXPECT_EQ("first", wal->next());
+    EXPECT_TRUE(wal->next().empty());
+    EXPECT_TRUE(wal->read_status().ok());
+    ASSERT_EQ(0, wal->close());
+
+    ASSERT_EQ(0, WalFile::CreateAndOpen(wal_path, {0, false}, &wal));
+    ASSERT_EQ(0, wal->append("second"));
+    ASSERT_EQ(0, wal->prepare_for_read());
+    EXPECT_EQ("first", wal->next());
+    EXPECT_EQ("second", wal->next());
+    EXPECT_TRUE(wal->next().empty());
+    EXPECT_TRUE(wal->read_status().ok());
+  }
+}
+
+#if defined(__linux__) && GTEST_HAS_DEATH_TEST
+TEST_F(WalFileTest, PartialAppendCanRetryOnTheSameHandle) {
+  const auto previous_style = ::testing::FLAGS_gtest_death_test_style;
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  EXPECT_EXIT(
+      {
+        const std::string path = "./data.wal.short";
+        WalFilePtr wal;
+        if (WalFile::CreateAndOpen(path, {0, true}, &wal) != 0 ||
+            wal->append("first") != 0)
+          std::_Exit(1);
+        const auto complete = std::filesystem::file_size(path);
+        struct rlimit original;
+        if (getrlimit(RLIMIT_FSIZE, &original) != 0) std::_Exit(2);
+        auto limited = original;
+        limited.rlim_cur = complete + 6;
+        const auto old_signal = std::signal(SIGXFSZ, SIG_IGN);
+        if (old_signal == SIG_ERR || setrlimit(RLIMIT_FSIZE, &limited) != 0)
+          std::_Exit(3);
+        const int refused = wal->append("unfinished");
+        if (setrlimit(RLIMIT_FSIZE, &original) != 0) std::_Exit(4);
+        std::signal(SIGXFSZ, old_signal);
+        if (refused == 0 || std::filesystem::file_size(path) != complete)
+          std::_Exit(5);
+        if (wal->append("second") != 0 || wal->prepare_for_read() != 0 ||
+            wal->next() != "first" || wal->next() != "second" ||
+            !wal->next().empty() || !wal->read_status().ok())
+          std::_Exit(6);
+        wal->close();
+        wal->remove();
+        std::_Exit(0);
+      },
+      ::testing::ExitedWithCode(0), "");
+  ::testing::FLAGS_gtest_death_test_style = previous_style;
+}
+#endif
 
 TEST_F(WalFileTest, ReadOnlyRejectsWritesAndPreservesRecords) {
   const std::string path = "./data.wal.readonly";

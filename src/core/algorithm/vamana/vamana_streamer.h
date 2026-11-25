@@ -42,6 +42,8 @@ class VamanaStreamer : public IndexStreamer {
 
   int cleanup() override;
 
+  int abort_open() override;
+
   Context::Pointer create_context() const override;
 
   IndexProvider::Pointer create_provider() const override;
