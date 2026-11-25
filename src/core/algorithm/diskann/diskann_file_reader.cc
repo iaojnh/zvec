@@ -394,8 +394,11 @@ static bool reset_aio_context(IoBackend &ctx) {
 static bool prepare_libaio_staging(IoBackend &ctx, const AlignedRead *reads,
                                    size_t count) try {
   using Buffer = ailego::BudgetedMappedBuffer;
-  if (ailego::MemoryLimitPool::get_instance().under_process_rss_pressure())
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  if (pool.process_rss_limit() &&
+      (!pool.capacity() || pool.under_process_rss_pressure())) {
     return false;
+  }
   size_t bytes = 0;
   for (size_t i = 0; i < count; ++i) {
     if (!reads[i].buf || !reads[i].len ||

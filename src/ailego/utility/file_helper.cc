@@ -428,7 +428,13 @@ bool StagedPath::supported() {
 bool StagedPath::prepare(const std::string &destination) {
   ClearFsError();
   if (!directory_.empty() || !supported()) return false;
-  auto target = FileHelper::PathFromUtf8(destination);
+  std::error_code absolute_error;
+  auto target =
+      fs::absolute(FileHelper::PathFromUtf8(destination), absolute_error);
+  if (absolute_error) {
+    SetFsError(absolute_error);
+    return false;
+  }
   while (target.has_relative_path() &&
          (!target.has_filename() || target.filename() == ".")) {
     target = target.parent_path();

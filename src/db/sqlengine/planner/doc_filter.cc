@@ -26,6 +26,10 @@
 namespace zvec::sqlengine {
 
 Status DocFilter::compute_filter() {
+  forward_prepared_ = false;
+  forward_view_.reset();
+  forward_rows_ = 0;
+  sealed_deletion_.reset();
   if (invert_cond_) {
     InvertSearch search(segment_.get());
     auto invert_res = search.exec_invert_cond_tree(invert_cond_.get());
@@ -71,18 +75,39 @@ Status DocFilter::compute_filter() {
     forward_bitmap_ = forward_table->column(0);
   }
 
+  // A sealed IPC segment also supplies a lock-free deletion check. Only a
+  // filter that exists now is replaced, so the delete bitmap observed at
+  // construction still decides whether deletion is checked at all.
+  const bool with_deletion = delete_filter_ != nullptr;
   if (forward_filter_expr_) {
     // get schema to bind to Expression
-    auto table = segment_->fetch(query_info_->get_forward_filter_field_names(),
-                                 std::vector<int>{});
-    if (!table) {
-      return Status::InternalError("Fetch forward failed");
+    const auto columns = query_info_->get_forward_filter_field_names();
+    auto prepared = segment_->prepare_forward_read(columns, with_deletion);
+    if (!prepared.ok()) {
+      const auto &status = prepared.status();
+      return Status(status.IsOutOfMemory() ? StatusCode::RESOURCE_EXHAUSTED
+                                           : StatusCode::INTERNAL_ERROR,
+                    status.ToString());
+    }
+    auto state = prepared.MoveValueUnsafe();
+    forward_rows_ = state.num_rows;
+    forward_view_ = std::move(state.view);
+    sealed_deletion_ = std::move(state.deletion_filter);
+    const auto &schema = state.schema;
+    // Log outside segment synchronization.
+    if (forward_view_) {
+      LOG_DEBUG("Forward filter view: segment[%d] rows[%zu] columns[%zu]",
+                segment_->id(), static_cast<size_t>(forward_rows_),
+                columns.size());
+    } else {
+      LOG_DEBUG("Forward filter locked fetch: segment[%d] rows[%zu]",
+                segment_->id(), static_cast<size_t>(forward_rows_));
     }
     auto *pool = segment_->uses_buffer_storage()
                      ? detail::GetParquetMemoryPool().get()
                      : arrow::default_memory_pool();
     arrow::compute::ExecContext context(pool);
-    auto bind_res = forward_filter_expr_->Bind(*table->schema(), &context);
+    auto bind_res = forward_filter_expr_->Bind(*schema, &context);
     if (!bind_res.ok()) {
       if (bind_res.status().IsOutOfMemory())
         return Status(StatusCode::RESOURCE_EXHAUSTED,
@@ -91,6 +116,14 @@ Status DocFilter::compute_filter() {
                                    bind_res.status().ToString());
     }
     *forward_filter_expr_ = bind_res.MoveValueUnsafe();
+    forward_prepared_ = true;
+  } else if (with_deletion) {
+    // Without a forward predicate the capture is only an optimization: on
+    // any failure keep the segment's filter, which gives the same results.
+    auto prepared = segment_->prepare_forward_read({}, true);
+    if (prepared.ok()) {
+      sealed_deletion_ = std::move(prepared->deletion_filter);
+    }
   }
   return Status::OK();
 }
@@ -101,8 +134,11 @@ bool DocFilter::empty() const {
 }
 
 Result<bool> DocFilter::is_filtered_checked(uint64_t id) const try {
+  if (forward_filter_expr_ && !forward_prepared_) return true;
+  if (forward_view_ && id >= forward_rows_) return true;
   if (delete_filter_) {
-    auto result = delete_filter_->is_filtered_checked(id);
+    auto result = (sealed_deletion_ ? sealed_deletion_ : delete_filter_)
+                      ->is_filtered_checked(id);
     if (!result || *result) return result;
   }
   if (invert_filter_) {
@@ -180,8 +216,16 @@ std::optional<std::vector<uint64_t>> DocFilter::get_bf_by_keys_and_update(
 }
 
 Result<bool> DocFilter::is_matched_by_forward_filter(uint64_t id) const {
-  auto exec_batch =
-      segment_->fetch(query_info_->get_forward_filter_field_names(), id);
+  ExecBatchPtr exec_batch;
+  if (forward_view_) {
+    exec_batch = forward_view_->read_row(id);
+  } else {
+    const auto &columns = query_info_->get_forward_filter_field_names();
+    // Literal predicates need a one-row batch but no scalar storage access.
+    exec_batch = columns.empty() ? std::make_shared<arrow::compute::ExecBatch>(
+                                       std::vector<arrow::Datum>{}, 1)
+                                 : segment_->fetch(columns, id);
+  }
   if (!exec_batch) {
     return tl::make_unexpected(
         Status::InternalError("Fetch forward failed for row ID ", id));

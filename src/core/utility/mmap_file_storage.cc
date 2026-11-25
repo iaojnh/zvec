@@ -230,7 +230,8 @@ class MMapFileStorage : public IndexStorage {
     return open_index(path, options);
   }
 
-  int open_index(const std::string &path, const OpenOptions &options) {
+  int open_index(const std::string &path, const OpenOptions &options) try {
+    if (mapping_.index_size() != 0) return IndexError_OpenFile;
     std::unique_ptr<ailego::StagedPath> pending;
     ailego::File::Identity created_file;
     ailego::File::Identity private_identity;
@@ -283,6 +284,8 @@ class MMapFileStorage : public IndexStorage {
     opened = true;
     if (options.created_file) *options.created_file = created_file;
     return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
   }
 
   int publish_creation() override {

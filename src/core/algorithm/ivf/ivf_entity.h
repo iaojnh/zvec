@@ -57,6 +57,35 @@ class IVFEntity {
   // accepted=false keeps this list in the caller's rolling lookahead plan.
   size_t prefetch_list(size_t inverted_list_id, bool *accepted = nullptr) const;
   void release_prefetch() const;
+  const turbo::DistanceImpl &query_distance() const {
+    return query_distance_;
+  }
+
+  //! Match the bound posting kernel without changing its layout or arithmetic.
+  turbo::ManyToManyDistanceFunc many_distance() const;
+
+  bool buffered_storage() const {
+    return (container_ && container_->vec_buffer_pool() != nullptr) ||
+           (inverted_ && inverted_->supports_read_chunks());
+  }
+
+  bool column_many_supported() const {
+    return !quantizer_ && calculator_ && calculator_->column_many_supported();
+  }
+
+  turbo::DistanceImpl column_query(const void *query,
+                                   const IndexQueryMeta &qmeta) const {
+    return calculator_->column_query(query, qmeta);
+  }
+
+  //! Scan one list for queries sharing the same next centroid. Column-major
+  //! blocks retain their matrix kernel and do not require a Turbo row kernel.
+  int search_many(size_t inverted_list_id,
+                  const std::vector<const turbo::DistanceImpl *> &queries,
+                  const turbo::ManyToManyDistanceFunc &distance,
+                  const std::vector<IndexCandidateHeap *> &heaps,
+                  const std::vector<IndexContext::Stats *> &stats,
+                  uint32_t *scan_count) const;
 
   const turbo::Quantizer::Pointer &quantizer() const {
     return quantizer_;
@@ -406,6 +435,8 @@ class IVFEntity {
   int load_header(const IndexStorage::Pointer &container);
 
   int load_quantizer(const IndexStorage::Pointer &container);
+
+  size_t posting_read_size(size_t offset, size_t blocks, size_t items) const;
 
   //! Unlike fetch, distance evaluation must not read retained original vectors.
   int read_posting_vector(size_t id, IndexStorage::MemoryBlock &block) const;

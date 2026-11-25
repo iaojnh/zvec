@@ -1358,13 +1358,14 @@ int VecBufferPool::init() {
   writeback_staging_size_ = staging_charge;
   writeback_staging_projection_ = staging_projection;
 #if defined(__linux__) && !defined(__ANDROID__)
-  // Only an available ring needs the optional second staging allowance.
-  // Synchronous writeback uses the mandatory workspace reserved above.
+  // An optional io_uring stage owns its reservation. Leave enough room for
+  // the initial data page and slab header before trying the optional path.
+  const size_t io_staging_charge = kBlockingAioBatchSize * kVectorPageSize;
   if (writable_ && io_backend_type_ == IOBackendType::kIoUring &&
-      !pool.under_process_rss_pressure()) {
+      !pool.under_process_rss_pressure() &&
+      pool.available() >= io_staging_charge + 2 * kVectorPageSize) {
     try {
       auto ring = std::make_unique<IoUringRing>();
-      const size_t io_staging_charge = kBlockingAioBatchSize * kVectorPageSize;
       if (ring->setup(kBlockingAioBatchSize) &&
           pool.try_charge_metadata_without_reclaim(io_staging_charge)) {
         ring->adopt_staging_reservation(io_staging_charge);
@@ -1573,30 +1574,40 @@ void VecBufferPool::register_metadata_range(size_t offset, size_t length) {
   }
   {
     std::shared_lock<std::shared_mutex> lock(metadata_ranges_mutex_);
-    if (metadata_ranges_.find(offset) != metadata_ranges_.end()) return;
+    if (metadata_ranges_ &&
+        metadata_ranges_->find(offset) != metadata_ranges_->end()) {
+      return;
+    }
   }
   // Budget admission can reclaim pages and enter writeback. Allocate the
-  // node before taking the lock that writeback uses to read the directory.
-  MetadataRanges pending;
-  auto entry = pending.emplace(offset, end);
-  auto node = pending.extract(entry.first);
+  // map and node before taking the lock that writeback uses to read them.
+  auto pending = std::make_unique<MetadataRanges>();
+  const auto entry = pending->emplace(offset, end);
   std::unique_lock<std::shared_mutex> lock(metadata_ranges_mutex_);
-  metadata_ranges_.insert(std::move(node));
-  has_unaligned_metadata_.store(true, std::memory_order_release);
+  if (metadata_ranges_) {
+    metadata_ranges_->insert(pending->extract(entry.first));
+  } else {
+    metadata_ranges_ = std::move(pending);
+    has_unaligned_metadata_.store(true, std::memory_order_release);
+  }
 }
 
 void VecBufferPool::unregister_metadata_range(size_t offset) {
   if (!has_unaligned_metadata_.load(std::memory_order_acquire)) return;
   std::unique_lock<std::shared_mutex> lock(metadata_ranges_mutex_);
-  metadata_ranges_.erase(offset);
-  has_unaligned_metadata_.store(!metadata_ranges_.empty(),
-                                std::memory_order_release);
+  if (!metadata_ranges_) return;
+  metadata_ranges_->erase(offset);
+  if (metadata_ranges_->empty()) {
+    metadata_ranges_.reset();
+    has_unaligned_metadata_.store(false, std::memory_order_release);
+  }
 }
 
-VecBufferPool::MetadataRanges::const_iterator VecBufferPool::first_metadata_range(
-    size_t offset) const {
-  auto range = metadata_ranges_.upper_bound(offset);
-  if (range != metadata_ranges_.begin() && std::prev(range)->second > offset) {
+VecBufferPool::MetadataRanges::const_iterator
+VecBufferPool::first_metadata_range(const MetadataRanges &ranges,
+                                    size_t offset) {
+  auto range = ranges.upper_bound(offset);
+  if (range != ranges.begin() && std::prev(range)->second > offset) {
     --range;
   }
   return range;
@@ -1605,9 +1616,10 @@ VecBufferPool::MetadataRanges::const_iterator VecBufferPool::first_metadata_rang
 bool VecBufferPool::page_overlaps_metadata(size_t offset) const {
   if (!has_unaligned_metadata_.load(std::memory_order_acquire)) return false;
   std::shared_lock<std::shared_mutex> lock(metadata_ranges_mutex_);
-  const auto range = first_metadata_range(offset);
-  return range != metadata_ranges_.end() &&
-         range->first < offset + kVectorPageSize;
+  if (!metadata_ranges_) return false;
+  const auto &ranges = *metadata_ranges_;
+  const auto range = first_metadata_range(ranges, offset);
+  return range != ranges.end() && range->first < offset + kVectorPageSize;
 }
 
 int VecBufferPool::writeback_page(size_t offset, size_t length,
@@ -1634,18 +1646,21 @@ int VecBufferPool::writeback_page(size_t offset, size_t length,
 
   if (has_unaligned_metadata_.load(std::memory_order_acquire)) {
     std::shared_lock<std::shared_mutex> lock(metadata_ranges_mutex_);
-    auto range = first_metadata_range(offset);
-    if (range != metadata_ranges_.end() && range->first < end) {
-      // Directory bytes are published by write_meta(). A cached copy may
-      // precede a directory update. Only the gaps belong to data writeback.
-      size_t begin = offset;
-      for (; range != metadata_ranges_.end() && range->first < end; ++range) {
-        if (const int error = write(meta_fd_, begin, range->first)) {
-          return error;
+    if (metadata_ranges_) {
+      const auto &ranges = *metadata_ranges_;
+      auto range = first_metadata_range(ranges, offset);
+      if (range != ranges.end() && range->first < end) {
+        // Directory bytes are published by write_meta(). A cached copy may
+        // precede a directory update. Only the gaps belong to data writeback.
+        size_t begin = offset;
+        for (; range != ranges.end() && range->first < end; ++range) {
+          if (const int error = write(meta_fd_, begin, range->first)) {
+            return error;
+          }
+          begin = range->second;
         }
-        begin = range->second;
+        return write(meta_fd_, begin, end);
       }
-      return write(meta_fd_, begin, end);
     }
   }
   return write(fd_, offset, end);
@@ -2369,7 +2384,7 @@ bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
     // F_NOCACHE (macOS) and ordinary file handles do not impose O_DIRECT's
     // alignment restriction. They can copy even partial pages straight out.
     const bool needs_alignment = requires_aligned_io();
-    const bool direct_destination =
+    bool direct_destination =
         !needs_alignment ||
         (within_page == 0 && copy_size == kVectorPageSize &&
          reinterpret_cast<uintptr_t>(buffer + copied) % kVectorPageSize == 0);
@@ -2404,10 +2419,13 @@ bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
         continue;
       }
     }
+    int read_fd = fd_;
     if (!writable_ && !direct_destination &&
-        PrepareReadScratch(scratch, 1) == 0) {
-      allocation_failed = true;
-      return false;
+        (!cache_enabled() || PrepareReadScratch(scratch, 1) == 0)) {
+      // The buffered descriptor was verified against the data descriptor
+      // when opening. A read-only copy needs no aligned workspace here.
+      read_fd = meta_fd_;
+      direct_destination = true;
     }
     char *page = direct_destination ? buffer + copied : scratch.data();
     const size_t available = file_size_ - page_offset;
@@ -2424,7 +2442,7 @@ bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
 
     ++io_requests;
     const ssize_t read_bytes = zvec_pread(
-        fd_, page, read_size, direct_destination ? absolute : page_offset);
+        read_fd, page, read_size, direct_destination ? absolute : page_offset);
     if (read_bytes <= 0 ||
         (direct_destination ? copy_size : within_page + copy_size) >
             static_cast<size_t>(read_bytes)) {
@@ -2523,7 +2541,7 @@ int VecBufferPool::write_range(size_t file_offset, size_t length,
 }
 
 int VecBufferPool::write_range(size_t file_offset, size_t length,
-                              const char *src, size_t *written) {
+                               const char *src, size_t *written) {
   return write_range_status(file_offset, length, src, written) ==
                  PageWriteStatus::kOk
              ? 0
@@ -2531,9 +2549,9 @@ int VecBufferPool::write_range(size_t file_offset, size_t length,
 }
 
 PageWriteStatus VecBufferPool::write_range_status(size_t file_offset,
-                                                 size_t length,
-                                                 const char *src,
-                                                 size_t *written) try {
+                                                  size_t length,
+                                                  const char *src,
+                                                  size_t *written) try {
   if (written != nullptr) *written = 0;
   if (writeback_quarantined()) return PageWriteStatus::kError;
   if (!writable_) {
@@ -2862,10 +2880,12 @@ bool VecBufferPool::extend_file(size_t new_size) {
 }
 
 bool VecBufferPool::truncate_unused_tail(size_t new_size) {
+  if (writeback_quarantined()) return false;
   if (!writable_ || new_size > file_size_) return false;
   if (new_size == file_size_) return true;
 
   std::lock_guard<std::mutex> lock(writeback_flush_mutex_);
+  if (writeback_quarantined()) return false;
   const size_t new_entry_num =
       new_size == 0 ? 0 : (new_size - 1) / kVectorPageSize + 1;
   const bool discard_pages = new_entry_num < page_table_.entry_num();
@@ -3214,13 +3234,15 @@ int VecBufferPoolHandle::write_range(size_t file_offset, size_t len,
   return pool_.write_range(file_offset, len, src);
 }
 
-PageWriteStatus VecBufferPoolHandle::write_range_status(
-    size_t file_offset, size_t len, const char *src, size_t *written) {
+PageWriteStatus VecBufferPoolHandle::write_range_status(size_t file_offset,
+                                                        size_t len,
+                                                        const char *src,
+                                                        size_t *written) {
   return pool_.write_range_status(file_offset, len, src, written);
 }
 
 int VecBufferPoolHandle::write_range(size_t file_offset, size_t len,
-                                   const char *src, size_t *written) {
+                                     const char *src, size_t *written) {
   return pool_.write_range(file_offset, len, src, written);
 }
 
@@ -3583,16 +3605,15 @@ struct ThreadLocalAioContext {
     return usable;
   }
 
-  bool destroy_context(const char *context_name) {
+  bool destroy_context() {
     if (!ctx) return true;
     const int ret = LibAioLoader::Instance().destroy_budgeted(ctx, memory);
     if (ret != 0) {
-      LOG_ERROR(
-          "%s: io_destroy failed, ret=%d; in-flight buffers remain "
-          "quarantined",
-          context_name, ret);
+      usable = false;
       return false;
     }
+    inited = false;
+    usable = false;
     return true;
   }
 };
@@ -3629,7 +3650,7 @@ struct ThreadLocalBlockingAioCtx
   }
 
   ~ThreadLocalBlockingAioCtx() {
-    if (destroy_context("ThreadLocalBlockingAioCtx")) {
+    if (destroy_context()) {
       release_quarantined();
     }
   }
@@ -3639,7 +3660,7 @@ static thread_local ThreadLocalIoUringContext<kBlockingAioBatchSize>
 static thread_local ThreadLocalBlockingAioCtx tl_blocking_aio;
 
 void retire_blocking_aio(char **buffers, size_t count) {
-  if (!tl_blocking_aio.destroy_context("ThreadLocalBlockingAioCtx"))
+  if (!tl_blocking_aio.destroy_context())
     tl_blocking_aio.quarantine(buffers, count);
 }
 
@@ -3691,6 +3712,14 @@ bool VecBufferPool::read_ranges_bypass_aio(const ReadRange *ranges,
   for (size_t begin = 0; begin < count; begin += kBatchSize) {
     const size_t batch = std::min(kBatchSize, count - begin);
     if (use_io_uring) {
+      bool aligned = true;
+      for (size_t i = 0; i < batch; ++i) {
+        if (reinterpret_cast<uintptr_t>(ranges[begin + i].buffer) % 512 != 0) {
+          aligned = false;
+          break;
+        }
+      }
+      if (!aligned) return false;
       std::array<IoUringRead, kBatchSize> requests{};
       for (size_t i = 0; i < batch; ++i) {
         const auto &range = ranges[begin + i];
@@ -4046,6 +4075,10 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
       }
 
       const size_t accepted = static_cast<size_t>(submit_ret);
+      bool in_flight = true;
+      auto retire_on_error = ScopeGuard::Make([&] {
+        if (in_flight) retire_blocking_aio(buffers.data(), accepted);
+      });
       aio_pages_submitted_.fetch_add(accepted, std::memory_order_relaxed);
       batch_ok = batch_ok && accepted == allocated;
       for (size_t i = accepted; i < allocated; ++i) {
@@ -4061,8 +4094,10 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
       }
 
       std::array<struct io_event, kBlockingAioBatchSize> events{};
-      if (!drain_blocking_aio(cbs.data(), buffers.data(), accepted,
-                              events.data())) {
+      const bool drained = drain_blocking_aio(cbs.data(), buffers.data(),
+                                              accepted, events.data());
+      in_flight = false;
+      if (!drained) {
         abandon_claims(accepted);
         return false;
       }

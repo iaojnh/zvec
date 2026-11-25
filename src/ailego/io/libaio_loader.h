@@ -36,7 +36,6 @@
 #include <mutex>
 #include <ailego/io/libaio_def.h>  // ABI-stable struct definitions (replaces <libaio.h>)
 #include <zvec/ailego/buffer/block_eviction_queue.h>
-#include <zvec/ailego/logger/logger.h>
 
 // Function-pointer typedefs for the four libaio syscalls used by DiskAnn.
 typedef int (*aio_setup_fn)(int maxevents, io_context_t *ctxp);
@@ -86,6 +85,7 @@ class LibAioLoader {
   };
 
   int setup_budgeted(int maxevents, io_context_t &ctx, RingMemory &memory) {
+    if (ctx || !io_setup || !io_destroy || maxevents <= 0) return -EINVAL;
     auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
     const size_t page = pool.page_buffer_size();
     // io_setup returns a completion-ring address. Reserve its header page
@@ -108,7 +108,6 @@ class LibAioLoader {
       if (destroy_ring(ring) == 0) {
         pool.finish_process_backing(page, false);
       } else {
-        LOG_ERROR("%s", "libaio: failed to destroy a rejected completion ring");
         const bool accounted =
             !extra || pool.account_pending_process_backing(extra);
         memory.bytes = page + (accounted ? extra : 0);

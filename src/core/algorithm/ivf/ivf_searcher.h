@@ -131,6 +131,13 @@ class IVFSearcher : public IndexSearcher {
                    uint32_t count, Context::Pointer &context, bool brute,
                    const std::vector<std::vector<uint64_t>> *p_keys = nullptr,
                    const std::vector<uint64_t> *single_keys = nullptr) const;
+  int search_many(const void *query, const IndexQueryMeta &qmeta,
+                  uint32_t count, IVFSearcherContext *ctx, bool brute_force,
+                  size_t result_offset, bool *handled) const;
+
+  int search_bf(const void *query, const IndexQueryMeta &qmeta, uint32_t count,
+                Context::Pointer &context,
+                const std::vector<std::vector<uint64_t>> *p_keys) const;
 
   //! Constants
   static constexpr uint32_t kDefaultBfThreshold = 1000u;

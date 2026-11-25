@@ -1135,13 +1135,12 @@ TEST(MergedProviderIndexHolderTest, OrdinalReadsDoNotAccumulatePagePins) {
     const std::string path{"merged_provider_ordinal_read_test.bin"};
   } backing;
   constexpr size_t kPageCount = 2;
+  // Fit both data pages and the slab header so the pin assertions do not
+  // depend on eviction between reads.
   ASSERT_EQ(
-      0, ailego::PoolPayloadBudget::get_instance().init(
-             kPageCount * ailego::kVectorPageSize +
-             ailego::VecBufferPool::metadata_bytes_for_page_count(kPageCount) +
-             // The holder's source directory, ordinal map and reader are
-             // mandatory workspace, not either of the two cached pages.
-             64 * 1024));
+      0, ::zvec::ailego::PoolPayloadBudget::get_instance().init(
+             (kPageCount + 1) * ailego::kVectorPageSize +
+             ailego::VecBufferPool::metadata_bytes_for_page_count(kPageCount)));
   {
     ailego::File file;
     ASSERT_TRUE(
@@ -1166,6 +1165,7 @@ TEST(MergedProviderIndexHolderTest, OrdinalReadsDoNotAccumulatePagePins) {
   uint64_t key = 99;
   const void *data = nullptr;
   for (size_t ordinal : {0u, 1u, 1u, 0u}) {
+    SCOPED_TRACE(ordinal);
     ASSERT_EQ(0, reader->read(ordinal, &key, &data));
     EXPECT_EQ(ordinal, key);
     ASSERT_NE(nullptr, data);

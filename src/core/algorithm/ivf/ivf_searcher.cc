@@ -244,6 +244,13 @@ int IVFSearcher::search_batch(const void *query, const IndexQueryMeta &qmeta,
     const void *converted = nullptr;
     int ret = entity->transform(input, qmeta, n, &converted, &iv_qmeta);
     ivf_check_error_code(ret);
+    if (n > 1 && !p_keys && !single_keys && !filter.is_valid() &&
+        !entity->buffered_storage()) {
+      bool handled = false;
+      ret = search_many(converted, iv_qmeta, n, ctx, brute, base, &handled);
+      ivf_check_error_code(ret);
+      if (handled) continue;
+    }
     for (uint32_t q = 0; q < n; ++q) {
       const void *one = static_cast<const char *>(converted) +
                         static_cast<size_t>(q) * iv_qmeta.element_size();
@@ -309,6 +316,119 @@ int IVFSearcher::search_batch(const void *query, const IndexQueryMeta &qmeta,
 } catch (const std::bad_alloc &) {
   if (context) context->reset();
   return IndexError_NoMemory;
+}
+
+int IVFSearcher::search_many(const void *query, const IndexQueryMeta &qmeta,
+                             uint32_t count, IVFSearcherContext *ctx,
+                             bool brute_force, size_t result_offset,
+                             bool *handled) const {
+  auto &entity = ctx->entity();
+  const auto &quantizer = entity->quantizer();
+  if (quantizer && quantizer->type() != turbo::QuantizeType::kFp16 &&
+      quantizer->type() != turbo::QuantizeType::kFp32) {
+    return 0;
+  }
+  int ret = entity->bind_query(query, qmeta);
+  ivf_check_error_code(ret);
+  const bool column_major = entity->column_many_supported();
+  auto distance = entity->many_distance();
+  if (!distance && !column_major) return 0;
+  *handled = true;
+
+  // Bound scratch memory independently of the caller's query count.
+  constexpr size_t kQueryBatch = 32;
+  for (size_t base = 0; base < count; base += kQueryBatch) {
+    const size_t n = std::min(kQueryBatch, count - base);
+    std::vector<turbo::DistanceImpl> queries;
+    std::vector<IndexCandidateHeap> heaps;
+    queries.reserve(n);
+    heaps.reserve(n);
+    for (size_t q = 0; q < n; ++q) {
+      const void *data =
+          static_cast<const char *>(query) + (base + q) * qmeta.element_size();
+      if (column_major) {
+        queries.push_back(entity->column_query(data, qmeta));
+      } else {
+        if (base + q != 0) {
+          ret = entity->bind_query(static_cast<const char *>(query) +
+                                       (base + q) * qmeta.element_size(),
+                                   qmeta);
+          ivf_check_error_code(ret);
+        }
+        queries.push_back(entity->query_distance());
+      }
+      auto &heap = heaps.emplace_back();
+      heap.limit(ctx->topk());
+      heap.set_threshold(ctx->threshold());
+    }
+
+    std::vector<size_t> next(n, 0), scanned(n, 0);
+    const auto pending = [&](size_t q) {
+      return brute_force ? next[q] < entity->inverted_list_count()
+                         : next[q] < ctx->centroid_searcher_ctx()
+                                         ->result(base + q)
+                                         .size() &&
+                               scanned[q] < ctx->max_scan_count();
+    };
+    const auto centroid = [&](size_t q) -> size_t {
+      return brute_force ? next[q]
+                         : ctx->centroid_searcher_ctx()
+                               ->result(base + q)[next[q]]
+                               .key();
+    };
+    std::vector<const turbo::DistanceImpl *> group;
+    std::vector<IndexCandidateHeap *> group_heaps;
+    std::vector<IndexContext::Stats *> group_stats;
+    std::vector<size_t> members;
+    group.reserve(n);
+    group_heaps.reserve(n);
+    group_stats.reserve(n);
+    members.reserve(n);
+    for (;;) {
+      size_t first = 0;
+      while (first < n && !pending(first)) ++first;
+      if (first == n) break;
+      const size_t cid = centroid(first);
+      group.clear();
+      group_heaps.clear();
+      group_stats.clear();
+      members.clear();
+      // Only join queries at the same frontier. This preserves each query's
+      // list order, scan limit, and heap tie-breaking order.
+      for (size_t q = first; q < n; ++q) {
+        if (pending(q) && centroid(q) == cid) {
+          group.push_back(&queries[q]);
+          group_heaps.push_back(&heaps[q]);
+          group_stats.push_back(&ctx->mutable_stats(result_offset + base + q));
+          members.push_back(q);
+        }
+      }
+      uint32_t scan_count = 0;
+      if (column_major && group.size() == 1) {
+        // No shared scan is possible; retain the original single-query path.
+        ret = entity->search(cid, group[0]->query_storage().data(), &scan_count,
+                             group_heaps[0], group_stats[0]);
+      } else {
+        ret = entity->search_many(cid, group, distance, group_heaps,
+                                  group_stats, &scan_count);
+      }
+      ivf_check_error_code(ret);
+      for (size_t q : members) {
+        ++next[q];
+        scanned[q] += scan_count;
+      }
+    }
+    for (size_t q = 0; q < n; ++q) {
+      heaps[q].sort();
+      ret = entity->retrieve_keys(&heaps[q]);
+      ivf_check_error_code(ret);
+      entity->normalize(result_offset + base + q, &heaps[q]);
+      ret = ctx->topk_to_result(
+          static_cast<uint32_t>(result_offset + base + q), heaps[q]);
+      ivf_check_error_code(ret);
+    }
+  }
+  return 0;
 }
 
 const IndexSearcher::Stats &IVFSearcher::stats() const {

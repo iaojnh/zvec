@@ -16,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <ailego/pattern/defer.h>
+#include <ailego/pattern/scope_guard.h>
 #include <zvec/core/interface/index.h>
 #if DISKANN_SUPPORTED
 #include "algorithm/diskann/diskann_params.h"
@@ -149,17 +150,18 @@ int DiskAnnIndex::open(const std::string &file_path,
                                                : reinitialize_streamer();
     if (ret != 0) return ret;
   }
+  core::IndexStorage::Pointer storage;
   ailego::Params storage_params;
   file_path_ = file_path;
   is_read_only_ = storage_options.read_only;
   switch (storage_options.type) {
     case StorageOptions::StorageType::kMMAP: {
-      storage_ = core::IndexFactory::CreateStorage("FileReadStorage");
-      if (storage_ == nullptr) {
+      storage = core::IndexFactory::CreateStorage("FileReadStorage");
+      if (storage == nullptr) {
         LOG_ERROR("Failed to create FileReadStorage");
         return core::IndexError_Runtime;
       }
-      int ret = storage_->init(storage_params);
+      int ret = storage->init(storage_params);
       if (ret != 0) {
         LOG_ERROR("Failed to init FileReadStorage, path: %s, err: %s",
                   file_path_.c_str(), core::IndexError::What(ret));
@@ -170,12 +172,12 @@ int DiskAnnIndex::open(const std::string &file_path,
     case StorageOptions::StorageType::kBufferPool: {
       storage_params.set(core::BUFFER_READ_STORAGE_WARMUP_MODE,
                          core::BUFFER_READ_STORAGE_WARMUP_AUTO);
-      storage_ = core::IndexFactory::CreateStorage("BufferReadStorage");
-      if (storage_ == nullptr) {
+      storage = core::IndexFactory::CreateStorage("BufferReadStorage");
+      if (storage == nullptr) {
         LOG_ERROR("Failed to create BufferReadStorage");
         return core::IndexError_Runtime;
       }
-      int ret = storage_->init(storage_params);
+      int ret = storage->init(storage_params);
       if (ret != 0) {
         LOG_ERROR("Failed to init BufferReadStorage, path: %s, err: %s",
                   file_path_.c_str(), core::IndexError::What(ret));
@@ -202,6 +204,10 @@ int DiskAnnIndex::open(const std::string &file_path,
         storage_options.type == StorageOptions::StorageType::kBufferPool);
   }
 
+  storage_ = std::move(storage);
+  auto reset_failed_storage = ailego::ScopeGuard::Make([&] {
+    if (!is_open_) storage_.reset();
+  });
   if (!storage_options.create_new) {
     const int ret = open_trained_storage(file_path_);
     if (ret != 0) return ret;

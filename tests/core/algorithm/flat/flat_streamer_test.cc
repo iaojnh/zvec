@@ -581,10 +581,13 @@ TEST_F(FlatStreamerTest, ContiguousBuildDistinguishesKeyReadErrorsFromHoles) {
     SCOPED_TRACE(bytes);
     ASSERT_EQ(key_offset + bytes, segment->resize(key_offset + bytes));
     IndexStorage::MemoryBlock block;
-    ASSERT_EQ(0, entity.FlatStreamerEntity::get_vector_by_key(0, block));
+    // The logical lookup requires a complete block. Verify the underlying
+    // vector bytes are still readable independently of that lookup.
+    const auto vector_size = dim * sizeof(float);
+    ASSERT_EQ(vector_size, segment->read(0, block, vector_size));
     ASSERT_NE(nullptr, block.data());
     EXPECT_NE(0, entity.get_key(0, &key));
-    EXPECT_EQ(kInvalidKey, entity.key(0));
+    EXPECT_THROW(entity.key(0), FlatStreamerEntity::ReadError);
     EXPECT_EQ(IndexError_ReadData, entity.build_contiguous_memory());
     EXPECT_FALSE(entity.is_contiguous());
   }

@@ -233,6 +233,8 @@ bool IoUringRing::release_staging() {
     pool.release_unmapped_external(staging_charge_, staging_projection_);
   } else if (prepaid_staging_bytes_) {
     pool.release_materialization(staging_size_, staging_projection_);
+  } else {
+    pool.release_unmapped_process_backing(staging_size_, staging_projection_);
   }
   staging_ = nullptr;
   staging_size_ = 0;
@@ -388,9 +390,7 @@ void IoUringRing::teardown() {
   const auto release_region = [](void *region, size_t size,
                                  ProcessRssBudget::MaterializationStamp stamp) {
     if (!region) return;
-    if (::munmap(region, size) != 0) {
-      LOG_ERROR("io_uring control unmap failed; size=%zu", size);
-    } else {
+    if (::munmap(region, size) == 0) {
       MemoryLimitPool::get_instance().release_unmapped_process_backing(
           BudgetedMappedBuffer::mapping_size(size), stamp);
     }
@@ -450,10 +450,12 @@ bool IoUringRing::ensure_staging(size_t bytes) {
   const size_t charge = prepaid_staging_bytes_ || !pool.capacity() ? 0 : bytes;
   // Keep the old allocation charged until the replacement actually exists.
   using Pending = MemoryLimitPool::PendingAllocation;
-  Pending pending(pool, Pending::Kind::kWorkspace);
+  Pending pending(pool, Pending::Kind::kLockedExternal);
   if (!pending.reserve(charge)) return false;
   if (prepaid_staging_bytes_ && !pool.try_reserve_materialization(bytes))
     return false;
+  const bool process_backing = !prepaid_staging_bytes_ && !charge;
+  if (process_backing && !pool.try_reserve_process_backing(bytes)) return false;
   // Anonymous mappings are page-aligned, satisfying the I/O alignment. They
   // bypass malloc arenas, so release_staging() really returns physical pages.
   void *ptr = File::MemoryMap(bytes, 0);
@@ -461,6 +463,9 @@ bool IoUringRing::ensure_staging(size_t bytes) {
       prepaid_staging_bytes_
           ? pool.finish_materialization(bytes, ptr != nullptr)
           : ProcessRssBudget::MaterializationStamp{};
+  const auto process_projection =
+      process_backing ? pool.finish_process_backing(bytes, ptr != nullptr)
+                      : ProcessRssBudget::MaterializationStamp{};
   if (!ptr) {
     LOG_WARN("io_uring staging mapping failed; size=%zu", bytes);
     return false;
@@ -468,14 +473,17 @@ bool IoUringRing::ensure_staging(size_t bytes) {
   if (!release_staging()) {
     if (!File::TryMemoryUnmap(ptr, bytes)) {
       LOG_ERROR("io_uring replacement staging unmap failed; size=%zu", bytes);
-      pending.commit();
+      pending.commit_mapping();
     } else if (prepaid_staging_bytes_) {
       pool.release_materialization(bytes, prepaid_projection);
+    } else if (process_backing) {
+      pool.release_unmapped_process_backing(bytes, process_projection);
     }
     return false;
   }
-  staging_projection_ =
-      prepaid_staging_bytes_ ? prepaid_projection : pending.commit_mapping();
+  staging_projection_ = prepaid_staging_bytes_ ? prepaid_projection
+                        : process_backing      ? process_projection
+                                               : pending.commit_mapping();
   staging_ = static_cast<char *>(ptr);
   staging_size_ = bytes;
   staging_charge_ = charge;
@@ -580,117 +588,119 @@ int IoUringRing::execute_impl(int fd, const IoUringRead *read_reqs,
     __atomic_store_n(sq_tail_, tail + static_cast<unsigned>(n_ops),
                      __ATOMIC_RELEASE);
 
-    size_t submitted = 0;
-    size_t completed = 0;
-    bool all_ok = true;
-    std::array<bool, kIoUringMaxBatch> seen{};
-    auto reap_available = [&]() {
-      unsigned chead = *cq_head_;
-      const unsigned ctail = __atomic_load_n(cq_tail_, __ATOMIC_ACQUIRE);
-      const unsigned cq_mask = *cq_ring_mask_;
-      while (chead != ctail) {
-        struct io_uring_cqe *cqe = &cqes_[chead & cq_mask];
-        const size_t req_idx = static_cast<size_t>(cqe->user_data);
-        if (req_idx < batch_start || req_idx >= batch_start + n_ops ||
-            seen[req_idx - batch_start]) {
-          LOG_ERROR("io_uring completion did not identify a new request: %zu",
-                    req_idx);
-          return false;
-        } else {
-          seen[req_idx - batch_start] = true;
-          const uint64_t offset =
-              is_write ? write_reqs[req_idx].offset : read_reqs[req_idx].offset;
-          const uint64_t len =
-              is_write ? write_reqs[req_idx].len : read_reqs[req_idx].len;
-          const uint64_t expected_len =
-              is_write ? len
-                       : (read_reqs[req_idx].expected_len == 0
-                              ? len
-                              : read_reqs[req_idx].expected_len);
-          const char *operation = is_write ? "write" : "read";
-          if (cqe->res < 0) {
-            LOG_WARN("io_uring %s failed: req=%zu, res=%d, offset=%lu",
-                     operation, req_idx, cqe->res,
-                     static_cast<unsigned long>(offset));
-            all_ok = false;
-          } else if (static_cast<uint64_t>(cqe->res) != expected_len) {
-            LOG_WARN("io_uring short %s: req=%zu, got=%d, expected=%lu",
-                     operation, req_idx, cqe->res,
-                     static_cast<unsigned long>(expected_len));
-            all_ok = false;
-          } else if (!is_write) {
-            const IoUringRead &req = read_reqs[req_idx];
-            const size_t slot = req_idx - batch_start;
-            std::memcpy(req.buf, staging_ + slot_offsets[slot], expected_len);
-            if (expected_len < len) {
-              std::memset(static_cast<char *>(req.buf) + expected_len, 0,
-                          len - expected_len);
+    try {
+      size_t submitted = 0;
+      size_t completed = 0;
+      bool all_ok = true;
+      std::array<bool, kIoUringMaxBatch> seen{};
+      auto reap_available = [&]() {
+        unsigned chead = *cq_head_;
+        const unsigned ctail = __atomic_load_n(cq_tail_, __ATOMIC_ACQUIRE);
+        const unsigned cq_mask = *cq_ring_mask_;
+        while (chead != ctail) {
+          struct io_uring_cqe *cqe = &cqes_[chead & cq_mask];
+          const size_t req_idx = static_cast<size_t>(cqe->user_data);
+          if (req_idx < batch_start || req_idx >= batch_start + n_ops ||
+              seen[req_idx - batch_start]) {
+            LOG_ERROR("io_uring completion did not identify a new request: %zu",
+                      req_idx);
+            return false;
+          } else {
+            seen[req_idx - batch_start] = true;
+            const uint64_t offset = is_write ? write_reqs[req_idx].offset
+                                             : read_reqs[req_idx].offset;
+            const uint64_t len =
+                is_write ? write_reqs[req_idx].len : read_reqs[req_idx].len;
+            const uint64_t expected_len =
+                is_write ? len
+                         : (read_reqs[req_idx].expected_len == 0
+                                ? len
+                                : read_reqs[req_idx].expected_len);
+            const char *operation = is_write ? "write" : "read";
+            if (cqe->res < 0) {
+              LOG_WARN("io_uring %s failed: req=%zu, res=%d, offset=%lu",
+                       operation, req_idx, cqe->res,
+                       static_cast<unsigned long>(offset));
+              all_ok = false;
+            } else if (static_cast<uint64_t>(cqe->res) != expected_len) {
+              LOG_WARN("io_uring short %s: req=%zu, got=%d, expected=%lu",
+                       operation, req_idx, cqe->res,
+                       static_cast<unsigned long>(expected_len));
+              all_ok = false;
+            } else if (!is_write) {
+              const IoUringRead &req = read_reqs[req_idx];
+              const size_t slot = req_idx - batch_start;
+              std::memcpy(req.buf, staging_ + slot_offsets[slot], expected_len);
+              if (expected_len < len) {
+                std::memset(static_cast<char *>(req.buf) + expected_len, 0,
+                            len - expected_len);
+              }
             }
           }
+          ++chead;
+          ++completed;
         }
-        ++chead;
-        ++completed;
-      }
-      __atomic_store_n(cq_head_, chead, __ATOMIC_RELEASE);
-      return true;
-    };
+        __atomic_store_n(cq_head_, chead, __ATOMIC_RELEASE);
+        return true;
+      };
 
-    while (completed < n_ops) {
-      if (!reap_available()) return quarantine();
-      if (completed >= n_ops) {
-        break;
-      }
-
-      const unsigned to_submit = static_cast<unsigned>(n_ops - submitted);
-      const int ret = static_cast<int>(syscall(
-          __NR_io_uring_enter, ring_fd_, to_submit, 1u, IORING_ENTER_GETEVENTS,
-          static_cast<void *>(nullptr), static_cast<size_t>(0)));
-      if (ret >= 0) {
-        if (static_cast<unsigned>(ret) > to_submit) return quarantine();
-        submitted += static_cast<size_t>(ret);
-        continue;
-      }
-      if (errno == EINTR ||
-          ((errno == EAGAIN || errno == EBUSY) && completed < submitted)) {
-        continue;
-      }
-
-      LOG_WARN(
-          "io_uring_enter failed; errno=%d, %s, submitted=%zu/%zu, "
-          "completed=%zu. draining before falling back to p%s",
-          errno, ::strerror(errno), submitted, n_ops, completed,
-          is_write ? "write" : "read");
-      __atomic_store_n(sq_tail_, tail + static_cast<unsigned>(submitted),
-                       __ATOMIC_RELEASE);
-
-      size_t drain_retries = 0;
-      while (completed < submitted) {
+      while (completed < n_ops) {
         if (!reap_available()) return quarantine();
-        if (completed >= submitted) {
+        if (completed >= n_ops) {
           break;
         }
-        const int wait_ret = static_cast<int>(syscall(
-            __NR_io_uring_enter, ring_fd_, 0u, 1u, IORING_ENTER_GETEVENTS,
-            static_cast<void *>(nullptr), static_cast<size_t>(0)));
-        if (wait_ret >= 0 || errno == EINTR) {
-          continue;
-        }
-        if ((errno == EAGAIN || errno == EBUSY) &&
-            drain_retries++ < kIoUringDrainRetries) {
-          std::this_thread::sleep_for(std::chrono::microseconds(100));
-          continue;
-        }
-        LOG_ERROR(
-            "io_uring drain failed; errno=%d, %s. leaking the staging pool "
-            "and disabling io_uring for this context",
-            errno, ::strerror(errno));
-        return quarantine();
-      }
-      return -1;
-    }
 
-    if (!all_ok) {
-      return -1;
+        const unsigned to_submit = static_cast<unsigned>(n_ops - submitted);
+        const int ret = enter(to_submit, 1u, IORING_ENTER_GETEVENTS);
+        if (ret >= 0) {
+          if (static_cast<unsigned>(ret) > to_submit) return quarantine();
+          submitted += static_cast<size_t>(ret);
+          continue;
+        }
+        if (errno == EINTR ||
+            ((errno == EAGAIN || errno == EBUSY) && completed < submitted)) {
+          continue;
+        }
+
+        LOG_WARN(
+            "io_uring_enter failed; errno=%d, %s, submitted=%zu/%zu, "
+            "completed=%zu. draining before falling back to p%s",
+            errno, ::strerror(errno), submitted, n_ops, completed,
+            is_write ? "write" : "read");
+        __atomic_store_n(sq_tail_, tail + static_cast<unsigned>(submitted),
+                         __ATOMIC_RELEASE);
+
+        size_t drain_retries = 0;
+        while (completed < submitted) {
+          if (!reap_available()) return quarantine();
+          if (completed >= submitted) {
+            break;
+          }
+          const int wait_ret = enter(0u, 1u, IORING_ENTER_GETEVENTS);
+          if (wait_ret >= 0 || errno == EINTR) {
+            continue;
+          }
+          if ((errno == EAGAIN || errno == EBUSY) &&
+              drain_retries++ < kIoUringDrainRetries) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            continue;
+          }
+          LOG_ERROR(
+              "io_uring drain failed; errno=%d, %s. leaking the staging pool "
+              "and disabling io_uring for this context",
+              errno, ::strerror(errno));
+          return quarantine();
+        }
+        return -1;
+      }
+
+      if (!all_ok) {
+        return -1;
+      }
+    } catch (...) {
+      // After publication even a userspace exception cannot establish that
+      // every kernel reference has gone away.
+      return quarantine();
     }
   }
   return 0;

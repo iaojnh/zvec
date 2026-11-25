@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
@@ -281,12 +282,25 @@ class BufferStorage : public IndexStorage {
       return read_borrowed_batch_impl(reads, count, /*immutable=*/true);
     }
 
+    static constexpr size_t kResidentBatch = 32;
+
     bool try_read_resident_immutable(BorrowedRead *reads, size_t count) {
-      // The common DiskANN batch fits in bounded stack scratch. Retain the
-      // unique source pins until every output has acquired its own pin, so
-      // duplicate pages and aliased output blocks remain safe.
-      static constexpr size_t kResidentBatch = 32;
-      if (count > kResidentBatch) return false;
+      // Keep scratch bounded without imposing a limit on resident requests.
+      // If a later chunk misses, the caller resets every earlier result before
+      // entering the general path, including aliased output handles.
+      for (size_t begin = 0; begin < count;) {
+        const size_t chunk = std::min(kResidentBatch, count - begin);
+        if (!try_read_resident_immutable_chunk(reads + begin, chunk))
+          return false;
+        begin += chunk;
+      }
+      return true;
+    }
+
+    bool try_read_resident_immutable_chunk(BorrowedRead *reads, size_t count) {
+      // Retain source pins until each output owns its pin. An output reset
+      // must not invalidate a source used by another request in this chunk.
+      assert(count <= kResidentBatch);
       std::array<ailego::block_id_t, kResidentBatch> ids;
       std::array<char *, kResidentBatch> pages;
       std::array<size_t, kResidentBatch> indices, offsets;
@@ -520,6 +534,11 @@ class BufferStorage : public IndexStorage {
       // Reserve bounded fallback space before pinning pages. Otherwise a
       // large batch can pin the entire budget and prevent its own fallback.
       if (copy_upper_bound && copy_upper_bound <= kMaxArenaBytes) {
+        // This worst-case arena is optional. Avoid waiting/reclaiming for an
+        // obviously oversized reservation when scalar pins/copies may fit.
+        auto &memory = ailego::MemoryLimitPool::get_instance();
+        if (memory.capacity() && copy_upper_bound > memory.available())
+          throw std::bad_alloc();
         scratch.arena = std::allocate_shared<BatchArena>(
             ailego::BudgetedAllocator<BatchArena>{}, copy_upper_bound,
             kArenaAlign);
@@ -781,6 +800,16 @@ class BufferStorage : public IndexStorage {
                                                       range_count))
           return fail();
         for (size_t group = 0; group < groups; ++group) {
+          const size_t unique_index =
+              scratch.page_uses[starts[group]].unique_index;
+          std::shared_lock<std::shared_mutex> page_lock;
+          if (mutable_snapshot && scratch.pages[unique_index] != nullptr) {
+            // Pins prevent eviction, not writes. Hold the writer's page latch
+            // through every copy from this resident page. Bypass sources are
+            // already synchronized snapshots owned by this operation.
+            page_lock = owner_->buffer_pool_handle_->lock_pinned_page_for_read(
+                scratch.unique_page_ids[unique_index]);
+          }
           for (size_t i = starts[group]; i < ends[group]; ++i) {
             const PageUse &use = scratch.page_uses[i];
             BatchState &state = scratch.states[use.state_index];
@@ -816,18 +845,25 @@ class BufferStorage : public IndexStorage {
       release_pages();
       return true;
     } catch (const std::bad_alloc &) {
-      buffer_storage_read_error = IndexError_NoMemory;
       for (size_t i = 0; reads && i < count; ++i) {
         if (reads[i].block) reads[i].block->reset();
       }
-      if (!immutable && owner_->buffer_pool_ != nullptr &&
-          owner_->buffer_pool_->writable()) {
-        // Batch descriptors are optional. Their pins and allocations have
-        // already unwound, so retain the original scalar snapshot fallback.
-        buffer_storage_read_error = IndexError_ReadData;
-        return IndexStorage::Segment::read_borrowed_batch(reads, count);
+      // Batch descriptors and the worst-case arena are optional for every
+      // entry, including immutable and read-only reads. Their pins and scratch
+      // have unwound before retrying the scalar implementation.
+      buffer_storage_read_error = IndexError_ReadData;
+      try {
+        return immutable
+                   ? IndexStorage::Segment::read_borrowed_batch_immutable(reads,
+                                                                          count)
+                   : IndexStorage::Segment::read_borrowed_batch(reads, count);
+      } catch (const std::bad_alloc &) {
+        for (size_t i = 0; reads && i < count; ++i) {
+          if (reads[i].block) reads[i].block->reset();
+        }
+        buffer_storage_read_error = IndexError_NoMemory;
+        return false;
       }
-      return false;
     }
 
     int write_error() const override {
@@ -926,7 +962,7 @@ class BufferStorage : public IndexStorage {
 
     int prepare_write_batch(const SegmentData *writes, size_t count,
                             std::unique_ptr<PreparedWrite> *out) override try {
-      if (!out || (!writes && count)) return IndexError_InvalidArgument;
+      if (!out || *out || (!writes && count)) return IndexError_InvalidArgument;
       if (!active()) return IndexError_WriteData;
       std::shared_lock<std::shared_mutex> latch(
           owner_->mapping_shards_[owner_->mapping_shard_id()].mtx);
@@ -1175,7 +1211,8 @@ class BufferStorage : public IndexStorage {
       auto owner = std::allocate_shared<ailego::BudgetedAlignedBuffer>(
           ailego::BudgetedAllocator<ailego::BudgetedAlignedBuffer>{}, bytes,
           alignment);
-      return MemoryBlock::MakeSharedView(owner->data(), owner);
+      return MemoryBlock::MakeSharedView(owner->data(), owner,
+                                         /*deep_copy=*/true);
     }
 
     size_t read_memory_block(size_t abs_offset, MemoryBlock &data, size_t len,
@@ -1362,7 +1399,8 @@ class BufferStorage : public IndexStorage {
     {
       std::scoped_lock checkpoint_lock(checkpoint_mutex_,
                                        candidate.checkpoint_mutex_);
-      std::swap(accept_checkpoint_requests_, candidate.accept_checkpoint_requests_);
+      std::swap(accept_checkpoint_requests_,
+                candidate.accept_checkpoint_requests_);
       std::swap(pending_checkpoint_, candidate.pending_checkpoint_);
       std::swap(refreshed_during_writeback_,
                 candidate.refreshed_during_writeback_);
@@ -1371,7 +1409,8 @@ class BufferStorage : public IndexStorage {
       visible_checkpoint_.store(
           candidate.visible_checkpoint_.load(std::memory_order_acquire),
           std::memory_order_release);
-      candidate.visible_checkpoint_.store(previous_visible, std::memory_order_release);
+      candidate.visible_checkpoint_.store(previous_visible,
+                                          std::memory_order_release);
       const bool previous_dirty = index_dirty_.load(std::memory_order_relaxed);
       index_dirty_.store(candidate.index_dirty_.load(std::memory_order_relaxed),
                          std::memory_order_relaxed);
@@ -2536,10 +2575,12 @@ class BufferStorage : public IndexStorage {
   // buffer manager
   std::string file_name_;
   std::unique_ptr<ailego::StagedPath> staged_file_;
-  using SegmentMap = std::unordered_map<
-      std::string_view, SegmentState, std::hash<std::string_view>,
-      std::equal_to<std::string_view>,
-      ailego::BudgetedAllocator<std::pair<const std::string_view, SegmentState>>>;
+  using SegmentMap =
+      std::unordered_map<std::string_view, SegmentState,
+                         std::hash<std::string_view>,
+                         std::equal_to<std::string_view>,
+                         ailego::BudgetedAllocator<
+                             std::pair<const std::string_view, SegmentState>>>;
   ailego::LazyMap<SegmentMap> segments_;
   std::shared_ptr<DirectoryGeneration> directory_generation_;
 
