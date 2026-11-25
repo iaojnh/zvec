@@ -20,6 +20,7 @@
 #include <zvec/db/collection.h>
 #include <zvec/db/options.h>
 #include "zvec/ailego/logger/logger.h"
+#include "utility.h"
 
 
 struct Config {
@@ -65,6 +66,12 @@ int main(int argc, char **argv) {
 #ifdef __ANDROID__
     _exit(1);
 #endif
+    return 1;
+  }
+
+  const auto resource_status = zvec::InitializeOptimizeRecoveryResources();
+  if (!resource_status.ok()) {
+    std::cerr << resource_status.message() << std::endl;
     return 1;
   }
 

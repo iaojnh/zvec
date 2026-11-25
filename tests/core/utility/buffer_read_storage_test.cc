@@ -115,6 +115,16 @@ TEST_F(BufferReadStorageTest, SequentialPreservesExistingWarmupBehavior) {
   EXPECT_EQ(payload_, actual);
 }
 
+TEST_F(BufferReadStorageTest, AutoDefersPopulationToTheAlgorithm) {
+  auto storage = create_storage(BUFFER_READ_STORAGE_WARMUP_AUTO);
+  ASSERT_NE(storage, nullptr);
+  ASSERT_EQ(0, storage->open(file_path_, false));
+  EXPECT_TRUE(storage->automatic_warmup_enabled());
+  EXPECT_EQ(0u, ailego::PoolPayloadBudget::get_instance().stats().page_used);
+  auto lazy = create_storage(BUFFER_READ_STORAGE_WARMUP_NONE);
+  EXPECT_FALSE(lazy->automatic_warmup_enabled());
+}
+
 TEST_F(BufferReadStorageTest, ResidentScatterReadReturnsPinnedPageSpans) {
   auto storage = create_storage(BUFFER_READ_STORAGE_WARMUP_SEQUENTIAL);
   ASSERT_NE(storage, nullptr);
@@ -235,6 +245,11 @@ TEST_F(BufferReadStorageTest, CachePressureFallsBackToOwnedRead) {
   AILEGO_DEFER([&] { pool.release_external(external_charge); });
 
   IndexStorage::MemoryBlock block;
+  if (storage->vec_buffer_pool()->requires_aligned_io()) {
+    EXPECT_EQ(0u, segment->read(0, block, 64));
+    EXPECT_EQ(nullptr, block.data());
+    return;
+  }
   ASSERT_EQ(64u, segment->read(0, block, 64));
   EXPECT_EQ(0, std::memcmp(payload_.data(), block.data(), 64));
   EXPECT_EQ(IndexStorage::MemoryBlock::MBT_HEAP_SCRATCH, block.type_);

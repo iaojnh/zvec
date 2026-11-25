@@ -211,6 +211,10 @@ class InvertedIndexCodec {
     }
 
     if (header == 0) {  // This is a bitmap
+      if (roaring_bitmap_portable_deserialize_size(data + 1, size - 1) !=
+              size - 1 ||
+          size == 1)
+        return Status::InternalError("Invalid bitmap payload");
       *bitmap = roaring_bitmap_portable_deserialize_safe(data + 1, size - 1);
       if (*bitmap) {
         return Status::OK();
@@ -252,6 +256,10 @@ class InvertedIndexCodec {
     }
 
     if (header == 0) {  // This is a bitmap
+      if (roaring_bitmap_portable_deserialize_size(data + 1, size - 1) !=
+              size - 1 ||
+          size == 1)
+        return Status::InternalError("Invalid bitmap payload");
       auto bitmap_other = roaring_bitmap_portable_deserialize_frozen(data + 1);
       if (!bitmap_other) {
         LOG_ERROR("Failed to deserialize bitmap");
@@ -293,6 +301,10 @@ class InvertedIndexCodec {
     }
 
     if (header == 0) {  // This is a bitmap
+      if (roaring_bitmap_portable_deserialize_size(data + 1, size - 1) !=
+              size - 1 ||
+          size == 1)
+        return Status::InternalError("Invalid bitmap payload");
       auto bitmap_other = roaring_bitmap_portable_deserialize_frozen(data + 1);
       if (!bitmap_other) {
         LOG_ERROR("Failed to deserialize bitmap");

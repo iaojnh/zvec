@@ -44,5 +44,14 @@ Result<QueryResultSnapshot> query_result_snapshot(const Collection &collection,
 Result<QueryResultSnapshot> query_result_snapshot(const Collection &collection,
                                                   const MultiQuery &query);
 
+// Keep native result buffers admitted during language binding conversion.
+struct ResolvedIdsSnapshot {
+  std::shared_ptr<void> memory_owner;
+  std::vector<std::optional<std::string>> keys;
+};
+
+Result<ResolvedIdsSnapshot> resolve_internal_ids_snapshot(
+    const Collection &collection, const std::vector<int64_t> &ids);
+
 }  // namespace internal
 }  // namespace zvec

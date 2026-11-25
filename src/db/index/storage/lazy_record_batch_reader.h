@@ -15,9 +15,12 @@
 #pragma once
 
 #include <arrow/ipc/reader.h>
+#include <arrow/table.h>
 #include <parquet/arrow/reader.h>
 #include "db/common/constants.h"
 #include "parquet_buffer_pool.h"
+#include "parquet_memory_pool.h"
+#include "resident_record_batch_reader.h"
 
 
 namespace zvec {
@@ -78,101 +81,62 @@ class IPCRecordBatchReader : public arrow::RecordBatchReader {
 };
 
 
-class ParquetRecordBatchReader : public arrow::RecordBatchReader {
+// Keep the BP reader implementation out of mmap's shared reader header.
+class ParquetRecordBatchReader : public ResidentRecordBatchReader {
  public:
   ParquetRecordBatchReader(std::unique_ptr<parquet::arrow::FileReader> &reader,
                            const std::vector<std::string> &columns,
                            std::shared_ptr<arrow::Schema> schema,
-                           const std::string &file_path, bool with_cache = true)
-      : reader_(std::move(reader)),
-        schema_(std::move(schema)),
-        columns_(columns),
-        file_path_(file_path),
-        with_cache_(with_cache) {
-    std::vector<std::shared_ptr<arrow::Field>> fields;
-    for (const auto &col : columns) {
-      int index = schema_->GetFieldIndex(col);
-      if (index != -1) {
-        fields.push_back(schema_->field(index));
-        col_indices_.push_back(index);
-      }
-    }
-    projected_schema_ = arrow::schema(fields);
+                           const std::string &file_path, bool with_cache = true,
+                           bool stream_uncached = false,
+                           std::shared_ptr<arrow::MemoryPool> memory_pool = {},
+                           ParquetBufferID metadata_id = {});
 
-    auto parquet_metadata = reader_->parquet_reader()->metadata();
-    total_rows_ = parquet_metadata->num_rows();
-    num_row_groups_ = parquet_metadata->num_row_groups();
-    int64_t offset = 0;
-    for (int64_t rg = 0; rg < num_row_groups_; ++rg) {
-      auto row_group_metadata = parquet_metadata->RowGroup(rg);
-      int64_t num_rows_in_group = row_group_metadata->num_rows();
-      row_group_row_nums_.push_back(num_rows_in_group);
-      row_group_offsets_.push_back(offset);
-      offset += num_rows_in_group;
-    }
-  }
+  ~ParquetRecordBatchReader() override;
+
+  ParquetRecordBatchReader(const std::vector<std::string> &columns,
+                           std::shared_ptr<arrow::Schema> schema,
+                           const std::string &file_path,
+                           std::shared_ptr<arrow::MemoryPool> memory_pool,
+                           std::shared_ptr<arrow::io::RandomAccessFile> input,
+                           std::shared_ptr<parquet::FileMetaData> metadata,
+                           ParquetBufferID metadata_id,
+                           const std::vector<int64_t> &row_group_rows);
 
   std::shared_ptr<arrow::Schema> schema() const override {
     return projected_schema_;
   }
 
-  arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override {
-    if (current_row_group_ >= num_row_groups_) {
-      return arrow::Status::OK();
-    }
+  arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override;
 
-    int64_t rg_id = current_row_group_;
-    int64_t num_rows_in_rg = row_group_row_nums_[rg_id];
-
-    std::vector<std::shared_ptr<arrow::Array>> chunks(col_indices_.size());
-    if (with_cache_) {
-      for (size_t col_idx = 0; col_idx < col_indices_.size(); ++col_idx) {
-        auto buffer_id =
-            ParquetBufferID(file_path_, col_indices_[col_idx], rg_id);
-        auto buffer_handle =
-            ParquetBufferPool::get_instance().acquire_buffer(buffer_id);
-        std::shared_ptr<arrow::ChunkedArray> col_chunked_array =
-            buffer_handle.data();
-        if (col_chunked_array) {
-          std::shared_ptr<arrow::Array> concat;
-          auto concat_result = arrow::Concatenate(col_chunked_array->chunks(),
-                                                  arrow::default_memory_pool());
-          if (!concat_result.ok()) {
-            return concat_result.status();
-          }
-          concat = concat_result.ValueOrDie();
-          chunks[col_idx] = concat;
-        }
-      }
-    } else {
-      std::shared_ptr<arrow::Table> rg_table;
-      ARROW_RETURN_NOT_OK(
-          reader_->RowGroup(rg_id)->ReadTable(col_indices_, &rg_table));
-      for (size_t i = 0; i < col_indices_.size(); ++i) {
-        std::shared_ptr<arrow::Array> concat;
-        auto concat_result = arrow::Concatenate(rg_table->column(i)->chunks(),
-                                                arrow::default_memory_pool());
-        if (!concat_result.ok()) {
-          return concat_result.status();
-        }
-        concat = concat_result.ValueOrDie();
-        chunks[i] = concat;
-      }
-    }
-
-    *batch =
-        arrow::RecordBatch::Make(projected_schema_, num_rows_in_rg, chunks);
-    current_row_group_++;
-    return arrow::Status::OK();
-  }
+  arrow::Result<bool> ReadNextResident(
+      std::shared_ptr<arrow::RecordBatch> *batch) override;
 
  private:
+  arrow::Result<bool> read_next(std::shared_ptr<arrow::RecordBatch> *batch,
+                                bool resident_only);
+  // Preserve the existing uncached mmap reader's row-group batch boundaries.
+  arrow::Status read_row_group(std::shared_ptr<arrow::RecordBatch> *batch);
+
+  arrow::Status read_next_uncached(std::shared_ptr<arrow::RecordBatch> *batch);
+
+  void project_columns();
+  arrow::Status ensure_reader();
+
+  // FileReader must outlive the batch reader (members are destroyed in reverse
+  // order). The reader and its file remain alive even if the store is closed.
+  std::shared_ptr<arrow::MemoryPool> memory_pool_;
+  std::shared_ptr<arrow::io::RandomAccessFile> input_;
+  std::shared_ptr<parquet::FileMetaData> metadata_;
   std::unique_ptr<parquet::arrow::FileReader> reader_;
+  std::unique_ptr<arrow::RecordBatchReader> row_group_reader_;
+  std::unique_ptr<arrow::TableBatchReader> cached_batches_;
   std::shared_ptr<arrow::Schema> schema_;
   std::shared_ptr<arrow::Schema> projected_schema_;
   std::vector<std::string> columns_;
   std::vector<int> col_indices_;
   std::string file_path_;
+  ParquetBufferID metadata_id_;
 
   int64_t current_row_group_ = 0;
   int64_t num_row_groups_ = 0;
@@ -180,6 +144,7 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
   std::vector<int64_t> row_group_offsets_;
   std::vector<int64_t> row_group_row_nums_;
   bool with_cache_;
+  bool stream_uncached_;
 };
 
 

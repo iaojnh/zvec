@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #pragma once
-
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 #include <rabitqlib/utils/space.hpp>
-#include "utility/legacy_read_buffer.h"
+#include <zvec/ailego/buffer/budgeted_buffer.h>
+#include "utility/group_candidate_collector.h"
+#include "utility/immutable_segment_view.h"
 #include "zvec/core/framework/index_document.h"
 #include "zvec/core/framework/index_filter.h"
 #include "zvec/core/framework/index_storage.h"
@@ -46,19 +48,19 @@ class IvfRabitqEntity {
   //! Same interface as IVFEntity::search for consistency.
   int search_cluster(uint32_t cluster_id,
                      const IvfRabitqQueryState &query_state, size_t padded_dim,
-                     size_t ex_bits, IndexDocumentHeap *heap) const;
+                     size_t ex_bits, IndexCandidateHeap *heap) const;
 
   int search_cluster(uint32_t cluster_id,
                      const IvfRabitqQueryState &query_state, size_t padded_dim,
                      size_t ex_bits, const IndexFilter &filter,
-                     IndexDocumentHeap *heap) const;
+                     IndexCandidateHeap *heap) const;
 
   int search_cluster_group_by(uint32_t cluster_id,
                               const IvfRabitqQueryState &query_state,
                               size_t padded_dim, size_t ex_bits,
                               const IndexGroupBy &group_by, uint32_t group_topk,
                               float threshold,
-                              IvfRabitqContext::GroupTopkHeaps *heaps) const;
+                              GroupCandidateCollector *heaps) const;
 
   int search_cluster_group_by(uint32_t cluster_id,
                               const IvfRabitqQueryState &query_state,
@@ -66,12 +68,12 @@ class IvfRabitqEntity {
                               const IndexFilter &filter,
                               const IndexGroupBy &group_by, uint32_t group_topk,
                               float threshold,
-                              IvfRabitqContext::GroupTopkHeaps *heaps) const;
+                              GroupCandidateCollector *heaps) const;
 
-  int compute_distances(uint32_t cluster_id, const std::vector<uint32_t> &ids,
-                        const IvfRabitqQueryState &query_state,
-                        size_t padded_dim, size_t ex_bits,
-                        IndexDocumentList *documents) const;
+  int compute_distances(
+      uint32_t cluster_id, ailego::BudgetedVector<uint32_t> &ids,
+      const IvfRabitqQueryState &query_state, size_t padded_dim, size_t ex_bits,
+      const std::function<void(uint64_t, float)> &consume) const;
 
   uint32_t cluster_count() const {
     return header_.cluster_count;
@@ -94,41 +96,25 @@ class IvfRabitqEntity {
   }
 
   uint64_t get_key(size_t id) const;
+  int read_key(size_t id, uint64_t *key) const;
 
   const void *get_vector_by_key(uint64_t key) const;
 
   int get_vector_by_key(uint64_t key, IndexStorage::MemoryBlock &block) const;
 
   uint32_t key_to_id(uint64_t key) const;
+  int find_id(uint64_t key, uint32_t *id) const;
 
   uint32_t get_cluster_id(uint32_t id) const;
 
-  const uint32_t *get_key_order_mapping() const {
-    if (!mapping_) {
-      return nullptr;
-    }
-    // Keep the legacy pointer valid until the next call on this thread.
-    static thread_local LegacyReadBuffer buffer;
-    IndexStorage::MemoryBlock data;
-    size_t size = total_vector_count() * sizeof(uint32_t);
-    if (mapping_->read(0, data, size) != size) {
-      return nullptr;
-    }
-    return static_cast<const uint32_t *>(buffer.assign(data, size));
-  }
-
  private:
   IvfRabitqHeader header_;
-  std::vector<IvfRabitqClusterMeta> cluster_metas_;
+  ailego::BudgetedVector<IvfRabitqClusterMeta> cluster_metas_;
 
-  IndexStorage::MemoryBlock batch_data_block_;
-  IndexStorage::MemoryBlock ex_data_block_;
-  IndexStorage::MemoryBlock keys_block_;
-  IndexStorage::Segment::Pointer mapping_;
-
-  const char *batch_data_{nullptr};
-  const char *ex_data_{nullptr};
-  const uint64_t *keys_{nullptr};
+  ImmutableSegmentView batch_data_;
+  ImmutableSegmentView ex_data_;
+  ImmutableSegmentView keys_;
+  ImmutableSegmentView mapping_;
   size_t batch_data_size_{0};
   size_t ex_data_size_{0};
 
@@ -140,14 +126,16 @@ class IvfRabitqEntity {
                           const IvfRabitqQueryState &query_state,
                           size_t padded_dim, size_t ex_bits,
                           const IndexFilter *filter,
-                          IndexDocumentHeap *heap) const;
+                          IndexCandidateHeap *heap) const;
 
   template <bool HasFilter>
-  int search_cluster_group_by_impl(
-      uint32_t cluster_id, const IvfRabitqQueryState &query_state,
-      size_t padded_dim, size_t ex_bits, const IndexFilter *filter,
-      const IndexGroupBy &group_by, uint32_t group_topk, float threshold,
-      IvfRabitqContext::GroupTopkHeaps *heaps) const;
+  int search_cluster_group_by_impl(uint32_t cluster_id,
+                                   const IvfRabitqQueryState &query_state,
+                                   size_t padded_dim, size_t ex_bits,
+                                   const IndexFilter *filter,
+                                   const IndexGroupBy &group_by,
+                                   uint32_t group_topk, float threshold,
+                                   GroupCandidateCollector *heaps) const;
 
   const IvfRabitqClusterMeta *find_cluster_meta(size_t id) const;
 

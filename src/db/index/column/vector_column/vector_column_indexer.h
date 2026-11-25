@@ -76,6 +76,9 @@ class VectorColumnIndexer {
   //! Insert vector
   Status insert(const vector_column_params::VectorData &vector_data,
                 uint32_t doc_id);
+  using PreparedAdd = core::IndexStreamer::PreparedAdd;
+  Status prepare_insert(const vector_column_params::VectorData &vector_data,
+                        uint32_t doc_id, std::unique_ptr<PreparedAdd> *out);
   // TODO: batch insert
 
   virtual Result<IndexResults::Ptr> search(

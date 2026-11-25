@@ -65,97 +65,77 @@ class HnswSparseIndexProvider : public IndexSparseProvider {
  private:
   class Iterator : public IndexSparseProvider::Iterator {
    public:
-    Iterator(const HnswSparseEntity::Pointer &entity)
-        : entity_(entity), cur_id_(0U), valid_(false) {
-      const void *sparse_data = entity_->get_sparse_data(cur_id_);
-      if (sparse_data != nullptr) {
-        valid_ = true;
-
-        sparse_indices_buffer_.clear();
-        sparse_data_buffer_.clear();
-
-        SparseUtility::ReverseSparseFormat(
-            sparse_data, &sparse_count_, &sparse_indices_buffer_,
-            &sparse_data_buffer_, entity_->sparse_unit_size());
-      }
+    explicit Iterator(const HnswSparseEntity::Pointer &entity)
+        : entity_(entity) {
+      read_current();
     }
 
-    //! Retrieve sparse count
     uint32_t sparse_count() const override {
       return sparse_count_;
     }
 
-    //! Retrieve sparse indices
     const uint32_t *sparse_indices() const override {
       return reinterpret_cast<const uint32_t *>(sparse_indices_buffer_.data());
     }
 
-    //! Retrieve sparse data
     const void *sparse_data() const override {
-      return reinterpret_cast<const void *>(sparse_data_buffer_.data());
+      return sparse_data_buffer_.data();
     }
 
-    //! Test if the iterator is valid
     bool is_valid() const override {
-      return cur_id_ < entity_->doc_cnt() && valid_;
+      return valid_;
     }
-
-    //! Retrieve primary key
+    int status() const override {
+      return status_;
+    }
     uint64_t key() const override {
-      return entity_->get_key(cur_id_);
+      return key_;
     }
 
-    //! Next iterator
     void next() override {
-      cur_id_ = get_next_valid_id(cur_id_ + 1);
-
-      if (cur_id_ < entity_->doc_cnt()) {
-        const void *sparse_data = entity_->get_sparse_data(cur_id_);
-        if (sparse_data != nullptr) {
-          valid_ = true;
-
-          sparse_indices_buffer_.clear();
-          sparse_data_buffer_.clear();
-
-          SparseUtility::ReverseSparseFormat(
-              sparse_data, &sparse_count_, &sparse_indices_buffer_,
-              &sparse_data_buffer_, entity_->sparse_unit_size());
-        } else {
-          valid_ = false;
-        }
-      }
-    }
-
-    //! Reset the iterator
-    void reset() {
-      cur_id_ = get_next_valid_id(0);
-      const void *sparse_data = entity_->get_sparse_data(cur_id_);
-      if (sparse_data != nullptr) {
-        valid_ = true;
-
-        SparseUtility::ReverseSparseFormat(
-            sparse_data, &sparse_count_, &sparse_indices_buffer_,
-            &sparse_data_buffer_, entity_->sparse_unit_size());
+      if (status_ == 0 && cur_id_ < entity_->doc_cnt()) {
+        ++cur_id_;
+        read_current();
       }
     }
 
    private:
-    node_id_t get_next_valid_id(node_id_t start_id) {
-      for (node_id_t i = start_id; i < entity_->doc_cnt(); i++) {
-        if (entity_->get_key(i) != kInvalidNodeId) {
-          return i;
-        }
+    void read_current() try {
+      valid_ = false;
+      while (cur_id_ < entity_->doc_cnt()) {
+        key_ = entity_->get_key(cur_id_);
+        if (key_ != kInvalidKey) break;
+        ++cur_id_;
       }
-      return kInvalidNodeId;
+      if (cur_id_ >= entity_->doc_cnt()) return;
+
+      IndexStorage::MemoryBlock block;
+      status_ = entity_->get_sparse_data(cur_id_, block);
+      if (status_ != 0) return;
+      if (!block.data()) {
+        status_ = IndexError_ReadData;
+        return;
+      }
+      sparse_indices_buffer_.clear();
+      sparse_data_buffer_.clear();
+      SparseUtility::ReverseSparseFormat(
+          block.data(), &sparse_count_, &sparse_indices_buffer_,
+          &sparse_data_buffer_, entity_->sparse_unit_size());
+      valid_ = true;
+    } catch (const GraphStorageError &error) {
+      status_ = error.code;
+    } catch (const std::bad_alloc &) {
+      status_ = IndexError_NoMemory;
     }
 
-   private:
     const HnswSparseEntity::Pointer entity_;
-    node_id_t cur_id_;
+    node_id_t cur_id_{0};
     uint32_t sparse_count_{0};
-    std::string sparse_indices_buffer_;
-    std::string sparse_data_buffer_;
+    ailego::BudgetedString sparse_indices_buffer_;
+    ailego::BudgetedString sparse_data_buffer_;
     bool valid_{false};
+    int status_{0};
+    uint64_t key_{kInvalidKey};
   };
 
  private:

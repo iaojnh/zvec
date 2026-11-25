@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #pragma once
-
 #include <string.h>
 #include <functional>
 #include <ailego/utility/memory_helper.h>
@@ -21,6 +20,7 @@
 #include <zvec/core/framework/index_dumper.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_storage.h>
+#include "utility/graph_storage_error.h"
 
 // Reuse typed MemoryBlock and NeighborsT from hnsw_entity.h
 #include "algorithm/hnsw/hnsw_entity.h"
@@ -320,32 +320,16 @@ class VamanaEntity {
     header_.graph.node_size = size;
   }
 
-  int64_t dump_segments(const IndexDumper::Pointer &dumper, key_t *keys) const;
+  int64_t dump_segments(const IndexDumper::Pointer &dumper) const;
 
   int64_t dump_segment(const IndexDumper::Pointer &dumper,
                        const std::string &segment_id, const void *data,
                        size_t size) const;
-
   int64_t dump_header(const IndexDumper::Pointer &dumper,
                       const VamanaHeader &hd) const;
-
-  int64_t dump_vectors(const IndexDumper::Pointer &dumper,
-                       const std::vector<node_id_t> &reorder_mapping) const;
-
-  int64_t dump_neighbors(const IndexDumper::Pointer &dumper,
-                         const std::vector<node_id_t> &reorder_mapping,
-                         const std::vector<node_id_t> &neighbor_mapping) const;
-
-  int64_t dump_neighbor_dists(
-      const IndexDumper::Pointer &dumper,
-      const std::vector<node_id_t> &reorder_mapping) const;
-
-  int64_t dump_mapping_segment(const IndexDumper::Pointer &dumper,
-                               const key_t *keys) const;
-
-  void reshuffle_vectors(std::vector<node_id_t> *n2o_mapping,
-                         std::vector<node_id_t> *o2n_mapping,
-                         key_t *keys) const;
+  int64_t dump_vectors(const IndexDumper::Pointer &dumper) const;
+  int64_t dump_neighbors(const IndexDumper::Pointer &dumper) const;
+  int64_t dump_neighbor_dists(const IndexDumper::Pointer &dumper) const;
 
   static inline size_t AlignSize(size_t size) {
     return (size + 0x1F) & (~0x1F);

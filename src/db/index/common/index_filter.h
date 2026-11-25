@@ -14,8 +14,10 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
+#include <zvec/db/status.h>
 
 
 namespace zvec {
@@ -38,6 +40,38 @@ class IndexFilter {
    * @return false if the document is not filtered (should be included)
    */
   virtual bool is_filtered(uint64_t id) const = 0;
+
+  virtual Result<bool> is_filtered_checked(uint64_t id) const {
+    return is_filtered(id);
+  }
+};
+
+class CheckedIndexFilter : public IndexFilter {
+ public:
+  // Synchronous Boolean-only callers can unwind to their status boundary.
+  class Error : public std::exception {
+   public:
+    explicit Error(Status status) : status_(std::move(status)) {}
+
+    const char *what() const noexcept override {
+      return status_.c_str();
+    }
+
+    const Status &status() const {
+      return status_;
+    }
+
+   private:
+    Status status_;
+  };
+
+  bool is_filtered(uint64_t id) const final {
+    auto result = is_filtered_checked(id);
+    if (!result) throw Error(std::move(result.error()));
+    return *result;
+  }
+
+  Result<bool> is_filtered_checked(uint64_t id) const override = 0;
 };
 
 class EasyIndexFilter : public IndexFilter {

@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <shared_mutex>
 #include <unordered_map>
 #include "select_info.h"
@@ -42,10 +43,12 @@ class ZVecCachedSQLParser : public ZVecParser {
   int traverse_to_replace(Node::Ptr ptr, Node::Ptr vector_node);
 
  private:
+  class CacheReclaimer;
+  static CacheReclaimer &cache_reclaimer();
   static std::unordered_map<std::string, SQLInfo::Ptr> sql_info_map_;
   static std::unordered_map<std::string, Node::Ptr> filter_map_;
-  static uint32_t hit;
-  static uint32_t miss;
+  static std::atomic<uint32_t> hit;
+  static std::atomic<uint32_t> miss;
   inline static std::shared_mutex shared_mutex_;
 
  private:

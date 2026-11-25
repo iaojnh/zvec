@@ -13,7 +13,9 @@
 // limitations under the License.
 #pragma once
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <zvec/ailego/pattern/expected.hpp>
 #include <zvec/core/interface/index.h>
 #include <zvec/core/interface/index_param_builders.h>
@@ -30,10 +32,51 @@ namespace zvec {
 // TODO: rename file extension
 class ProximaEngineHelper {
  public:
+  static Status index_status(int code, const char *operation) {
+    if (code == 0) return Status::OK();
+    return Status(code == core::IndexError_NoMemory
+                      ? StatusCode::RESOURCE_EXHAUSTED
+                      : StatusCode::INTERNAL_ERROR,
+                  ailego::StringHelper::Concat(operation, ": ",
+                                               core::IndexError::What(code)));
+  }
+
+  class SearchFilter {
+   public:
+    explicit SearchFilter(const IndexFilter *filter) {
+      if (!filter) return;
+      engine_filter_ = std::make_shared<core_interface::IndexFilter>();
+      engine_filter_->set([this, filter](uint64_t id) {
+        if (failed_.load(std::memory_order_relaxed)) return true;
+        auto result = filter->is_filtered_checked(id);
+        if (result) return *result;
+        std::call_once(first_error_, [&] {
+          status_ = std::move(result.error());
+          failed_.store(true, std::memory_order_relaxed);
+        });
+        return true;
+      });
+    }
+
+    const std::shared_ptr<core_interface::IndexFilter> &engine_filter() const {
+      return engine_filter_;
+    }
+
+    // Read after the synchronous core search has joined any workers.
+    const Status &status() const {
+      return status_;
+    }
+
+   private:
+    std::shared_ptr<core_interface::IndexFilter> engine_filter_;
+    std::atomic<bool> failed_{false};
+    std::once_flag first_error_;
+    Status status_;
+  };
+
   static Result<vector_column_params::VectorDataBuffer>
   move_from_engine_vector_buffer(
-      const core_interface::VectorDataBuffer &&vector_data_buffer,
-      bool is_sparse) {
+      core_interface::VectorDataBuffer &&vector_data_buffer, bool is_sparse) {
     if (is_sparse) {
       auto sparse_vector_buffer = std::get<core_interface::SparseVectorBuffer>(
           vector_data_buffer.vector_buffer);
@@ -42,11 +85,10 @@ class ProximaEngineHelper {
               std::move(sparse_vector_buffer.indices),
               std::move(sparse_vector_buffer.values)}};
     }
-    auto dense_vector_buffer = std::get<core_interface::DenseVectorBuffer>(
+    auto &dense_vector_buffer = std::get<core_interface::DenseVectorBuffer>(
         vector_data_buffer.vector_buffer);
     return vector_column_params::VectorDataBuffer{
-        vector_column_params::DenseVectorBuffer{
-            std::move(dense_vector_buffer.data)}};
+        std::move(dense_vector_buffer)};
   }
 
   static Result<vector_column_params::VectorData> convert_from_engine_vector(
@@ -112,10 +154,8 @@ class ProximaEngineHelper {
             query_params->type(), query_params, &engine_query_param, nullptr);
         if (!status.ok()) return status;
       }
-      if (filter) {
-        engine_query_param.filter =
-            ProximaEngineHelper::convert_to_engine_filter(filter);
-      }
+      SearchFilter search_filter(filter);
+      engine_query_param.filter = search_filter.engine_filter();
       core_interface::RefinerParam refiner;
       if (reference_indexer) {
         refiner.scale_factor_ = query_params->scale_factor();
@@ -131,11 +171,10 @@ class ProximaEngineHelper {
       // search.
       const core_interface::BaseIndexQueryParam::Pointer params(
           core_interface::BaseIndexQueryParam::Pointer{}, &engine_query_param);
-      if (index->search_internal_ids(vector_data, params, output_ids,
-                                     output_scores) != 0) {
-        return Status::InternalError("Failed to search vector");
-      }
-      return Status::OK();
+      const int error = index->search_internal_ids(vector_data, params,
+                                                   output_ids, output_scores);
+      if (!search_filter.status().ok()) return search_filter.status();
+      return index_status(error, "Failed to search vector");
     };
     switch (indexer.field_schema_.index_type()) {
       case IndexType::FLAT:
@@ -182,11 +221,6 @@ class ProximaEngineHelper {
     auto engine_query_param = std::make_shared<EngineQueryParamType>();
     engine_query_param->topk = db_query_params.topk;
     engine_query_param->fetch_vector = db_query_params.fetch_vector;
-
-    if (db_query_params.filter) {
-      engine_query_param->filter =
-          convert_to_engine_filter(db_query_params.filter);
-    }
 
     if (db_query_params.query_params) {
       auto status = update_engine_query_param(

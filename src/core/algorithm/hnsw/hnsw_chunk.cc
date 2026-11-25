@@ -85,20 +85,22 @@ int ChunkBroker::init_storage(uint32_t chunk_size) {
   size = chunk_meta_segment_->write(0UL, &chunk_meta_, sizeof(HnswChunkMeta));
   if (ailego_unlikely(size != sizeof(HnswChunkMeta))) {
     LOG_ERROR("Storage write data failed, wsize=%zu", size);
-    return IndexError_WriteData;
+    return chunk_meta_segment_->write_error();
   }
 
   return 0;
 }
 
 int ChunkBroker::load_storage(uint32_t &chunk_size) {
-  IndexStorage::MemoryBlock data_block;
-  size_t size = chunk_meta_segment_->read(0UL, data_block,
-                                          chunk_meta_segment_->data_size());
+  const size_t size = chunk_meta_segment_->data_size();
   if (size != sizeof(HnswChunkMeta)) {
-    LOG_ERROR("Invalid hnsw meta chunk, read size=%zu chunk size=%zu", size,
-              chunk_meta_segment_->data_size());
+    LOG_ERROR("Invalid hnsw meta chunk size=%zu", size);
     return IndexError_InvalidFormat;
+  }
+  IndexStorage::MemoryBlock data_block;
+  if (chunk_meta_segment_->read(0UL, data_block, size) != size) {
+    LOG_ERROR("Read hnsw meta chunk failed");
+    return chunk_meta_segment_->read_error();
   }
   std::memcpy(static_cast<void *>(&chunk_meta_), data_block.data(), size);
   if (chunk_meta_.chunk_size != chunk_size) {
@@ -150,12 +152,13 @@ int ChunkBroker::open(IndexStorage::Pointer stg, uint32_t &chunk_size,
   const std::string segment_id =
       make_segment_id(CHUNK_TYPE_META, kDefaultChunkSeqId);
   chunk_meta_segment_ = stg_->get(segment_id);
-  if (!chunk_meta_segment_) {
-    LOG_DEBUG("Create new index");
-    return init_storage(chunk_size);
+  const int ret =
+      chunk_meta_segment_ ? load_storage(chunk_size) : init_storage(chunk_size);
+  if (ret != 0) {
+    chunk_meta_segment_.reset();
+    stg_.reset();
   }
-
-  return load_storage(chunk_size);
+  return ret;
 }
 
 int ChunkBroker::close() {
@@ -163,28 +166,31 @@ int ChunkBroker::close() {
   // Storage can still be dirty for a newly created index with no vectors.
   int ret = stg_ && (dirty_ || stg_->is_dirty()) ? flush(0UL) : 0;
 
+  if (ret != 0) return ret;
+  chunk_meta_segment_.reset();
   stg_.reset();
   check_crc_ = false;
   dirty_ = false;
 
-  return ret;
+  return 0;
 }
 
 int ChunkBroker::flush(uint64_t checkpoint) {
   ailego_assert_with(chunk_meta_segment_, "invalid meta segment");
 
   chunk_meta_.update_time = ailego::Realtime::Seconds();
-  stats_.set_update_time(chunk_meta_.update_time);
 
   size_t size =
       chunk_meta_segment_->write(0UL, &chunk_meta_, sizeof(HnswChunkMeta));
   if (ailego_unlikely(size != sizeof(HnswChunkMeta))) {
     LOG_ERROR("Storage write data failed, wsize=%zu", size);
+    return chunk_meta_segment_->write_error();
   }
 
   stg_->refresh(checkpoint);
   int ret = stg_->flush();
   if (ret == 0) {
+    stats_.set_update_time(chunk_meta_.update_time);
     (*stats_.mutable_check_point()) = checkpoint;
   } else {
     LOG_ERROR("Storage flush failed for %s", IndexError::What(ret));

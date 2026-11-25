@@ -25,7 +25,9 @@
 #include <rocksdb/utilities/stackable_db.h>
 #include <zvec/db/index_params.h>
 #include "db/common/file_helper.h"
+#include "db/common/mobile_memory.h"
 #include "db/index/common/index_filter.h"
+#include "../../../../ailego/buffer/pool_payload_budget.h"
 // FtsQueryParams defined below
 #include "db/index/column/fts_column/fts_ast_rewriter.h"
 #include "db/index/column/fts_column/fts_indexer.h"
@@ -41,6 +43,20 @@ using namespace zvec;
 using namespace zvec::fts;
 
 namespace {
+
+class FtsBudgetEnvironment : public ::testing::Environment {
+ public:
+  void SetUp() override {
+    if constexpr (detail::kMobileMemoryPolicy) {
+      // Jieba's full dictionary needs a standalone budget in death-test
+      // parents and their re-executed children.
+      ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(256UL << 20));
+    }
+  }
+};
+
+[[maybe_unused]] const auto *const kFtsBudgetEnvironment =
+    ::testing::AddGlobalTestEnvironment(new FtsBudgetEnvironment);
 
 // Build a transient FieldSchema for FTS unit tests.
 // When fts_params is provided, it is attached as the field's index_params
@@ -341,6 +357,28 @@ TEST_F(FtsColumnIndexerTest, SearchTopkLimitsResults) {
   std::vector<FtsResult> results;
   EXPECT_TRUE(search_ok(*indexer, "hello", 3, &results));
   EXPECT_LE(results.size(), 3u);
+}
+
+TEST_F(FtsColumnIndexerTest, SearchTopkAcrossInitialReserveKeepsRanking) {
+  auto indexer = make_indexer();
+  for (uint64_t doc_id = 0; doc_id < 192; ++doc_id) {
+    std::string text = "world";
+    for (uint64_t i = 0; i <= doc_id; ++i) text += " hello";
+    ASSERT_TRUE(indexer->insert(doc_id, text).has_value());
+  }
+  std::vector<FtsResult> all;
+  ASSERT_TRUE(search_ok(*indexer, "hello", 192, &all));
+  ASSERT_EQ(192u, all.size());
+  for (const uint32_t topk : {0u, 1u, 32u, 128u, 129u, 192u, 256u}) {
+    SCOPED_TRACE(topk);
+    std::vector<FtsResult> results;
+    ASSERT_TRUE(search_ok(*indexer, "hello", topk, &results));
+    ASSERT_EQ(std::min<size_t>(topk, all.size()), results.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+      EXPECT_EQ(all[i].doc_id, results[i].doc_id);
+      EXPECT_FLOAT_EQ(all[i].score, results[i].score);
+    }
+  }
 }
 
 // ============================================================

@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #pragma once
-
+#include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include "hnsw_sparse_builder_entity.h"
 #include "hnsw_sparse_entity.h"
 
@@ -112,18 +113,18 @@ class HnswSparseSearcherEntity : public HnswSparseEntity {
   }
 
   //! get fixed length neighbors data
-  int get_fixed_neighbors(std::vector<uint32_t> *fixed_neighbors) const;
+  int get_fixed_neighbors(
+      ailego::BudgetedVector<uint32_t> *fixed_neighbors) const;
 
  private:
   //! Constructor
-  HnswSparseSearcherEntity(const HNSWSparseHeader &hd,
-                           const SegmentPointer &keys,
-                           const SegmentPointer &mapping,
-                           const SegmentGroupParam &neighbor_group,
-                           const SegmentPointer &sparse_vector_meta,
-                           const SegmentPointer &sparse_vectors,
-                           const std::shared_ptr<char> &fixed_neighbors,
-                           bool neighbors_in_memory_enabled)
+  HnswSparseSearcherEntity(
+      const HNSWSparseHeader &hd, const SegmentPointer &keys,
+      const SegmentPointer &mapping, const SegmentGroupParam &neighbor_group,
+      const SegmentPointer &sparse_vector_meta,
+      const SegmentPointer &sparse_vectors,
+      const std::shared_ptr<ailego::BudgetedMappedBuffer> &fixed_neighbors,
+      bool neighbors_in_memory_enabled)
       : HnswSparseEntity(hd),
         keys_(keys),
         mapping_(mapping),
@@ -172,7 +173,8 @@ class HnswSparseSearcherEntity : public HnswSparseEntity {
   SegmentPointer sparse_vectors_{};
 
   mutable std::vector<IndexStorage::SegmentData> segment_datas_{};
-  std::shared_ptr<char> fixed_neighbors_{};  // level 0 fixed size neighbors
+  std::shared_ptr<ailego::BudgetedMappedBuffer>
+      fixed_neighbors_{};  // level 0 fixed size neighbors
   bool neighbors_in_memory_enabled_{false};
   bool loaded_{false};
 };

@@ -91,6 +91,20 @@ class IndexSegmentStorage : public IndexStorage {
       return parent_->read_error();
     }
 
+    bool supports_read_chunks() const override {
+      return parent_->supports_read_chunks();
+    }
+    int set_read_chunks(const ReadChunks &chunks) override {
+      ReadChunks translated;
+      translated.reserve(chunks.size());
+      for (const auto &chunk : chunks) {
+        if (chunk.offset > data_size_ || chunk.size > data_size_ - chunk.offset)
+          return IndexError_InvalidArgument;
+        translated.push_back({data_offset_ + chunk.offset, chunk.size});
+      }
+      return parent_->set_read_chunks(translated);
+    }
+
     size_t read_scatter(size_t offset, ScatterBlock &data,
                         size_t len) override {
       if (offset > region_size_) {

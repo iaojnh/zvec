@@ -23,6 +23,7 @@
 #include <arrow/record_batch.h>
 #include <gtest/gtest.h>
 #include "db/common/constants.h"
+#include "db/index/storage/parquet_memory_pool.h"
 #include "db/index/storage/wal/wal_file.h"
 #include "segment_test_fixture.h"
 
@@ -143,6 +144,49 @@ TEST_P(SegmentTest, ScanAndFetchPreserveLocalRowIDColumnPosition) {
   }
 }
 
+TEST_P(SegmentTest, SharedBlockLocalRowIDsSurviveFlushAndNonzeroOffsets) {
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, *schema_, 0, 100, id_map_, delete_store_, version_manager_,
+      options_, 100, 8);
+  ASSERT_NE(segment, nullptr);
+  auto check = [&](const std::vector<int> &rows) {
+    for (const auto &projection : LocalRowIdProjections()) {
+      auto table = segment->fetch(projection.columns, rows);
+      ExpectFetchedLocalRowIDs(table, projection.row_id_column_index, rows);
+      ASSERT_NE(table, nullptr);
+      ASSERT_TRUE(table->ValidateFull().ok());
+      for (size_t row = 0; row < rows.size(); ++row) {
+        auto expected = test::TestHelper::CreateDoc(100 + rows[row], *schema_);
+        auto id = table->GetColumnByName("id")->GetScalar(row);
+        auto name = table->GetColumnByName("name")->GetScalar(row);
+        ASSERT_TRUE(id.ok() && name.ok());
+        EXPECT_TRUE((*id)->Equals(
+            arrow::Int32Scalar(expected.get<int32_t>("id").value())));
+        EXPECT_TRUE((*name)->Equals(
+            arrow::StringScalar(expected.get<std::string>("name").value())));
+      }
+    }
+  };
+  check({7, 0, 7, 3});
+  check({});
+  ASSERT_TRUE(segment->flush().ok());
+  check({7, 0, 7, 3});
+  ASSERT_TRUE(
+      test::TestHelper::SegmentInsertDoc(segment, *schema_, 108, 116).ok());
+  check({12, 8, 15, 12});
+  check({15, 0, 8, 3});
+  ASSERT_TRUE(segment->dump().ok());
+  check({12, 8, 15, 12});
+  check({15, 0, 8, 3});
+  auto only_ids = segment->fetch({LOCAL_ROW_ID}, std::vector<int>{12, 8, 12});
+  ASSERT_NE(only_ids, nullptr);
+  auto array = std::static_pointer_cast<arrow::UInt64Array>(
+      only_ids->column(0)->chunk(0));
+  EXPECT_EQ(array->Value(0), 12);
+  EXPECT_EQ(array->Value(1), 8);
+  EXPECT_EQ(array->Value(2), 12);
+}
+
 
 TEST_P(SegmentTest, ScanLocalRowIDIsSegmentLocal) {
   options_.max_buffer_size_ = 1 * 1024;
@@ -176,6 +220,31 @@ TEST_P(SegmentTest, ScanLocalRowIDIsSegmentLocal) {
     expected_ids.push_back(i);
   }
   EXPECT_EQ(actual_ids, expected_ids);
+}
+
+
+TEST_P(SegmentTest, ScanLocalRowIDUsesStorageModeBudget) {
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_,
+      options_, 0, 10);
+  ASSERT_NE(nullptr, segment);
+  auto reader = segment->scan({LOCAL_ROW_ID, "id"});
+  ASSERT_NE(nullptr, reader);
+
+  // LOCAL_ROW_ID is synthesized by the query, outside the column cache.
+  auto *pool = detail::GetParquetQueryMemoryPool().get();
+  const auto baseline = pool->bytes_allocated();
+  std::shared_ptr<arrow::RecordBatch> batch;
+  auto status = reader->ReadNext(&batch);
+  ASSERT_TRUE(status.ok()) << status.ToString();
+  ASSERT_NE(nullptr, batch);
+  if (options_.enable_mmap_) {
+    EXPECT_EQ(baseline, pool->bytes_allocated());
+  } else {
+    EXPECT_GE(pool->bytes_allocated(), baseline + 10 * sizeof(uint64_t));
+  }
+  batch.reset();
+  EXPECT_EQ(baseline, pool->bytes_allocated());
 }
 
 
@@ -231,6 +300,30 @@ TEST_P(SegmentTest, DocCountDeleteFilterWithNonZeroGlobalDocID) {
 
   EXPECT_EQ(segment->doc_count(), 10);
   EXPECT_EQ(segment->doc_count(delete_store_->make_filter()), 8);
+}
+
+
+TEST_P(SegmentTest, DeleteFilterReportsInvalidLocalRow) {
+  auto segment = test::TestHelper::CreateSegmentWithDoc(
+      col_path_, *schema_, 0, 100, id_map_, delete_store_, version_manager_,
+      options_, 0, 2);
+  ASSERT_NE(segment, nullptr);
+  ASSERT_TRUE(segment->Delete(100).ok());
+
+  auto filter = segment->get_filter();
+  ASSERT_NE(filter, nullptr);
+  auto deleted = filter->is_filtered_checked(0);
+  ASSERT_TRUE(deleted);
+  EXPECT_TRUE(*deleted);
+  auto live = filter->is_filtered_checked(1);
+  ASSERT_TRUE(live);
+  EXPECT_FALSE(*live);
+
+  for (uint64_t row_id : {uint64_t{2}, uint64_t{1} << 32}) {
+    auto missing = filter->is_filtered_checked(row_id);
+    ASSERT_FALSE(missing);
+    EXPECT_EQ(missing.error().code(), StatusCode::INVALID_ARGUMENT);
+  }
 }
 
 

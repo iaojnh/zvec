@@ -14,16 +14,24 @@
 #include "ivf_builder.h"
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <iostream>
 #include <limits>
+#include <thread>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <turbo/quantizer/quantizer.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/container/vector.h>
 #include <zvec/core/framework/index_helper.h>
 #include <zvec/core/framework/index_provider.h>
 #include <zvec/core/framework/index_streamer.h>
+#include "turbo/algorithm/kmeans.h"
+#include "ivf_entity.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
 
 using namespace zvec::core;
 using namespace zvec::ailego;
@@ -345,7 +353,7 @@ TEST_F(IVFBuilderTest, LabelQueueIsBoundedForHighDimensionalVectors) {
     SCOPED_TRACE(convert ? "FP16" : "FP32");
     dimension_ = 1024;
     index_meta_.set_meta(IndexMeta::DataType::DT_FP32, dimension_);
-    params_.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "1");
+    params_.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "2");
     params_.set(PARAM_IVF_BUILDER_TRAIN_SAMPLE_COUNT, 8u);
     if (convert) {
       params_.set(PARAM_IVF_BUILDER_CONVERTER_CLASS, "HalfFloatConverter");
@@ -385,6 +393,39 @@ TEST_F(IVFBuilderTest, LabelQueueIsBoundedForHighDimensionalVectors) {
     ASSERT_EQ(0, builder.dump(dumper));
     EXPECT_EQ(kVectorCount, builder.stats().dumped_count());
     ASSERT_EQ(0, dumper->close());
+    // Each delayed batch must see its own rows, including the partial batch
+    // at a window boundary. A single centroid cannot detect overwritten rows.
+    auto storage = IndexFactory::CreateStorage("MemoryReadStorage");
+    ASSERT_NE(nullptr, storage);
+    ASSERT_EQ(0, storage->init(Params()));
+    ASSERT_EQ(0, storage->open("label_queue", false));
+    IVFEntity entity;
+    ASSERT_EQ(0, entity.load(storage));
+    std::vector<Float16> half(dimension_);
+    size_t checked = 0;
+    for (size_t centroid = 0; centroid < entity.inverted_list_count();
+         ++centroid) {
+      IndexStorage::MemoryBlock meta_block;
+      const auto *list = entity.inverted_list_meta(centroid, meta_block);
+      ASSERT_NE(nullptr, list);
+      for (size_t row = 0; row < list->vector_count; ++row) {
+        IndexStorage::MemoryBlock vector;
+        ASSERT_EQ(0, entity.get_vector(list->id_offset + row, vector));
+        const void *query = vector.data();
+        if (convert) {
+          const auto *values = static_cast<const float *>(query);
+          for (size_t d = 0; d < dimension_; ++d) half[d] = Float16(values[d]);
+          query = half.data();
+        }
+        uint32_t expected = IVFCentroidIndex::kInvalidID;
+        ASSERT_EQ(0, builder.centroid_index()->search_nearest_centroid(
+                         query, builder.centroid_index()->meta().element_size(),
+                         &expected));
+        ASSERT_EQ(centroid, expected);
+        ++checked;
+      }
+    }
+    EXPECT_EQ(kVectorCount, checked);
   }
 }
 
@@ -599,9 +640,10 @@ TEST_F(IVFBuilderTest, HalfFloatOrdinalReaderPreservesErrorsAndFallback) {
   ASSERT_EQ(0, reader->read(0, &key, &data));
   ASSERT_NE(nullptr, data);
 
-  // An ordinary multipass source has no ordinal capability. Declining it
-  // must leave the existing reader intact and sequential conversion usable.
-  ASSERT_EQ(0, converter->transform(holder_));
+  // A source may decline ordinal access even though it supports iteration.
+  // This must leave the reader intact and sequential conversion usable.
+  source->create_error = IndexError_NotImplemented;
+  ASSERT_EQ(0, converter->transform(source));
   auto fallback = converter->result();
   auto *unsupported = dynamic_cast<OrdinalAccessHolder *>(fallback.get());
   ASSERT_NE(nullptr, unsupported);
@@ -804,181 +846,6 @@ TEST_F(IVFBuilderTest, OrdinalSourceFallsBackForUnsupportedTransforms) {
     ASSERT_EQ(0, builder.dump(dumper));
     ASSERT_EQ(0, dumper->close());
     EXPECT_EQ(103u, builder.stats().dumped_count());
-  }
-}
-
-class StableTestHolder : public IndexHolder, public StableVectorHolder {
- public:
-  explicit StableTestHolder(IndexHolder::Pointer delegate)
-      : delegate_(std::move(delegate)) {}
-  size_t count() const override {
-    return reported_count ? reported_count : delegate_->count();
-  }
-  size_t dimension() const override { return delegate_->dimension(); }
-  IndexMeta::DataType data_type() const override {
-    return delegate_->data_type();
-  }
-  size_t element_size() const override { return delegate_->element_size(); }
-  bool multipass() const override { return true; }
-  IndexHolder::Iterator::Pointer create_iterator() override {
-    ++iterations;
-    return delegate_->create_iterator();
-  }
-  int retain_stable_data(std::shared_ptr<const void> *lifetime) override {
-    ++retains;
-    if (retain_error != 0) return retain_error;
-    if (!null_lifetime) *lifetime = delegate_;
-    return 0;
-  }
-
-  size_t iterations{0};
-  size_t retains{0};
-  size_t reported_count{0};
-  int retain_error{0};
-  bool null_lifetime{false};
-
- private:
-  IndexHolder::Pointer delegate_;
-};
-
-TEST_F(IVFBuilderTest, StableSourceKeepsOriginalAddressesAndBackingData) {
-  prepare_index_holder(100, 103);
-  auto source = std::make_shared<StableTestHolder>(holder_);
-  std::shared_ptr<const void> lifetime;
-  ASSERT_EQ(0, source->retain_stable_data(&lifetime));
-  IVFBuilder::RandomAccessIndexHolder borrowed(index_meta_, std::move(lifetime));
-  borrowed.reserve(source->count());
-  const void *first = nullptr;
-  for (auto iter = source->create_iterator(); iter->is_valid(); iter->next()) {
-    if (!first) first = iter->data();
-    borrowed.emplace(iter->key(), iter->data());
-  }
-  std::weak_ptr<IndexHolder> backing = holder_;
-  source.reset();
-  holder_.reset();
-  ASSERT_FALSE(backing.expired());
-  EXPECT_EQ(103u, borrowed.count());
-  EXPECT_EQ(first, borrowed.element(0));
-  auto iter = borrowed.create_iterator();
-  for (size_t i = 0; i < borrowed.count(); ++i, iter->next()) {
-    ASSERT_TRUE(iter->is_valid());
-    EXPECT_EQ(100u + i, iter->key());
-    EXPECT_EQ(borrowed.element(i), iter->data());
-    EXPECT_EQ(float(i), static_cast<const float *>(iter->data())[0]);
-  }
-  EXPECT_FALSE(iter->is_valid());
-}
-
-TEST_F(IVFBuilderTest, StableSourceSupportsTransformsAndRepeatedDumps) {
-  // Raw postings, centroid conversion, legacy posting conversion, and the
-  // automatic Cosine/IP centroid converters all retain the original data.
-  for (int mode : {0, 1, 2, 3, 4}) {
-    SCOPED_TRACE(mode);
-    auto input = std::make_shared<MultiPassIndexHolder<IndexMeta::DT_FP32>>(
-        dimension_);
-    // Primary keys deliberately differ from ordinal IDs and arrive unsorted.
-    for (size_t i = 0; i < 103; ++i) {
-      input->emplace(1000 + (103 - i) * 3,
-                     NumericalVector<float>(dimension_, float(i)));
-    }
-    holder_ = std::move(input);
-    auto expected = holder_;
-    auto meta = index_meta_;
-    Params params = params_;
-    params.set(PARAM_IVF_BUILDER_STORE_ORIGINAL_FEATURES, true);
-    if (mode == 1)
-      params.set(PARAM_IVF_BUILDER_CONVERTER_CLASS, "HalfFloatConverter");
-    if (mode == 2)
-      params.set(PARAM_IVF_BUILDER_QUANTIZER_CLASS, "HalfFloatConverter");
-    if (mode == 3) meta.set_metric("Cosine", 0, Params());
-    if (mode == 4) meta.set_metric("InnerProduct", 0, Params());
-    zvec::turbo::Quantizer::Pointer quantizer;
-    if (mode == 3) {
-      meta.set_quantizer("Fp32Quantizer", 0, Params());
-      quantizer = IndexFactory::CreateQuantizer("Fp32Quantizer");
-      ASSERT_NE(nullptr, quantizer);
-      ASSERT_EQ(0, quantizer->init(meta, Params()));
-    }
-    IVFBuilder builder;
-    ASSERT_EQ(0, builder.init(meta, params, quantizer));
-    ASSERT_EQ(0, builder.train(threads_, holder_));
-    auto source = std::make_shared<StableTestHolder>(holder_);
-    ASSERT_EQ(0, builder.build(threads_, source));
-    EXPECT_EQ(1u, source->retains);
-    EXPECT_EQ(1u, source->iterations);
-    std::weak_ptr<IndexHolder> backing = holder_;
-    source.reset();
-    holder_.reset();
-    for (size_t pass = 0; pass < 2; ++pass) {
-      const std::string path = "ivf_stable_source.index";
-      auto dumper = IndexFactory::CreateDumper("FileDumper");
-      ASSERT_EQ(0, dumper->create(path));
-      ASSERT_EQ(0, builder.dump(dumper));
-      ASSERT_EQ(0, dumper->close());
-      auto storage = IndexFactory::CreateStorage("MMapFileReadStorage");
-      ASSERT_EQ(0, storage->init(Params()));
-      ASSERT_EQ(0, storage->open(path, false));
-      auto streamer = IndexFactory::CreateStreamer("IVFStreamer");
-      ASSERT_EQ(0, streamer->init(meta, Params()));
-      ASSERT_EQ(0, streamer->open(storage));
-      auto provider = streamer->create_provider();
-      ASSERT_NE(nullptr, provider);
-      for (auto iter = expected->create_iterator(); iter->is_valid();
-           iter->next()) {
-        const void *actual = provider->get_vector(iter->key());
-        ASSERT_NE(nullptr, actual);
-        EXPECT_EQ(0, std::memcmp(actual, iter->data(), expected->element_size()));
-      }
-      provider.reset();
-      ASSERT_EQ(0, streamer->close());
-      ASSERT_EQ(0, storage->close());
-      File::RemovePath(path);
-    }
-    expected.reset();
-    EXPECT_FALSE(backing.expired());
-    ASSERT_EQ(0, builder.cleanup());
-    EXPECT_TRUE(backing.expired());
-  }
-}
-
-TEST_F(IVFBuilderTest, StableSourceValidatesLifetimeAndCounts) {
-  for (int mode : {0, 1, 2, 3, 4}) {
-    SCOPED_TRACE(mode);
-    prepare_index_holder(100, 103);
-    IVFBuilder builder;
-    ASSERT_EQ(0, builder.init(index_meta_, params_));
-    ASSERT_EQ(0, builder.train(threads_, holder_));
-    auto source = std::make_shared<StableTestHolder>(holder_);
-    int expected = IndexError_Mismatch;
-    if (mode == 0) {
-      source->retain_error = expected = IndexError_ReadData;
-    } else if (mode == 1) {
-      source->null_lifetime = true;
-      expected = IndexError_Runtime;
-    } else if (mode == 2 || mode == 3) {
-      source->reported_count = mode == 2 ? 104 : 102;
-    } else {
-      source->retain_error = IndexError_NotImplemented;
-      expected = 0;
-    }
-    EXPECT_EQ(expected, builder.build(threads_, source));
-    EXPECT_EQ(mode < 2 ? 0u : 1u, source->iterations);
-  }
-}
-
-TEST_F(IVFBuilderTest, StableSourcePreservesIteratorReadErrors) {
-  prepare_index_holder(100, 103);
-  for (auto operation : {IteratorErrorOperation::kValidity,
-                         IteratorErrorOperation::kKey,
-                         IteratorErrorOperation::kData}) {
-    IVFBuilder builder;
-    ASSERT_EQ(0, builder.init(index_meta_, params_));
-    ASSERT_EQ(0, builder.train(threads_, holder_));
-    auto failing = std::make_shared<IteratorErrorHolder>(holder_, 3, operation);
-    auto source = std::make_shared<StableTestHolder>(failing);
-    EXPECT_EQ(IndexError_ReadData, builder.build(threads_, source));
-    EXPECT_EQ(1u, source->retains);
-    EXPECT_EQ(1u, source->iterations);
   }
 }
 
@@ -1383,6 +1250,25 @@ TEST_F(IVFBuilderTest, TestBuildWithConverterClassMultiLevel) {
 }
 
 TEST_F(IVFBuilderTest, TestIndexThreads) {
+  // A refused worker allocation must return an error, never escape the
+  // thread and terminate the process. Normal threaded builds follow below.
+  {
+    auto &pool = PoolPayloadBudget::get_instance();
+    const size_t previous = pool.capacity();
+    ASSERT_EQ(0, pool.init(32UL << 20));
+    auto restore = ScopeGuard::Make([&] { EXPECT_EQ(0, pool.init(previous)); });
+    using Algorithm = zvec::turbo::NumericalKmeans<float, IndexThreads>;
+    class WorkerProbe : public Algorithm {
+     public:
+      WorkerProbe() : Algorithm(1, 1536) {}
+      using Algorithm::cluster_matrix_features;
+    } algorithm;
+    MemoryReservation pressure;
+    pressure.add(pool.capacity() - pool.used());
+    std::thread denied([&] { algorithm.cluster_matrix_features(0, 1); });
+    denied.join();
+    EXPECT_EQ(Algorithm::kWorkspaceNoMemory, algorithm.matrix_status());
+  }
   IndexBuilder::Pointer builder1 = IndexFactory::CreateBuilder("IVFBuilder");
   ASSERT_NE(builder1, nullptr);
   IndexBuilder::Pointer builder2 = IndexFactory::CreateBuilder("IVFBuilder");
@@ -1475,6 +1361,223 @@ TEST(IVFTurboConfiguration, RejectsColumnOrderAndLegacyPostingQuantization) {
     auto conflicting_params = params;
     conflicting_params.set(PARAM_IVF_BUILDER_QUANTIZE_BY_CENTROID, true);
     EXPECT_NE(0, builder.init(meta, conflicting_params, quantizer));
+  }
+}
+
+class StableTestHolder : public IndexHolder, public StableVectorHolder {
+ public:
+  explicit StableTestHolder(IndexHolder::Pointer delegate)
+      : delegate_(std::move(delegate)) {}
+  size_t count() const override {
+    return reported_count ? reported_count : delegate_->count();
+  }
+  size_t dimension() const override {
+    return delegate_->dimension();
+  }
+  IndexMeta::DataType data_type() const override {
+    return delegate_->data_type();
+  }
+  size_t element_size() const override {
+    return delegate_->element_size();
+  }
+  bool multipass() const override {
+    return true;
+  }
+  IndexHolder::Iterator::Pointer create_iterator() override {
+    ++iterations;
+    return delegate_->create_iterator();
+  }
+  int retain_stable_data(std::shared_ptr<const void> *lifetime) override {
+    ++retains;
+    if (retain_error != 0) return retain_error;
+    if (!null_lifetime) *lifetime = delegate_;
+    return 0;
+  }
+
+  size_t iterations{0};
+  size_t retains{0};
+  size_t reported_count{0};
+  int retain_error{0};
+  bool null_lifetime{false};
+
+ private:
+  IndexHolder::Pointer delegate_;
+};
+
+TEST_F(IVFBuilderTest, StableSourceKeepsOriginalAddressesAndBackingData) {
+  prepare_index_holder(100, 103);
+  auto source = std::make_shared<StableTestHolder>(holder_);
+  std::shared_ptr<const void> lifetime;
+  ASSERT_EQ(0, source->retain_stable_data(&lifetime));
+  IVFBuilder::RandomAccessIndexHolder borrowed(index_meta_,
+                                               std::move(lifetime));
+  borrowed.reserve(source->count());
+  const void *first = nullptr;
+  for (auto iter = source->create_iterator(); iter->is_valid(); iter->next()) {
+    if (!first) first = iter->data();
+    borrowed.emplace(iter->key(), iter->data());
+  }
+  std::weak_ptr<IndexHolder> backing = holder_;
+  source.reset();
+  holder_.reset();
+  ASSERT_FALSE(backing.expired());
+  EXPECT_EQ(103u, borrowed.count());
+  EXPECT_EQ(first, borrowed.element(0));
+  auto iter = borrowed.create_iterator();
+  for (size_t i = 0; i < borrowed.count(); ++i, iter->next()) {
+    ASSERT_TRUE(iter->is_valid());
+    EXPECT_EQ(100u + i, iter->key());
+    EXPECT_EQ(borrowed.element(i), iter->data());
+    EXPECT_EQ(float(i), static_cast<const float *>(iter->data())[0]);
+  }
+  EXPECT_FALSE(iter->is_valid());
+}
+
+TEST_F(IVFBuilderTest, DefaultCosineTrainingNormalizesCentroidForRouting) {
+  // Exercise the real builder default (generic Kmeans for turbo Cosine),
+  // including conversion of raw vectors with unequal original lengths.
+  auto meta = index_meta_;
+  meta.set_metric("Cosine", 0, Params());
+  meta.set_quantizer("Fp32Quantizer", 0, Params());
+  auto quantizer = IndexFactory::CreateQuantizer("Fp32Quantizer");
+  ASSERT_NE(nullptr, quantizer);
+  ASSERT_EQ(0, quantizer->init(meta, Params()));
+  auto input =
+      std::make_shared<MultiPassIndexHolder<IndexMeta::DT_FP32>>(dimension_);
+  for (size_t i = 0; i < 20; ++i) {
+    NumericalVector<float> row(dimension_, 0.0f);
+    row[i % 2] = float(i + 1);
+    input->emplace(i, row);
+  }
+  Params params;
+  params.set(PARAM_IVF_BUILDER_CENTROID_COUNT, "1");
+  IVFBuilder builder;
+  ASSERT_EQ(0, builder.init(meta, params, quantizer));
+  ASSERT_EQ(0, builder.train(threads_, input));
+  auto index = builder.centroid_index();
+  ASSERT_EQ(1U, index->centroids_count());
+  auto context = index->create_context();
+  context->set_topk(1);
+  NumericalVector<float> query(dimension_, 0.0f);
+  query[0] = 1.0f;
+  IndexQueryMeta query_meta(IndexMeta::DT_FP32, dimension_);
+  ASSERT_EQ(0, index->search(query.data(), query_meta, 1, context));
+  ASSERT_EQ(1U, context->result().size());
+  EXPECT_NEAR(1.0f - std::sqrt(0.5f), context->result()[0].score(), 1e-5f);
+  ASSERT_EQ(0, builder.cleanup());
+}
+
+TEST_F(IVFBuilderTest, StableSourceSupportsTransformsAndRepeatedDumps) {
+  // Raw postings, centroid conversion, legacy posting conversion, and the
+  // automatic Cosine/IP centroid converters all retain the original data.
+  for (int mode : {0, 1, 2, 3, 4}) {
+    SCOPED_TRACE(mode);
+    auto input =
+        std::make_shared<MultiPassIndexHolder<IndexMeta::DT_FP32>>(dimension_);
+    // Primary keys deliberately differ from ordinal IDs and arrive unsorted.
+    for (size_t i = 0; i < 103; ++i) {
+      input->emplace(1000 + (103 - i) * 3,
+                     NumericalVector<float>(dimension_, float(i)));
+    }
+    holder_ = std::move(input);
+    auto expected = holder_;
+    auto meta = index_meta_;
+    Params params = params_;
+    params.set(PARAM_IVF_BUILDER_STORE_ORIGINAL_FEATURES, true);
+    if (mode == 1)
+      params.set(PARAM_IVF_BUILDER_CONVERTER_CLASS, "HalfFloatConverter");
+    if (mode == 2)
+      params.set(PARAM_IVF_BUILDER_QUANTIZER_CLASS, "HalfFloatConverter");
+    if (mode == 3) meta.set_metric("Cosine", 0, Params());
+    if (mode == 4) meta.set_metric("InnerProduct", 0, Params());
+    zvec::turbo::Quantizer::Pointer quantizer;
+    if (mode == 3) {
+      meta.set_quantizer("Fp32Quantizer", 0, Params());
+      quantizer = IndexFactory::CreateQuantizer("Fp32Quantizer");
+      ASSERT_NE(nullptr, quantizer);
+      ASSERT_EQ(0, quantizer->init(meta, Params()));
+    }
+    IVFBuilder builder;
+    ASSERT_EQ(0, builder.init(meta, params, quantizer));
+    ASSERT_EQ(0, builder.train(threads_, holder_));
+    auto source = std::make_shared<StableTestHolder>(holder_);
+    ASSERT_EQ(0, builder.build(threads_, source));
+    EXPECT_EQ(1u, source->retains);
+    EXPECT_EQ(1u, source->iterations);
+    std::weak_ptr<IndexHolder> backing = holder_;
+    source.reset();
+    holder_.reset();
+    for (size_t pass = 0; pass < 2; ++pass) {
+      const std::string path = "ivf_stable_source.index";
+      auto dumper = IndexFactory::CreateDumper("FileDumper");
+      ASSERT_EQ(0, dumper->create(path));
+      ASSERT_EQ(0, builder.dump(dumper));
+      ASSERT_EQ(0, dumper->close());
+      auto storage = IndexFactory::CreateStorage("MMapFileReadStorage");
+      ASSERT_EQ(0, storage->init(Params()));
+      ASSERT_EQ(0, storage->open(path, false));
+      auto streamer = IndexFactory::CreateStreamer("IVFStreamer");
+      ASSERT_EQ(0, streamer->init(meta, Params()));
+      ASSERT_EQ(0, streamer->open(storage));
+      auto provider = streamer->create_provider();
+      ASSERT_NE(nullptr, provider);
+      for (auto iter = expected->create_iterator(); iter->is_valid();
+           iter->next()) {
+        const void *actual = provider->get_vector(iter->key());
+        ASSERT_NE(nullptr, actual);
+        EXPECT_EQ(0,
+                  std::memcmp(actual, iter->data(), expected->element_size()));
+      }
+      provider.reset();
+      ASSERT_EQ(0, streamer->close());
+      ASSERT_EQ(0, storage->close());
+      File::RemovePath(path);
+    }
+    expected.reset();
+    EXPECT_FALSE(backing.expired());
+    ASSERT_EQ(0, builder.cleanup());
+    EXPECT_TRUE(backing.expired());
+  }
+}
+
+TEST_F(IVFBuilderTest, StableSourceValidatesLifetimeAndCounts) {
+  for (int mode : {0, 1, 2, 3, 4}) {
+    SCOPED_TRACE(mode);
+    prepare_index_holder(100, 103);
+    IVFBuilder builder;
+    ASSERT_EQ(0, builder.init(index_meta_, params_));
+    ASSERT_EQ(0, builder.train(threads_, holder_));
+    auto source = std::make_shared<StableTestHolder>(holder_);
+    int expected = IndexError_Mismatch;
+    if (mode == 0) {
+      source->retain_error = expected = IndexError_ReadData;
+    } else if (mode == 1) {
+      source->null_lifetime = true;
+      expected = IndexError_Runtime;
+    } else if (mode == 2 || mode == 3) {
+      source->reported_count = mode == 2 ? 104 : 102;
+    } else {
+      source->retain_error = IndexError_NotImplemented;
+      expected = 0;
+    }
+    EXPECT_EQ(expected, builder.build(threads_, source));
+    EXPECT_EQ(mode < 2 ? 0u : 1u, source->iterations);
+  }
+}
+
+TEST_F(IVFBuilderTest, StableSourcePreservesIteratorReadErrors) {
+  prepare_index_holder(100, 103);
+  for (auto operation :
+       {IteratorErrorOperation::kValidity, IteratorErrorOperation::kKey,
+        IteratorErrorOperation::kData}) {
+    IVFBuilder builder;
+    ASSERT_EQ(0, builder.init(index_meta_, params_));
+    ASSERT_EQ(0, builder.train(threads_, holder_));
+    auto failing = std::make_shared<IteratorErrorHolder>(holder_, 3, operation);
+    auto source = std::make_shared<StableTestHolder>(failing);
+    EXPECT_EQ(IndexError_ReadData, builder.build(threads_, source));
+    EXPECT_EQ(1u, source->retains);
+    EXPECT_EQ(1u, source->iterations);
   }
 }
 

@@ -10,7 +10,8 @@
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
-// limitations under the License.#pragma once
+// limitations under the License.
+#pragma once
 
 #include <pybind11/pybind11.h>
 #include <zvec/db/doc.h>
@@ -20,12 +21,23 @@ namespace py = pybind11;
 
 namespace zvec {
 
+py::tuple budgeted_doc_to_tuple(Doc &doc, const CollectionSchema &schema);
+py::object budgeted_doc_field_to_python(Doc &doc, const std::string &field,
+                                        DataType type);
+py::object budgeted_doc_pk(const Doc &doc);
+py::object budgeted_doc_field_names(const Doc &doc);
+py::bytes budgeted_doc_pickle_state(const Doc &doc);
+Doc::Ptr budgeted_doc_from_pickle_state(const py::bytes &state);
+
 class ZVecPyDoc {
  public:
   ZVecPyDoc() = delete;
 
  public:
   static void Initialize(py::module_ &m);
+
+  static bool set_field(Doc &doc, const std::string &field,
+                        const FieldSchema &schema, const py::object &value);
 
   // Materialize a single doc into (id, score, fields, vectors) following the
   // collection schema. Shared by the per-doc `get_all` binding and the batch

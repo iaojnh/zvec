@@ -55,11 +55,14 @@ class TokenizerFactory {
    *  \return        Tokenizer pipeline, or a detailed error status.
    */
   static Result<TokenizerPipelinePtr> create(const FtsIndexParams &params);
+  static Status validate(const FtsIndexParams &params);
 
  private:
   static Status create_tokenizer(const std::string &tokenizer_name,
                                  const ailego::JsonObject &extra_json,
                                  TokenizerPtr *tokenizer);
+  static Result<std::vector<TokenFilterPtr>> create_filters(
+      const FtsIndexParams &params, const ailego::JsonObject &extras);
   static TokenFilterPtr create_filter(const std::string &filter_name);
 };
 

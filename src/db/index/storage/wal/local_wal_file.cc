@@ -22,21 +22,15 @@
 #include "db/common/file_helper.h"
 #include "db/common/typedef.h"
 
-#define MAX_RECORD_SIZE 4194304  // 4Mb
-
 namespace zvec {
 
-int LocalWalFile::append(std::string &&data) {
+int LocalWalFile::append(std::string_view data) {
   CHECK_STATUS(read_only_, false);
-  WalRecord record;
-  record.length_ = data.size();
-  record.crc_ = ailego::Crc32c::Hash(
-      reinterpret_cast<const void *>(data.data()), record.length_, 0);
-  record.content_ = std::forward<std::string>(data);
-
-  if (write_record(record) < 0) {
-    WLOG_ERROR("Wal write record error. record.length_[%zu]",
-               (size_t)record.length_);
+  // Match the reader's limit before writing any part of an invalid record.
+  if (data.empty() || data.size() > kMaxRecordSize) return -1;
+  const uint32_t crc = ailego::Crc32c::Hash(data.data(), data.size(), 0);
+  if (write_record(data, crc) < 0) {
+    WLOG_ERROR("Wal write record error. record.length_[%zu]", data.size());
     return -1;
   }
   // if max_docs_wal_flush_ is 0, no need flush
@@ -50,15 +44,20 @@ int LocalWalFile::append(std::string &&data) {
   return 0;
 }
 
-std::string LocalWalFile::next() {
+std::string LocalWalFile::next(const ReadAdmission &admit) try {
+  read_status_ = Status::OK();
   WalRecord record;
-  if (read_record(record) > 0) {
+  const int ret = read_record(record, admit);
+  if (ret < 0) {
+    read_status_ = Status::InternalError("Failed to read WAL record");
+  } else if (ret > 0) {
     uint32_t tmp_crc = ailego::Crc32c::Hash(
         reinterpret_cast<const void *>(record.content_.data()), record.length_,
         0);
     if (tmp_crc == record.crc_) {
       return std::move(record.content_);
     } else {
+      read_status_ = Status::InternalError("WAL record checksum mismatch");
       WLOG_ERROR(
           "Wal next error. record.length_[%zu] crc_[%zu] != tmp_crc[%zu]",
           (size_t)record.length_, (size_t)record.crc_, (size_t)tmp_crc);
@@ -66,6 +65,10 @@ std::string LocalWalFile::next() {
   }
   // end of file or read error
   return std::string();
+} catch (const std::bad_alloc &) {
+  read_status_ = Status(StatusCode::RESOURCE_EXHAUSTED,
+                        "Insufficient memory for WAL record");
+  return {};
 }
 
 int LocalWalFile::open(const WalOptions &wal_option) {
@@ -107,11 +110,12 @@ int LocalWalFile::open(const WalOptions &wal_option) {
     }
 
     // Appends start at the end; prepare_for_read() rewinds readers.
-    file_.seek(0, ailego::File::Origin::End);
+    if (!file_.seek(0, ailego::File::Origin::End)) return -1;
   }
 
   max_docs_wal_flush_ = wal_option.max_docs_wal_flush;
   read_only_ = wal_option.read_only;
+  append_failed_ = false;
   opened_ = true;
 
   WLOG_INFO("Wal open success. create_new[%d]", wal_option.create_new);
@@ -153,7 +157,7 @@ int LocalWalFile::prepare_for_read() {
   if (!file_.seek(0, ailego::File::Origin::Begin)) {
     return -1;
   }
-  int read_size = file_.read((void *)&header_, sizeof(header_));
+  size_t read_size = file_.read((void *)&header_, sizeof(header_));
   if (read_size != sizeof(header_)) {
     WLOG_ERROR("Wal read header error.");
     return -1;
@@ -166,31 +170,34 @@ int LocalWalFile::prepare_for_read() {
 }
 
 //! Return 1 if success or -1 if write error
-int LocalWalFile::write_record(WalRecord &record) {
+int LocalWalFile::write_record(std::string_view data, uint32_t crc) {
   CHECK_STATUS(opened_, true);
+  const auto length = static_cast<uint32_t>(data.size());
 
   int write_size = 0;
   int ret = -1;
 
   std::lock_guard<std::mutex> lock(file_mutex_);
+  if (append_failed_) return -1;
+  const auto record_offset = file_.offset();
+  if (record_offset < static_cast<ssize_t>(sizeof(header_))) return -1;
   do {
-    write_size = file_.write((const void *)&record.length_, LENGTH_SIZE);
+    write_size = file_.write(&length, LENGTH_SIZE);
     if (write_size != LENGTH_SIZE) {
       WLOG_ERROR("Wal write error. record.length_ error write_size[%d]",
                  write_size);
       break;
     }
 
-    write_size = file_.write((const void *)&record.crc_, CRC_SIZE);
+    write_size = file_.write(&crc, CRC_SIZE);
     if (write_size != CRC_SIZE) {
       WLOG_ERROR("Wal write error. record.crc_ error write_size[%d]",
                  write_size);
       break;
     }
 
-    write_size =
-        file_.write((const void *)record.content_.data(), record.length_);
-    if (write_size != (int)record.length_) {
+    write_size = file_.write(data.data(), length);
+    if (write_size != static_cast<int>(length)) {
       WLOG_ERROR("Wal write error. record.content_ error write_size[%d]",
                  write_size);
       break;
@@ -199,50 +206,109 @@ int LocalWalFile::write_record(WalRecord &record) {
     docs_count_++;
   } while (false);
 
+  if (ret < 0 && (!file_.truncate(record_offset) ||
+                  !file_.seek(record_offset, ailego::File::Origin::Begin))) {
+    // Further successful records must not follow an unrepaired partial write.
+    append_failed_ = true;
+  }
   return ret;
 }
 
 //! Return 1 if success or 0 if eof or -1 if read error
-int LocalWalFile::read_record(WalRecord &record) {
+int LocalWalFile::read_record(WalRecord &record, const ReadAdmission &admit) {
   CHECK_STATUS(opened_, true);
 
-  int read_size = 0;
-  std::string err_msg;
+  const auto record_offset = file_.offset();
+  if (record_offset < static_cast<ssize_t>(sizeof(header_))) return -1;
+  size_t read_size = 0;
   int ret = -1;
+
+  // A crash can leave any prefix of the last record. Only a short read at
+  // the physical EOF is a recoverable tail; invalid lengths and bad CRCs
+  // in complete records must still be reported as corruption.
+  const auto repair_truncated_tail = [&] {
+    const auto offset = file_.offset();
+    if (offset < record_offset ||
+        static_cast<size_t>(offset) != file_.size())
+      return false;
+    // Recovery reopens this same WAL for append. Remove the incomplete tail
+    // before acknowledging EOF so future appends remain recoverable.
+    return read_only_ ||
+           (file_.truncate(record_offset) &&
+            file_.seek(record_offset, ailego::File::Origin::Begin));
+  };
 
   do {
     read_size =
         file_.read(reinterpret_cast<void *>(&record.length_), LENGTH_SIZE);
     if (read_size == 0) {
-      ret = 0;
-      WLOG_INFO("Wal read finished. end of file");
+      // File::read reports zero for both EOF and a failed system read.
+      // Unread bytes still in the file make this a replay error.
+      if (static_cast<size_t>(record_offset) == file_.size()) {
+        ret = 0;
+        WLOG_INFO("Wal read finished. end of file");
+      } else {
+        WLOG_ERROR("Wal record length read failed before end of file");
+      }
       break;
     }
 
     if (read_size != LENGTH_SIZE) {
-      WLOG_ERROR("Wal read error. record.length_ error read_size[%d]",
+      if (repair_truncated_tail()) {
+        ret = 0;
+        break;
+      }
+      WLOG_ERROR("Wal read error. record.length_ error read_size[%zu]",
                  read_size);
       break;
     }
 
     read_size = file_.read(reinterpret_cast<void *>(&record.crc_), CRC_SIZE);
     if (read_size != CRC_SIZE) {
-      WLOG_ERROR("Wal read error. record.crc_ error read_size[%d]", read_size);
+      if (repair_truncated_tail()) {
+        ret = 0;
+        break;
+      }
+      WLOG_ERROR("Wal read error. record.crc_ error read_size[%zu]", read_size);
       break;
     }
 
     // resize may crash if record.length_ very large
-    if (record.length_ <= 0 || record.length_ > MAX_RECORD_SIZE) {
-      WLOG_ERROR("Wal read error. record.length_ value error read_size[%d]",
+    if (record.length_ == 0) {
+      WLOG_ERROR("Wal read error. record.length_ value error read_size[%zu]",
                  read_size);
       break;
     }
 
-    record.content_.resize(record.length_);
+    // Check the physical extent before allocating a potentially large record.
+    // A torn final payload needs no allocation and must still be repaired at
+    // its record boundary before the file can be reopened for append.
+    const auto payload_offset = file_.offset();
+    const size_t file_size = file_.size();
+    if (payload_offset < 0 || static_cast<size_t>(payload_offset) > file_size)
+      break;
+    if (record.length_ > file_size - static_cast<size_t>(payload_offset)) {
+      if (file_.seek(0, ailego::File::Origin::End) && repair_truncated_tail())
+        ret = 0;
+      break;
+    }
+
+    try {
+      if (admit) admit(static_cast<size_t>(record.length_) + 1);
+      record.content_.resize(record.length_);
+    } catch (const std::bad_alloc &) {
+      // A retry must see the same record header rather than payload bytes.
+      if (!file_.seek(record_offset, ailego::File::Origin::Begin)) return -1;
+      throw;
+    }
     read_size = file_.read((void *)const_cast<char *>(record.content_.data()),
                            record.length_);
-    if (read_size != (int)record.length_) {
-      WLOG_ERROR("Wal read error. record.content_ error read_size[%d]",
+    if (read_size != record.length_) {
+      if (repair_truncated_tail()) {
+        ret = 0;
+        break;
+      }
+      WLOG_ERROR("Wal read error. record.content_ error read_size[%zu]",
                  read_size);
       break;
     }

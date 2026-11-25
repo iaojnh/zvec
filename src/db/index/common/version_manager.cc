@@ -14,15 +14,16 @@
 
 #include "version_manager.h"
 #include <cerrno>
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
-#include <regex>
 #include <sstream>
 #include <string>
+#include <ailego/pattern/scope_guard.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/pattern/expected.hpp>
 #include <zvec/ailego/utility/string_helper.h>
@@ -102,6 +103,7 @@ Status Version::Save(const std::string &path, const Version &version) {
   }
 
   ofs.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
+  ofs.close();
   if (!ofs.good()) {
     LOG_ERROR("Failed to serialize manifest to file: %s", path.c_str());
     return Status::InternalError("Failed to serialize manifest to file");
@@ -197,28 +199,28 @@ Result<VersionManager::Ptr> VersionManager::Recovery(const std::string &path) {
         Status::InvalidArgument("path", path, " is not a directory"));
   }
 
-  std::string prefix = GetFileName(FileID::MANIFEST_FILE);
-  std::string manifest_pattern = "^" + prefix + R"(\.(\d+)$)";
-  std::regex regex(manifest_pattern);
-  std::smatch match;
-
-  uint64_t max_id = UINT64_MAX;
+  const auto prefix = std::string(GetFileName(FileID::MANIFEST_FILE)) + ".";
+  uint64_t max_id = 0;
   std::string version_path;
 
   for (const auto &entry : fs::directory_iterator(u8path)) {
     if (entry.is_regular_file()) {
-      std::string filename = entry.path().filename().u8string();
-      if (std::regex_match(filename, match, regex)) {
-        uint64_t id = std::stoull(match[1].str());
-        if (id > max_id || max_id == UINT64_MAX) {
-          max_id = id;
-          version_path = entry.path().u8string();
-        }
+      const auto filename = entry.path().filename().u8string();
+      if (filename.compare(0, prefix.size(), prefix) != 0) continue;
+      uint64_t id = 0;
+      const auto end = filename.data() + filename.size();
+      const auto parsed =
+          std::from_chars(filename.data() + prefix.size(), end, id);
+      if (parsed.ec != std::errc{} || parsed.ptr != end || id == UINT64_MAX)
+        continue;
+      if (version_path.empty() || id > max_id) {
+        max_id = id;
+        version_path = entry.path().u8string();
       }
     }
   }
 
-  if (max_id == UINT64_MAX) {
+  if (version_path.empty()) {
     LOG_ERROR("Failed to find the version file in collction_path(%s)",
               path.c_str());
     return tl::make_unexpected(
@@ -276,20 +278,53 @@ Status VersionManager::remove_persisted_segment_meta(SegmentID id) {
 
 Status VersionManager::flush() {
   std::lock_guard lock(mtx_);
+  return flush_unlocked(current_version_);
+}
 
-  std::string current_path;
-  if (version_id_ != 0) {
-    current_path =
-        FileHelper::MakeFilePath(path_, FileID::MANIFEST_FILE, version_id_ - 1);
+Status VersionManager::publish(Version version) {
+  std::lock_guard lock(mtx_);
+  auto status = flush_unlocked(version);
+  if (status.ok()) current_version_ = std::move(version);
+  return status;
+}
+
+Status VersionManager::flush_writing_segment(
+    const SegmentMeta::Ptr &meta, uint32_t delete_snapshot_path_suffix) {
+  std::lock_guard lock(mtx_);
+  auto pending = current_version_;
+  pending.reset_writing_segment_meta(meta);
+  if (delete_snapshot_path_suffix != UINT32_MAX) {
+    pending.set_delete_snapshot_path_suffix(delete_snapshot_path_suffix);
   }
+  auto status = flush_unlocked(pending);
+  if (status.ok()) current_version_ = std::move(pending);
+  return status;
+}
 
-  auto s = Version::Save(
-      FileHelper::MakeFilePath(path_, FileID::MANIFEST_FILE, version_id_++),
-      current_version_);
+Status VersionManager::flush_unlocked(const Version &version) {
+  const auto next_path =
+      FileHelper::MakeFilePath(path_, FileID::MANIFEST_FILE, version_id_);
+  const auto current_path =
+      version_id_ == 0 ? std::string{}
+                       : FileHelper::MakeFilePath(path_, FileID::MANIFEST_FILE,
+                                                  version_id_ - 1);
+  const auto temporary_path = next_path + ".tmp";
+  bool published = false;
+  auto cleanup = ailego::ScopeGuard::Make([&] {
+    if (!published) FileHelper::RemoveFile(temporary_path);
+  });
+  auto s = Version::Save(temporary_path, version);
   CHECK_RETURN_STATUS(s);
+  if (!ailego::File::Rename(temporary_path, next_path)) {
+    return Status::InternalError("Failed to publish manifest: ", next_path);
+  }
+  published = true;
+  ++version_id_;
 
-  if (!current_path.empty()) {
-    FileHelper::RemoveFile(current_path);
+  try {
+    if (!current_path.empty()) FileHelper::RemoveFile(current_path);
+  } catch (...) {
+    LOG_WARN("Could not remove old manifest: %s", current_path.c_str());
   }
 
   return Status::OK();

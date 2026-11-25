@@ -79,7 +79,10 @@ class IvfRabitqIndexProvider : public IndexProvider {
   class Iterator : public IndexProvider::Iterator {
    public:
     explicit Iterator(const IvfRabitqEntity::Pointer &entity)
-        : entity_(entity) {}
+        : entity_(entity) {
+      if (id_ < entity_->total_vector_count())
+        status_ = entity_->read_key(id_, &key_);
+    }
 
     //! Retrieve pointer of data
     const void *data() const override {
@@ -88,22 +91,31 @@ class IvfRabitqIndexProvider : public IndexProvider {
 
     //! Test if the iterator is valid
     bool is_valid() const override {
-      return id_ < entity_->total_vector_count();
+      return status_ == 0 && id_ < entity_->total_vector_count();
     }
 
     //! Retrieve primary key
     uint64_t key() const override {
-      return entity_->get_key(id_);
+      return key_;
+    }
+
+    int status() const override {
+      return status_;
     }
 
     //! Next iterator
     void next() override {
+      if (!is_valid()) return;
       ++id_;
+      if (id_ < entity_->total_vector_count())
+        status_ = entity_->read_key(id_, &key_);
     }
 
    private:
     IvfRabitqEntity::Pointer entity_;
     size_t id_{0};
+    uint64_t key_{0};
+    int status_{0};
   };
 
  private:

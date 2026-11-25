@@ -14,7 +14,9 @@
 
 #include "jieba_tokenizer.h"
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <limits>
 #include <zvec/ailego/logger/logger.h>
 #include "jieba_embedded_dict.h"
 
@@ -63,69 +65,128 @@ static Status check_jieba_file(const std::string &path, bool allow_empty) {
   return Status::OK();
 }
 
+Result<JiebaTokenizer::Config> JiebaTokenizer::parse_config(
+    const ailego::JsonObject &config) {
+  Config result;
+  result.user_dict_path = get_string_or_default(config, "user_dict_path", "");
+  result.mode_name = get_string_or_default(config, "cut_mode", "search");
+  if (result.mode_name == "search") {
+    result.mode = CutMode::kSearch;
+  } else if (result.mode_name == "mix") {
+    result.mode = CutMode::kMix;
+  } else if (result.mode_name == "full") {
+    result.mode = CutMode::kFull;
+  } else if (result.mode_name == "hmm") {
+    result.mode = CutMode::kHmm;
+  } else {
+    return tl::make_unexpected(Status::InvalidArgument(
+        "JiebaTokenizer: unknown cut_mode '", result.mode_name, "'"));
+  }
+
+  const bool needs_dict = result.mode != CutMode::kHmm;
+  const bool needs_model = result.mode != CutMode::kFull;
+  result.dict_dir = resolve_jieba_dict_dir(config);
+  if (needs_dict) result.dict_path = result.dict_dir + "/jieba.dict.utf8";
+  if (needs_model) result.model_path = result.dict_dir + "/hmm_model.utf8";
+
+  if (!result.dict_dir.empty()) {
+    for (const auto &path : {result.dict_path, result.model_path}) {
+      if (path.empty()) continue;
+      auto status = check_jieba_file(path, false);
+      if (!status.ok()) return tl::make_unexpected(std::move(status));
+    }
+  }
+  if (needs_dict && !result.user_dict_path.empty()) {
+    for (const auto &path : limonp::Split(result.user_dict_path, "|;")) {
+      auto status = check_jieba_file(path, true);
+      if (!status.ok()) return tl::make_unexpected(std::move(status));
+    }
+  }
+  return result;
+}
+
+Status JiebaTokenizer::validate_config(const ailego::JsonObject &config) {
+  auto parsed = parse_config(config);
+  return parsed ? Status::OK() : std::move(parsed.error());
+}
+
 Status JiebaTokenizer::init(const ailego::JsonObject &config) {
   reset();
-
-  std::string user_dict_path =
-      get_string_or_default(config, "user_dict_path", "");
-
-  std::string mode_str = get_string_or_default(config, "cut_mode", "search");
-  if (mode_str == "search") {
-    cut_mode_ = CutMode::kSearch;
-  } else if (mode_str == "mix") {
-    cut_mode_ = CutMode::kMix;
-  } else if (mode_str == "full") {
-    cut_mode_ = CutMode::kFull;
-  } else if (mode_str == "hmm") {
-    cut_mode_ = CutMode::kHmm;
-  } else {
-    return Status::InvalidArgument("JiebaTokenizer: unknown cut_mode '",
-                                   mode_str, "'");
-  }
-
-  bool needs_dict = cut_mode_ != CutMode::kHmm;
-  bool needs_model = cut_mode_ != CutMode::kFull;
-
-  std::string dict_dir = resolve_jieba_dict_dir(config);
-
-  std::string dict_path = needs_dict ? dict_dir + "/jieba.dict.utf8" : "";
-  std::string model_path = needs_model ? dict_dir + "/hmm_model.utf8" : "";
-
-  if (!dict_dir.empty()) {
-    if (needs_dict) {
-      auto status = check_jieba_file(dict_path, false);
-      if (!status.ok()) {
-        return status;
-      }
-    }
-    if (needs_model) {
-      auto status = check_jieba_file(model_path, false);
-      if (!status.ok()) {
-        return status;
-      }
-    }
-  }
-  if (needs_dict && !user_dict_path.empty()) {
-    for (const auto &path : limonp::Split(user_dict_path, "|;")) {
-      auto status = check_jieba_file(path, true);
-      if (!status.ok()) {
-        return status;
-      }
-    }
-  }
+  auto parsed = parse_config(config);
+  if (!parsed) return std::move(parsed.error());
+  const auto &options = *parsed;
+  cut_mode_ = options.mode;
+  const bool needs_dict = cut_mode_ != CutMode::kHmm;
+  const bool needs_model = cut_mode_ != CutMode::kFull;
+  const auto &dict_dir = options.dict_dir;
+  const auto &dict_path = options.dict_path;
+  const auto &model_path = options.model_path;
+  const auto &user_dict_path = options.user_dict_path;
+  const auto &mode_str = options.mode_name;
 
   try {
+    // Dictionaries scale with configuration, not collection row count. Keep
+    // a planning allowance for expanded trie/hash nodes and loader scratch;
+    // do not pretend that third-party STL allocations are exact pool bytes.
+    dictionary_memory_.add(8 * 1024 * 1024);
+    auto reserve_file = [this](const std::string &path) {
+      std::error_code error;
+      const auto bytes =
+          std::filesystem::file_size(std::filesystem::u8path(path), error);
+      if (error || bytes > std::numeric_limits<size_t>::max() / 16) {
+        return Status::InvalidArgument("Cannot size Jieba dictionary: ", path);
+      }
+      dictionary_memory_.add_array(static_cast<size_t>(bytes), 16);
+      return Status::OK();
+    };
+    if (dict_dir.empty()) {
+      // Shared defaults retain their own allowance after this tokenizer dies.
+      // Only trie construction/backing is per instance; the HMM is shared.
+      if (needs_dict)
+        dictionary_memory_.add_array(embedded_jieba_dict_bytes(),
+                                     kEmbeddedJiebaDictionaryMultiplier);
+    } else {
+      for (const auto &path : {dict_path, model_path}) {
+        if (path.empty()) continue;
+        const auto status = reserve_file(path);
+        if (!status.ok()) {
+          reset();
+          return status;
+        }
+      }
+    }
+    if (needs_dict && !user_dict_path.empty()) {
+      for (const auto &path : limonp::Split(user_dict_path, "|;")) {
+        const auto status = reserve_file(path);
+        if (!status.ok()) {
+          reset();
+          return status;
+        }
+      }
+    }
     if (needs_dict) {
       if (dict_dir.empty()) {
         auto dict = get_embedded_jieba_dict();
         if (!dict) {
+          reset();
           return dict.error();
         }
         dict_trie_ =
             std::make_unique<cppjieba::DictTrie>(**dict, user_dict_path);
       } else {
+        // The path constructor retains every dictionary in a process-wide
+        // cache. Load through the stream API instead so the final tokenizer
+        // releases external entries together with their instance allowance.
+        std::ifstream stream;
+        cppjieba::OpenInputFile(stream, dict_path);
+        if (!stream.is_open()) {
+          reset();
+          return Status::InvalidArgument("Cannot read Jieba dictionary: ",
+                                         dict_path);
+        }
+        auto entries = cppjieba::DictTrie::LoadDict(stream);
         dict_trie_ =
-            std::make_unique<cppjieba::DictTrie>(dict_path, user_dict_path);
+            std::make_unique<cppjieba::DictTrie>(entries, user_dict_path);
       }
     }
     if (needs_model) {
@@ -156,6 +217,10 @@ Status JiebaTokenizer::init(const ailego::JsonObject &config) {
         hmm_seg_ = std::make_unique<cppjieba::HMMSegment>(hmm_model_.get());
         break;
     }
+  } catch (const std::bad_alloc &) {
+    reset();
+    return Status(StatusCode::RESOURCE_EXHAUSTED,
+                  "Insufficient Jieba dictionary budget");
   } catch (const std::exception &e) {
     LOG_ERROR("JiebaTokenizer init failed: %s", e.what());
     reset();
@@ -170,6 +235,25 @@ Status JiebaTokenizer::init(const ailego::JsonObject &config) {
 
 JiebaTokenizer::~JiebaTokenizer() = default;
 
+JiebaTokenizer::JiebaTokenizer(JiebaTokenizer &&other) noexcept {
+  *this = std::move(other);
+}
+
+JiebaTokenizer &JiebaTokenizer::operator=(JiebaTokenizer &&other) noexcept {
+  if (this == &other) return *this;
+  reset();  // Free old dictionaries before releasing their allowance.
+  dictionary_memory_ = std::move(other.dictionary_memory_);
+  dict_trie_ = std::move(other.dict_trie_);
+  hmm_model_ = std::move(other.hmm_model_);
+  query_seg_ = std::move(other.query_seg_);
+  mix_seg_ = std::move(other.mix_seg_);
+  full_seg_ = std::move(other.full_seg_);
+  hmm_seg_ = std::move(other.hmm_seg_);
+  cut_mode_ = other.cut_mode_;
+  initialized_ = std::exchange(other.initialized_, false);
+  return *this;
+}
+
 void JiebaTokenizer::reset() {
   query_seg_.reset();
   mix_seg_.reset();
@@ -177,6 +261,7 @@ void JiebaTokenizer::reset() {
   hmm_seg_.reset();
   dict_trie_.reset();
   hmm_model_.reset();
+  dictionary_memory_.retain_at_most(0);
   initialized_ = false;
 }
 

@@ -74,6 +74,47 @@ TEST_F(SqlEngineTest, Forward) {
   EXPECT_TRUE(ret.has_value());
 }
 
+TEST_F(SqlEngineTest, ForwardPropagatesFilterReadFailure) {
+  class FailingFilter : public CheckedIndexFilter {
+   public:
+    explicit FailingFilter(StatusCode code) : code_(code) {}
+
+    Result<bool> is_filtered_checked(uint64_t id) const override {
+      if (id == 0) return false;
+      return tl::make_unexpected(Status(code_, "Cannot read document ID range"));
+    }
+
+   private:
+    StatusCode code_;
+  };
+
+  class FilteredSegment : public MockSegment {
+   public:
+    explicit FilteredSegment(StatusCode code)
+        : filter_(std::make_shared<FailingFilter>(code)) {}
+
+    const IndexFilter::Ptr get_filter() override {
+      return filter_;
+    }
+
+   private:
+    IndexFilter::Ptr filter_;
+  };
+
+  SearchQuery query;
+  query.output_fields_ = {"id"};
+  query.topk_ = 2;
+  auto engine = SQLEngine::create(std::make_shared<Profiler>());
+  for (auto code : {StatusCode::RESOURCE_EXHAUSTED, StatusCode::INTERNAL_ERROR}) {
+    auto result = engine->execute(schema_, query,
+                                  {std::make_shared<FilteredSegment>(code)});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), code);
+    EXPECT_NE(result.error().message().find("Cannot read document ID range"),
+              std::string::npos);
+  }
+}
+
 TEST_F(SqlEngineTest, Vector) {
   std::vector<Segment::Ptr> segments = {std::make_shared<MockSegment>()};
   SearchQuery query;

@@ -13,29 +13,136 @@
 // limitations under the License.
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <zvec/ailego/parallel/thread_pool.h>
 #include <zvec/ailego/pattern/singleton.h>
 
+namespace arrow::internal {
+class ThreadPool;
+}
+
 namespace zvec {
+
+class GlobalConfig;
+
+namespace detail {
+constexpr uint32_t kRocksDbMemoryPercent = 15;
+}
+
+}  // namespace zvec
+
+namespace rocksdb {
+class Cache;
+class WriteBufferManager;
+}  // namespace rocksdb
+
+namespace zvec {
+
+class GlobalConfig;
 
 class GlobalResource : public ailego::Singleton<GlobalResource> {
  public:
-  void initialize();
+  static uint64_t calculate_rocksdb_memory_budget(
+      uint64_t total_bytes) noexcept;
+  static uint64_t calculate_buffer_pool_memory_budget(
+      uint64_t total_bytes) noexcept;
+  static uint64_t calculate_rocksdb_write_buffer_budget(
+      uint64_t rocksdb_bytes) noexcept;
+  static int calculate_rocksdb_cache_shard_bits(
+      uint64_t rocksdb_bytes) noexcept;
+
+  int initialize();
+
+  bool initialized() const {
+    return initialized_.load(std::memory_order_acquire);
+  }
 
   ailego::ThreadPool *query_thread_pool() {
-    initialize();
+    if (initialize() != 0) {
+      return nullptr;
+    }
     return query_thread_pool_.get();
   }
 
   ailego::ThreadPool *optimize_thread_pool() {
-    initialize();
+    if (initialize() != 0) {
+      return nullptr;
+    }
     return optimize_thread_pool_.get();
   }
 
+  // Managed Acero plans use a separately budgeted executor instead of the
+  // host application's process-global Arrow pool.
+  arrow::internal::ThreadPool *arrow_query_thread_pool() {
+    if (initialize() != 0) return nullptr;
+    return arrow_query_thread_pool_.get();
+  }
+
+  arrow::internal::ThreadPool *arrow_io_thread_pool() {
+    if (initialize() != 0) return nullptr;
+    return arrow_io_thread_pool_.get();
+  }
+
+  std::shared_ptr<rocksdb::Cache> rocksdb_block_cache() {
+    if (initialize() != 0) {
+      return nullptr;
+    }
+    return rocksdb_block_cache_;
+  }
+
+  std::shared_ptr<rocksdb::WriteBufferManager> rocksdb_write_buffer_manager() {
+    if (initialize() != 0) {
+      return nullptr;
+    }
+    return rocksdb_write_buffer_manager_;
+  }
+
+  uint64_t rocksdb_memory_capacity() {
+    if (initialize() != 0) {
+      return 0;
+    }
+    return rocksdb_memory_capacity_;
+  }
+
  private:
+  friend class GlobalConfig;
+
+  // Explicit init publishes the prepared resources with its config snapshot.
+  int prepare(uint64_t memory_limit_bytes, uint32_t query_thread_count,
+              bool query_thread_binding, uint32_t optimize_thread_count,
+              bool optimize_thread_binding);
+  int initialize_locked(uint64_t memory_limit_bytes,
+                        uint32_t query_thread_count, bool query_thread_binding,
+                        uint32_t optimize_thread_count,
+                        bool optimize_thread_binding,
+                        bool preserve_existing_pool);
+  void log_initialized() const noexcept;
+  void reserve_native_memory(uint32_t query_workers, uint32_t optimize_workers);
+  int configure_memory_policy(uint64_t memory_limit_bytes);
+
+  std::atomic<bool> initialized_{false};
+  std::mutex initialization_mutex_;
+  // Protected by initialization_mutex_. Once DB-owned pool setup starts,
+  // failure is terminal: its partial state must not become a standalone pool.
+  bool initialization_failed_{false};
+  // A standalone pool can supply capacity before lazy DB workers are created.
+  // Explicit startup must still install the native/RSS policy before success.
+  bool memory_policy_ready_{false};
+  uint64_t memory_limit_bytes_{0};
+  uint32_t query_thread_count_{0};
+  uint32_t optimize_thread_count_{0};
+  bool query_thread_binding_{false};
+  bool optimize_thread_binding_{false};
+  uint64_t rocksdb_memory_capacity_{0};
   std::unique_ptr<ailego::ThreadPool> query_thread_pool_;
   std::unique_ptr<ailego::ThreadPool> optimize_thread_pool_;
+  std::shared_ptr<rocksdb::Cache> rocksdb_block_cache_;
+  std::shared_ptr<rocksdb::WriteBufferManager> rocksdb_write_buffer_manager_;
+  std::shared_ptr<arrow::internal::ThreadPool> arrow_query_thread_pool_;
+  std::shared_ptr<arrow::internal::ThreadPool> arrow_io_thread_pool_;
 };
 
 }  // namespace zvec

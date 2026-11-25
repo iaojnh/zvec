@@ -13,6 +13,11 @@
 // limitations under the License.
 
 #include "concurrent_roaring_bitmap.h"
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <ailego/pattern/scope_guard.h>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
 #include <zvec/ailego/hash/crc32c.h>
 
 
@@ -35,10 +40,10 @@ Status ConcurrentRoaringBitmap32::serialize(std::string *out) {
 
 Status ConcurrentRoaringBitmap32::deserialize(const std::string &in) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
-  roaring_bitmap_free(bitmap_);
-  bitmap_ = nullptr;
-  bitmap_ = roaring_bitmap_portable_deserialize_safe(in.data(), in.size());
-  if (bitmap_) {
+  auto *loaded = roaring_bitmap_portable_deserialize_safe(in.data(), in.size());
+  if (loaded) {
+    roaring_bitmap_free(bitmap_);
+    bitmap_ = loaded;
     return Status::OK();
   } else {
     LOG_ERROR("Failed to deserialize bitmap");
@@ -48,7 +53,7 @@ Status ConcurrentRoaringBitmap32::deserialize(const std::string &in) {
 
 
 Status ConcurrentRoaringBitmap64::serialize(const std::string &file_path,
-                                            bool overwrite) {
+                                            bool overwrite) try {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   FILE file;
   const std::string file_str = "[" + file_path + "]";
@@ -64,22 +69,12 @@ Status ConcurrentRoaringBitmap64::serialize(const std::string &file_path,
       LOG_ERROR("%s", msg.c_str());
       return Status::AlreadyExists(msg);
     }
-    if (!FILE::RemovePath(file_path)) {
-      auto msg = debug_str("failed to remove ", file_str);
-      LOG_ERROR("%s", msg.c_str());
-      return Status::InternalError(msg);
-    }
-  }
-  if (!file.create(file_path.c_str(), 0)) {
-    auto msg = debug_str("failed to create ", file_str);
-    LOG_ERROR("%s", msg.c_str());
-    return Status::InternalError(msg);
   }
 
   // Serialize bitmap to buffer
-  BitmapMetaHeader header;
+  BitmapMetaHeader header{};
   size_t bitmap_size;
-  std::vector<char> bitmap_buffer;
+  std::vector<char, ailego::BudgetedAllocator<char>> bitmap_buffer;
   if (is_32bit_) {
     bitmap_size = bitmap32_->getSizeInBytes();
     bitmap_buffer.resize(bitmap_size);
@@ -103,6 +98,35 @@ Status ConcurrentRoaringBitmap64::serialize(const std::string &file_path,
   header.checksum = ailego::Crc32c::Hash(bitmap_buffer.data(), bitmap_size);
   header.timestamp = time(nullptr);
 
+  // Create an owned sibling directory exclusively; never truncate an existing
+  // bitmap (or a stale temporary file) before a successful replacement.
+  static std::atomic<uint64_t> sequence{0};
+  std::filesystem::path temporary_directory;
+  bool created = false;
+  for (int attempt = 0; attempt < 16 && !created; ++attempt) {
+    temporary_directory = std::filesystem::u8path(
+        file_path + ".tmp." +
+        std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()) +
+        "." + std::to_string(sequence.fetch_add(1)));
+    std::error_code error;
+    created = std::filesystem::create_directory(temporary_directory, error);
+    if (error)
+      return Status::InternalError("Cannot create bitmap temporary directory: ",
+                                   error.message());
+  }
+  if (!created)
+    return Status::InternalError("Cannot create bitmap temporary directory");
+  const auto temporary_file = temporary_directory / "bitmap";
+  auto cleanup = ailego::ScopeGuard::Make([&] {
+    file.close();
+    std::error_code ignored;
+    std::filesystem::remove(temporary_file, ignored);
+    std::filesystem::remove(temporary_directory, ignored);
+  });
+  if (!file.create(temporary_file.u8string(), 0))
+    return Status::InternalError("Cannot create bitmap temporary file");
+
   // Write meta header to file
   if (file.write(&header, sizeof(header)) != sizeof(header)) {
     auto msg = debug_str("failed to serialize header to ", file_str);
@@ -117,14 +141,24 @@ Status ConcurrentRoaringBitmap64::serialize(const std::string &file_path,
     return Status::InternalError(msg);
   };
 
+  if (!file.flush())
+    return Status::InternalError("Cannot flush bitmap temporary file");
+  file.close();
+  if (!FILE::Rename(temporary_file.u8string(), file_path))
+    return Status::InternalError("Cannot replace bitmap file");
+
   LOG_DEBUG("%s: serialized bitmap to file[%s], checksum[%u], timestamp[%zu]",
             identifier_.c_str(), file_path.c_str(), header.checksum,
             (size_t)header.timestamp);
   return Status::OK();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Insufficient bitmap serialization budget");
 }
 
 
-Status ConcurrentRoaringBitmap64::deserialize(const std::string &file_path) {
+Status ConcurrentRoaringBitmap64::deserialize(
+    const std::string &file_path) try {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   FILE file;
   const std::string file_str = "[" + file_path + "]";
@@ -146,7 +180,7 @@ Status ConcurrentRoaringBitmap64::deserialize(const std::string &file_path) {
   }
 
   // Deserialize and verify the meta header
-  BitmapMetaHeader header;
+  BitmapMetaHeader header{};
   if (file.size() < sizeof(BitmapMetaHeader)) {
     auto msg =
         debug_str(file_str, " is too small to to contain a valid bitmap");
@@ -168,11 +202,10 @@ Status ConcurrentRoaringBitmap64::deserialize(const std::string &file_path) {
     LOG_ERROR("%s", msg.c_str());
     return Status::InternalError(msg);
   }
-  is_32bit_ = header.is_32bit == 1 ? true : false;
 
   // Read from file to buffer
   size_t bitmap_size = file.size() - sizeof(BitmapMetaHeader);
-  std::vector<char> bitmap_buffer(bitmap_size);
+  std::vector<char, ailego::BudgetedAllocator<char>> bitmap_buffer(bitmap_size);
   if (file.read(bitmap_buffer.data(), bitmap_size) != bitmap_size) {
     auto msg = debug_str("failed to read bitmap data from ", file_str);
     LOG_ERROR("%s", msg.c_str());
@@ -185,26 +218,61 @@ Status ConcurrentRoaringBitmap64::deserialize(const std::string &file_path) {
     return Status::InternalError(msg);
   }
 
-  // Deserialize from buffer
-  try {
-    if (is_32bit_) {
-      bitmap32_ = std::make_unique<roaring::Roaring>(
-          roaring::Roaring::readSafe(bitmap_buffer.data(), bitmap_size));
-    } else {
-      bitmap64_ = std::make_unique<roaring::Roaring64Map>(
-          roaring::Roaring64Map::readSafe(bitmap_buffer.data(), bitmap_size));
-    }
-  } catch (...) {
-    auto msg = debug_str("failed to deserialize bitmap from ", file_str);
-    LOG_ERROR("%s", msg.c_str());
-    return Status::InternalError(msg);
+  // Check container counts before calling readSafe, which may allocate its
+  // container table before detecting a truncated payload.
+  size_t offset = 0;
+  uint64_t count = 1;
+  if (!header.is_32bit) {
+    if (bitmap_size < sizeof(count))
+      return Status::InternalError("Truncated bitmap");
+    std::memcpy(&count, bitmap_buffer.data(), sizeof(count));
+    offset = sizeof(count);
+    if (count > (bitmap_size - offset) / 12)
+      return Status::InternalError("Invalid bitmap map size");
   }
+  for (uint64_t i = 0; i < count; ++i) {
+    if (!header.is_32bit) offset += sizeof(uint32_t);
+    if (offset >= bitmap_size) return Status::InternalError("Truncated bitmap");
+    const size_t bytes = roaring_bitmap_portable_deserialize_size(
+        bitmap_buffer.data() + offset, bitmap_size - offset);
+    if (!bytes) return Status::InternalError("Invalid bitmap payload");
+    offset += bytes;
+  }
+  if (offset != bitmap_size)
+    return Status::InternalError("Invalid bitmap length");
+  ailego::MemoryReservation memory;
+  memory.add(memory_allowance(bitmap_size));
+  try {
+    if (header.is_32bit) {
+      auto loaded = std::make_unique<roaring::Roaring>(
+          roaring::Roaring::readSafe(bitmap_buffer.data(), bitmap_size));
+      bitmap32_ = std::move(loaded);
+      bitmap64_.reset();
+    } else {
+      auto loaded = std::make_unique<roaring::Roaring64Map>(
+          roaring::Roaring64Map::readSafe(bitmap_buffer.data(), bitmap_size));
+      bitmap64_ = std::move(loaded);
+      bitmap32_.reset();
+    }
+  } catch (const std::bad_alloc &) {
+    throw;
+  } catch (...) {
+    return Status::InternalError("Failed to deserialize bitmap from ",
+                                 file_path);
+  }
+  is_32bit_ = header.is_32bit != 0;
+  if (is_32bit_ ? bitmap32_->isEmpty() : bitmap64_->isEmpty())
+    memory.retain_at_most(0);
+  memory_ = std::move(memory);
 
   LOG_DEBUG(
       "%s: deserialized bitmap from file[%s], checksum[%u], timestamp[%zu]",
       identifier_.c_str(), file_path.c_str(), header.checksum,
       (size_t)header.timestamp);
   return Status::OK();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Insufficient bitmap load budget");
 }
 
 

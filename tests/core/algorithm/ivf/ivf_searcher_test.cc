@@ -2496,6 +2496,8 @@ TEST_F(IVFSearcherTest, TestColumnMajorFloatWithFloat16Quantizer) {
   }
 
   auto context = searcher.create_context();
+  auto *ivf_context = dynamic_cast<IVFSearcherContext *>(context.get());
+  ASSERT_NE(nullptr, ivf_context);
   IndexQueryMeta qmeta(IndexMeta::DataType::DT_FP32, dimension_);
 
   // single bf serch
@@ -2522,6 +2524,9 @@ TEST_F(IVFSearcherTest, TestColumnMajorFloatWithFloat16Quantizer) {
     context->set_topk(topk);
     ret = searcher.search_bf_impl(query1.data(), qmeta, qnum, context);
     EXPECT_EQ(0, ret);
+    EXPECT_GT(ivf_context->entity()->query_workspace_bytes(), 0u);
+    EXPECT_LE(ivf_context->entity()->query_workspace_bytes(),
+              32u * qmeta.element_size() + 64);
 
     for (size_t q = 0; q < qnum; ++q) {
       const IndexDocumentList &result = context->result(q);
@@ -2554,6 +2559,9 @@ TEST_F(IVFSearcherTest, TestColumnMajorFloatWithFloat16Quantizer) {
     context->set_topk(topk);
     ret = searcher.search_impl(query1.data(), qmeta, qnum, context);
     EXPECT_EQ(0, ret);
+    EXPECT_GT(ivf_context->entity()->query_workspace_bytes(), 0u);
+    EXPECT_LE(ivf_context->entity()->query_workspace_bytes(),
+              32u * qmeta.element_size() + 64);
 
     for (size_t q = 0; q < qnum; ++q) {
       const IndexDocumentList &result = context->result(q);
@@ -2712,7 +2720,7 @@ TEST_F(IVFSearcherTest, KeyedBruteForceWithEmptyQuantizedCentroids) {
         meta.set_metric("InnerProduct", 0, Params());
         meta.set_major_order(order);
         IndexCluster::CentroidList centroid_list;
-        std::vector<IndexConverter::Pointer> quantizers;
+        zvec::ailego::BudgetedVector<IndexConverter::Pointer> quantizers;
         for (float value : centroids) {
           NumericalVector<float> centroid(dimension_);
           for (size_t d = 0; d < dimension_; ++d) {
@@ -2747,6 +2755,8 @@ TEST_F(IVFSearcherTest, KeyedBruteForceWithEmptyQuantizedCentroids) {
         auto posting_meta = quantizers.front()->meta();
         posting_meta.set_major_order(order);
         IVFDumper postings(posting_meta, dumper, centroids.size());
+        // Every layout has two populated lists with ten vectors each.
+        ASSERT_EQ(0, postings.reserve_keys(20));
         for (size_t i = 0; i < centroids.size(); ++i) {
           // Write only two lists, leaving leading, interior and trailing gaps.
           if (centroids[i] == 0.0f) {
@@ -3227,7 +3237,7 @@ TEST_F(IVFSearcherTest, TestProvider) {
 }
 
 TEST_F(IVFSearcherTest, ProviderReleasesStorageBeforeThreadExit) {
-  auto &memory_pool = ::zvec::ailego::PoolPayloadBudget::get_instance();
+  auto &memory_pool = PoolPayloadBudget::get_instance();
   const size_t previous_capacity = memory_pool.capacity();
   ASSERT_EQ(0u, memory_pool.used());
   ASSERT_EQ(0, memory_pool.init(8 * 1024 * 1024));
@@ -4595,6 +4605,7 @@ TEST_P(IVFTurboTest, ManyDistanceAcrossStoragePages) {
     auto dumper = IndexFactory::CreateDumper("FileDumper");
     ASSERT_EQ(0, dumper->create(path_ + ".format"));
     IVFDumper postings(posting_meta, dumper, 1, 32);
+    ASSERT_EQ(0, postings.reserve_keys(count));
     for (size_t i = 0; i < count; ++i) {
       ASSERT_EQ(0, postings.dump_inverted_vector(
                        0, Key(i), codes_[i % codes_.size()].data()));
@@ -4609,7 +4620,7 @@ TEST_P(IVFTurboTest, ManyDistanceAcrossStoragePages) {
     IVFEntity entity;
     ASSERT_EQ(0, entity.load(storage));
     std::vector<turbo::DistanceImpl> queries;
-    std::vector<IndexDocumentHeap> expected, actual;
+    std::vector<IndexCandidateHeap> expected, actual;
     std::vector<IndexContext::Stats> stats(3);
     for (size_t q = 0; q < 3; ++q) {
       const void *query = queries_.data() + q * kDimension;
@@ -4635,7 +4646,7 @@ TEST_P(IVFTurboTest, ManyDistanceAcrossStoragePages) {
     auto kernel = entity.many_distance();
     ASSERT_TRUE(kernel);
     std::vector<const turbo::DistanceImpl *> handles;
-    std::vector<IndexDocumentHeap *> heaps;
+    std::vector<IndexCandidateHeap *> heaps;
     std::vector<IndexContext::Stats *> counters;
     for (size_t q = 0; q < 3; ++q) {
       handles.push_back(&queries[q]);
@@ -4690,6 +4701,7 @@ TEST_P(IVFTurboTest, PostingFormatDetection) {
     ASSERT_EQ(0, dumper->create(path_ + ".format"));
     // Reproduce the earlier Turbo format without the new metadata attribute.
     IVFDumper postings(posting_meta, dumper, 1, 8);
+    ASSERT_EQ(0, postings.reserve_keys(codes_.size()));
     for (size_t i = 0; i < codes_.size(); ++i) {
       ASSERT_EQ(0, postings.dump_inverted_vector(0, Key(i), codes_[i].data()));
     }

@@ -13,6 +13,7 @@
 // limitations under the License.
 #pragma once
 
+#include <atomic>
 #include <zvec/ailego/internal/platform.h>
 #include "hnsw_sparse_entity.h"
 
@@ -43,26 +44,11 @@ class HnswSparseBuilderEntity : public HnswSparseEntity {
       std::vector<IndexStorage::MemoryBlock> &block_vecs) const override;
 
   //! Get the node id's neighbors on graph level
-  const NeighborsHeader *get_neighbor_header(level_t level,
-                                             node_id_t id) const {
-    if (level == 0) {
-      return reinterpret_cast<const NeighborsHeader *>(
-          neighbors_buffer_.data() + neighbors_size_ * id);
-    } else {
-      size_t offset = neighbors_index_[id].offset;
-      return reinterpret_cast<const NeighborsHeader *>(
-          upper_neighbors_buffer_.data() + offset +
-          (level - 1) * upper_neighbors_size_);
-    }
-  }
-
-  //! Get the node id's neighbors on graph level
   const Neighbors get_neighbors(level_t level, node_id_t id) const override;
 
   //! Replace node id in level's neighbors
-  int update_neighbors(
-      level_t level, node_id_t id,
-      const std::vector<std::pair<node_id_t, dist_t>> &neighbors) override;
+  int update_neighbors(level_t level, node_id_t id,
+                       const TopkHeap::Container &neighbors) override;
 
   //! add a neighbor to id in graph level
   void add_neighbor(level_t level, node_id_t id, uint32_t size,
@@ -96,10 +82,18 @@ class HnswSparseBuilderEntity : public HnswSparseEntity {
  public:
   //! Constructor
   HnswSparseBuilderEntity();
+  ~HnswSparseBuilderEntity() override;
 
   //! Get the node graph level by id
-  level_t get_level(node_id_t id) const {
-    return neighbors_index_[id].level;
+  level_t get_level(node_id_t id) const;
+
+  // Some graph interfaces return values rather than error codes. Keep their
+  // first I/O error so build/dump cannot report success with incomplete data.
+  int status() const {
+    return error_.load();
+  }
+  bool buffered() const {
+    return paged_ != nullptr;
   }
 
   //! Init builerEntity
@@ -134,10 +128,20 @@ class HnswSparseBuilderEntity : public HnswSparseEntity {
 
   //! class internal used only
   struct SparseNeighborIndex {
+    SparseNeighborIndex() : offset(0), level(0) {}
     SparseNeighborIndex(size_t off, level_t l) : offset(off), level(l) {}
     uint64_t offset : 48;
     uint64_t level : 16;
   };
+
+  struct PagedState;
+  std::unique_ptr<PagedState> paged_;
+  mutable std::atomic<int> error_{0};
+  int record_error(int ret) const;
+  SparseNeighborIndex neighbor_index(node_id_t id) const;
+  int neighbor_block(level_t level, node_id_t id,
+                     IndexStorage::MemoryBlock &block) const;
+  int write_neighbors(level_t level, node_id_t id, const void *data);
 
   std::string vectors_buffer_{};          // aligned vectors
   std::string keys_buffer_{};             // aligned vectors

@@ -26,6 +26,8 @@ class TokenizerPipeline;
 
 namespace detail {
 
+Status ValidateFtsConfiguration(const FtsIndexParams &params);
+
 // Internal entry to lazily acquire (and cache, per FtsIndexParams instance)
 // the tokenizer pipeline.  Thread-safe; same params instance returns the
 // same shared_ptr on subsequent calls; the manager-side reference is

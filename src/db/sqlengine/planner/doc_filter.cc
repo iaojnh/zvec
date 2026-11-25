@@ -16,7 +16,11 @@
 #include <optional>
 #include <arrow/acero/exec_plan.h>
 #include <arrow/table.h>
+#include <arrow/util/thread_pool.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/logger/logger.h>
+#include "db/common/global_resource.h"
+#include "db/index/storage/parquet_memory_pool.h"
 #include "db/sqlengine/planner/invert_search.h"
 
 namespace zvec::sqlengine {
@@ -30,16 +34,35 @@ Status DocFilter::compute_filter() {
     InvertSearch search(segment_.get());
     auto invert_res = search.exec_invert_cond_tree(invert_cond_.get());
     if (!invert_res) {
-      return Status::InternalError("Execute invert search failed: ",
-                                   invert_res.error().message());
+      return invert_res.error();
     }
     invert_result_ = invert_res.value();
     invert_filter_ = invert_result_->make_filter();
   }
 
   if (forward_plan_) {
-    auto forward_result = arrow::acero::DeclarationToTable(*forward_plan_);
+    auto *pool = segment_->uses_buffer_storage()
+                     ? detail::GetParquetMemoryPool().get()
+                     : arrow::default_memory_pool();
+    arrow::acero::QueryOptions options;
+    options.memory_pool = pool;
+    if (segment_->uses_buffer_storage()) {
+      // This nested filter can run on a managed CPU worker. Run its CPU
+      // continuations on the caller to avoid waiting on the same pool, and
+      // send blocking reads to the separately admitted I/O workers.
+      options.use_threads = false;
+      options.custom_io_executor =
+          GlobalResource::Instance().arrow_io_thread_pool();
+      if (!options.custom_io_executor)
+        return Status(StatusCode::RESOURCE_EXHAUSTED,
+                      "Managed Arrow I/O executor unavailable");
+    }
+    auto forward_result =
+        arrow::acero::DeclarationToTable(*forward_plan_, options);
     if (!forward_result.ok()) {
+      if (forward_result.status().IsOutOfMemory())
+        return Status(StatusCode::RESOURCE_EXHAUSTED,
+                      forward_result.status().ToString());
       return Status::InternalError("Execute filter bitmap failed: ",
                                    forward_result.status().ToString());
     }
@@ -61,8 +84,10 @@ Status DocFilter::compute_filter() {
     const auto columns = query_info_->get_forward_filter_field_names();
     auto prepared = segment_->prepare_forward_read(columns, with_deletion);
     if (!prepared.ok()) {
-      return Status::InternalError("Prepare forward read failed: ",
-                                   prepared.status().ToString());
+      const auto &status = prepared.status();
+      return Status(status.IsOutOfMemory() ? StatusCode::RESOURCE_EXHAUSTED
+                                           : StatusCode::INTERNAL_ERROR,
+                    status.ToString());
     }
     auto state = prepared.MoveValueUnsafe();
     forward_rows_ = state.num_rows;
@@ -78,8 +103,15 @@ Status DocFilter::compute_filter() {
       LOG_DEBUG("Forward filter locked fetch: segment[%d] rows[%zu]",
                 segment_->id(), static_cast<size_t>(forward_rows_));
     }
-    auto bind_res = forward_filter_expr_->Bind(*schema);
+    auto *pool = segment_->uses_buffer_storage()
+                     ? detail::GetParquetMemoryPool().get()
+                     : arrow::default_memory_pool();
+    arrow::compute::ExecContext context(pool);
+    auto bind_res = forward_filter_expr_->Bind(*schema, &context);
     if (!bind_res.ok()) {
+      if (bind_res.status().IsOutOfMemory())
+        return Status(StatusCode::RESOURCE_EXHAUSTED,
+                      bind_res.status().ToString());
       return Status::InternalError("Bind forward filter expression failed",
                                    bind_res.status().ToString());
     }
@@ -101,33 +133,32 @@ bool DocFilter::empty() const {
            forward_filter_expr_);
 }
 
-bool DocFilter::is_filtered(uint64_t id) const {
-  // An unprepared (or failed) forward filter never admits candidates.
+Result<bool> DocFilter::is_filtered_checked(uint64_t id) const try {
   if (forward_filter_expr_ && !forward_prepared_) return true;
-  // An owning view holds exactly the rows captured at preparation; nothing
-  // beyond them can be read. Locked fetch keeps reading the live segment.
   if (forward_view_ && id >= forward_rows_) return true;
-  if (delete_filter_ &&
-      (sealed_deletion_ ? sealed_deletion_ : delete_filter_)->is_filtered(id)) {
-    return true;
+  if (delete_filter_) {
+    auto result = (sealed_deletion_ ? sealed_deletion_ : delete_filter_)
+                      ->is_filtered_checked(id);
+    if (!result || *result) return result;
   }
-  if (invert_filter_ && invert_filter_->is_filtered(id)) {
-    return true;
+  if (invert_filter_) {
+    auto result = invert_filter_->is_filtered_checked(id);
+    if (!result || *result) return result;
   }
-  auto forward_bit = get_forward_bit(id);
-  if (!forward_bit) {
-    return false;
-  }
-  // revert to return false if forward filter is matched
-  return !forward_bit.value();
+  auto matches = get_forward_bit(id);
+  if (!matches) return tl::make_unexpected(std::move(matches.error()));
+  return !*matches;
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(Status(StatusCode::RESOURCE_EXHAUSTED,
+                                    "Forward filter evaluation failed"));
 }
 
-std::optional<bool> DocFilter::get_forward_bit(uint64_t id) const {
+Result<bool> DocFilter::get_forward_bit(uint64_t id) const {
   if (forward_filter_expr_) {
     return is_matched_by_forward_filter(id);
   }
   if (!forward_bitmap_) {
-    return std::nullopt;
+    return true;
   }
   uint64_t rows_seen = 0;
   for (int c = 0; c < forward_bitmap_->num_chunks(); c++) {
@@ -138,13 +169,12 @@ std::optional<bool> DocFilter::get_forward_bit(uint64_t id) const {
     }
     rows_seen += arr->length();
   }
-  LOG_ERROR("ID is out or range: id[%zu] count[%zu]", (size_t)id,
-            (size_t)rows_seen);
-  return std::nullopt;
+  return tl::make_unexpected(Status::InternalError(
+      "Forward filter row ID out of range: ", id, " of ", rows_seen));
 }
 
 std::optional<std::vector<uint64_t>> DocFilter::get_bf_by_keys_and_update(
-    float ratio) {
+    float ratio, ailego::MemoryReservation &keys_memory) {
   // TODO: support forward
   if (!invert_result_) {
     return std::nullopt;
@@ -156,15 +186,26 @@ std::optional<std::vector<uint64_t>> DocFilter::get_bf_by_keys_and_update(
   // decide to use brute force by keys or not
   if (size_t match_count = invert_result_->count();
       match_count <= bf_by_keys_threshold) {
-    std::vector<uint32_t> ids;
-    invert_result_->extract_ids(&ids);
+    ailego::MemoryReservation reservation;
+    std::vector<uint64_t> ids;
+    try {
+      ailego::ReserveVectorCapacity(ids, reservation, match_count);
+      // Widen directly into the sole owned candidate list, without a
+      // temporary uint32 list that duplicates all matching document IDs.
+      auto iter = invert_result_->create_iterator();
+      for (; iter->valid(); iter->next()) ids.push_back(iter->doc_id());
+      if (ids.size() != match_count) return std::nullopt;
+    } catch (const std::bad_alloc &) {
+      return std::nullopt;
+    }
+    keys_memory.swap(reservation);
     invert_filter_.reset();
     invert_result_.reset();
     LOG_INFO(
         "Use brute force by keys, doc_count[%zu] invert_result_count[%zu] "
         "ratio[%.4f]",
         doc_count, match_count, ratio);
-    return std::vector<uint64_t>(ids.begin(), ids.end());
+    return ids;
   } else {
     LOG_DEBUG(
         "Not use brute force by keys, doc_count[%zu] invert_result_count[%zu] "
@@ -174,7 +215,7 @@ std::optional<std::vector<uint64_t>> DocFilter::get_bf_by_keys_and_update(
   return std::nullopt;
 }
 
-std::optional<bool> DocFilter::is_matched_by_forward_filter(uint64_t id) const {
+Result<bool> DocFilter::is_matched_by_forward_filter(uint64_t id) const {
   ExecBatchPtr exec_batch;
   if (forward_view_) {
     exec_batch = forward_view_->read_row(id);
@@ -186,24 +227,30 @@ std::optional<bool> DocFilter::is_matched_by_forward_filter(uint64_t id) const {
                                  : segment_->fetch(columns, id);
   }
   if (!exec_batch) {
-    LOG_ERROR("Fetch forward failed, id[%zu]", (size_t)id);
-    return std::nullopt;
+    return tl::make_unexpected(
+        Status::InternalError("Fetch forward failed for row ID ", id));
   }
+  auto *pool = segment_->uses_buffer_storage()
+                   ? detail::GetParquetMemoryPool().get()
+                   : arrow::default_memory_pool();
+  arrow::compute::ExecContext context(pool);
   auto maybe_result = arrow::compute::ExecuteScalarExpression(
-      *forward_filter_expr_, *exec_batch);
+      *forward_filter_expr_, *exec_batch, &context);
   if (!maybe_result.ok()) {
-    LOG_ERROR("Execute scalar expression failed, id[%zu] err[%s]", (size_t)id,
-              maybe_result.status().ToString().c_str());
-    return std::nullopt;
+    const auto &status = maybe_result.status();
+    return tl::make_unexpected(Status(status.IsOutOfMemory()
+                                          ? StatusCode::RESOURCE_EXHAUSTED
+                                          : StatusCode::INTERNAL_ERROR,
+                                      status.ToString()));
   }
   arrow::Datum datum = maybe_result.MoveValueUnsafe();
   if (datum.is_scalar()) {
     const auto &scalar = datum.scalar_as<arrow::BooleanScalar>();
     return scalar.is_valid && scalar.value;
   }
-  LOG_ERROR("Datum is not scalar, id[%zu] type[%s]", (size_t)id,
-            datum.type()->ToString().c_str());
-  return std::nullopt;
+  return tl::make_unexpected(
+      Status::InternalError("Expected a scalar filter result for row ID ", id,
+                            ", got ", datum.type()->ToString()));
 }
 
 

@@ -340,10 +340,11 @@ TEST(DiskAnnMobileCompatTest, BuildDumpLoadAndSearch) {
 
   const auto &result = context->result();
   ASSERT_FALSE(result.empty());
-  EXPECT_NE(
-      std::find_if(result.begin(), result.end(),
-                   [](const auto &item) { return item.key() == kExpectedKey; }),
-      result.end());
+  EXPECT_NE(std::find_if(result.begin(), result.end(),
+                         [expected_key = kExpectedKey](const auto &item) {
+                           return item.key() == expected_key;
+                         }),
+            result.end());
 
   IndexStreamer::Pointer first_streamer =
       IndexFactory::CreateStreamer("DiskAnnStreamer");
@@ -366,8 +367,9 @@ TEST(DiskAnnMobileCompatTest, BuildDumpLoadAndSearch) {
   auto switching_context = first_streamer->create_context();
   ASSERT_NE(switching_context, nullptr);
   switching_context->set_topk(5);
-  switching_context->set_filter(
-      [](uint64_t key) { return key != kExpectedKey; });
+  switching_context->set_filter([expected_key = kExpectedKey](uint64_t key) {
+    return key != expected_key;
+  });
   ASSERT_EQ(
       second_streamer->search_impl(query.data(), query_meta, switching_context),
       0);
@@ -412,10 +414,11 @@ TEST(DiskAnnMobileCompatTest, BuildDumpLoadAndSearch) {
   ASSERT_NE(context, nullptr);
   context->set_topk(5);
   ASSERT_EQ(searcher->search_impl(query.data(), query_meta, context), 0);
-  EXPECT_NE(
-      std::find_if(context->result().begin(), context->result().end(),
-                   [](const auto &item) { return item.key() == kExpectedKey; }),
-      context->result().end());
+  EXPECT_NE(std::find_if(context->result().begin(), context->result().end(),
+                         [expected_key = kExpectedKey](const auto &item) {
+                           return item.key() == expected_key;
+                         }),
+            context->result().end());
 }
 
 }  // namespace

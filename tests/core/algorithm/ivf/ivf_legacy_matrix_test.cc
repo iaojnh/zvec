@@ -147,6 +147,7 @@ class IVFLegacyMatrixTest
     ASSERT_NE(nullptr, dumper);
     ASSERT_EQ(0, dumper->create(path_));
     IVFDumper postings(meta_, dumper, list_counts.size());
+    ASSERT_EQ(0, postings.reserve_keys(count));
     size_t id = 0;
     for (size_t list = 0; list < list_counts.size(); ++list) {
       for (size_t i = 0; i < list_counts[list]; ++i, ++id) {
@@ -331,7 +332,7 @@ TEST_P(IVFLegacyMatrixTest, BatchReadsOnlyTheFirstListTail) {
   IndexQueryMeta qmeta(meta_.data_type(), meta_.dimension());
   auto a = entity.column_query(queries_[0].data(), qmeta);
   auto b = entity.column_query(queries_[1].data(), qmeta);
-  IndexDocumentHeap ha(1), hb(1);
+  IndexCandidateHeap ha(1), hb(1);
   IndexContext::Stats sa, sb;
   uint32_t scanned = 0;
   ASSERT_EQ(

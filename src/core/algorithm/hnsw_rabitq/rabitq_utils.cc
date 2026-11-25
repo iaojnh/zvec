@@ -17,6 +17,7 @@
 #include <zvec/ailego/hash/crc32c.h>
 #include "zvec/ailego/logger/logger.h"
 #include "zvec/core/framework/index_error.h"
+#include "paged_rabitq_rotator.h"
 
 namespace zvec {
 namespace core {
@@ -24,8 +25,8 @@ namespace core {
 int dump_rabitq_centroids(
     const IndexDumper::Pointer &dumper, size_t dimension, size_t padded_dim,
     size_t ex_bits, size_t num_clusters, rabitqlib::RotatorType rotator_type,
-    const std::vector<float> &rotated_centroids,
-    const std::vector<float> &centroids,
+    const std::function<int(size_t, void *, size_t)> &rotated_centroids,
+    const std::function<int(size_t, void *, size_t)> &centroids,
     const std::unique_ptr<rabitqlib::Rotator<float>> &rotator,
     size_t *out_dumped_size) {
   auto align_size = [](size_t size) -> size_t {
@@ -52,40 +53,32 @@ int dump_rabitq_centroids(
   crc = ailego::Crc32c::Hash(&header, sizeof(header), crc);
   dumped_size += size;
 
-  // Write rotated centroids
-  size = dumper->write(rotated_centroids.data(),
-                       rotated_centroids.size() * sizeof(float));
-  if (size != rotated_centroids.size() * sizeof(float)) {
-    LOG_ERROR("Failed to write rotated centroids: written=%zu, expected=%zu",
-              size, rotated_centroids.size() * sizeof(float));
-    return IndexError_WriteData;
+  std::array<char, 65536> buffer;
+  for (size_t which = 0; which < 2; ++which) {
+    const size_t table_size =
+        num_clusters * (which == 0 ? padded_dim : dimension) * sizeof(float);
+    const auto &read = which == 0 ? rotated_centroids : centroids;
+    for (size_t offset = 0; offset < table_size;) {
+      size_t bytes = std::min(buffer.size(), table_size - offset);
+      int ret = read(offset, buffer.data(), bytes);
+      if (ret != 0) return ret;
+      if (dumper->write(buffer.data(), bytes) != bytes)
+        return IndexError_WriteData;
+      crc = ailego::Crc32c::Hash(buffer.data(), bytes, crc);
+      offset += bytes;
+      dumped_size += bytes;
+    }
   }
-  crc = ailego::Crc32c::Hash(rotated_centroids.data(),
-                             rotated_centroids.size() * sizeof(float), crc);
-  dumped_size += size;
-
-  // Write original centroids
-  size = dumper->write(centroids.data(), centroids.size() * sizeof(float));
-  if (size != centroids.size() * sizeof(float)) {
-    LOG_ERROR("Failed to write centroids: written=%zu, expected=%zu", size,
-              centroids.size() * sizeof(float));
-    return IndexError_WriteData;
+  for (size_t offset = 0; offset < rotator->dump_bytes();) {
+    size_t bytes = std::min(buffer.size(), rotator->dump_bytes() - offset);
+    int ret = ReadRabitqRotator(rotator.get(), offset, buffer.data(), bytes);
+    if (ret != 0) return ret;
+    if (dumper->write(buffer.data(), bytes) != bytes)
+      return IndexError_WriteData;
+    crc = ailego::Crc32c::Hash(buffer.data(), bytes, crc);
+    offset += bytes;
+    dumped_size += bytes;
   }
-  crc = ailego::Crc32c::Hash(centroids.data(), centroids.size() * sizeof(float),
-                             crc);
-  dumped_size += size;
-
-  // Write rotator data
-  std::vector<char> buffer(rotator->dump_bytes());
-  rotator->save(buffer.data());
-  size = dumper->write(buffer.data(), buffer.size());
-  if (size != buffer.size()) {
-    LOG_ERROR("Failed to write rotator data: written=%zu, expected=%zu", size,
-              buffer.size());
-    return IndexError_WriteData;
-  }
-  crc = ailego::Crc32c::Hash(buffer.data(), buffer.size(), crc);
-  dumped_size += size;
 
   // Write padding
   size_t padding_size = align_size(dumped_size) - dumped_size;

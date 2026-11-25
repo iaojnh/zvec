@@ -46,6 +46,11 @@ class ZVEC_AILEGO_API StagedPath {
   std::string destination_;
   std::string directory_;
   std::string path_;
+#if defined(_WIN32) || defined(_WIN64)
+  // Materialize native cleanup paths before creating the private directory.
+  std::wstring native_directory_;
+  std::wstring native_path_;
+#endif
 };
 
 /*! File Helper Module
@@ -70,6 +75,15 @@ struct ZVEC_AILEGO_API FileHelper {
 
   //! Retrieve current working directory (UTF-8 bytes in \p *path)
   static bool GetWorkingDirectory(std::string *path);
+
+  //! Configure the process-wide scratch directory (UTF-8). A nonempty path
+  //! must name an existing directory and is resolved to an absolute path.
+  //! Empty restores the system default. Failure preserves the previous path.
+  static bool SetTemporaryDirectory(const std::string &path);
+
+  //! Resolve the configured scratch directory or the system default.
+  //! Explicit configuration never falls back to another directory on failure.
+  static bool GetTemporaryDirectory(std::string *path);
 
   //! Narrow paths are UTF-8 on all platforms (on Windows, decoded as UTF-8;
   //! on POSIX, native narrow encoding is typically UTF-8).

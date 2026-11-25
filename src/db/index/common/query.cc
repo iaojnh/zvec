@@ -259,7 +259,7 @@ Status SearchQuery::validate(const FieldSchema *schema,
   return target_.validate(schema, need_sanitize);
 }
 
-Status sanitize_sparse_vector(VectorClause &vc, const FieldSchema *schema) {
+Status sanitize_sparse_vector(VectorClause &vc, const FieldSchema *schema) try {
   if (!schema || !schema->is_sparse_vector()) {
     return Status::OK();
   }
@@ -286,9 +286,13 @@ Status sanitize_sparse_vector(VectorClause &vc, const FieldSchema *schema) {
         "]: sparse vector contains duplicate indices");
   }
   return Status::OK();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Sparse query sort exceeds memory budget");
 }
 
-Status sanitize_sparse_vector(QueryTarget &target, const FieldSchema *schema) {
+Status sanitize_sparse_vector(QueryTarget &target,
+                              const FieldSchema *schema) try {
   if (auto *vvc = target.get_vector_view_clause()) {
     // Own the buffers before sorting so borrowed input remains unchanged.
     target.clause_ = VectorClause{std::string(vvc->query_vector_),
@@ -296,6 +300,9 @@ Status sanitize_sparse_vector(QueryTarget &target, const FieldSchema *schema) {
                                   std::string(vvc->sparse_values_)};
   }
   return sanitize_sparse_vector(*target.get_vector_clause(), schema);
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Sparse query copy exceeds memory budget");
 }
 
 }  // namespace zvec

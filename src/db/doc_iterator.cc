@@ -16,6 +16,7 @@
 #include <arrow/api.h>
 #include <zvec/db/doc_iterator.h>
 #include "db/common/constants.h"
+#include "db/common/query_result_memory.h"
 #include "db/doc_iterator_internal.h"
 #include "db/index/common/doc_field_converter.h"
 #include "db/index/segment/filtering_reader.h"
@@ -62,13 +63,36 @@ Status resolve_reader_columns(DocIterator::Impl *impl,
 // Materialize rows [begin, end) of the current batch column by column.
 // Windows (not batches) bound doc memory, because a Parquet ReadNext
 // returns a whole row group (up to ~1M rows).
-Status materialize_window(DocIterator::Impl *impl, int64_t begin, int64_t end) {
+Status materialize_window_once(DocIterator::Impl *impl, int64_t begin,
+                               int64_t *end) try {
   const auto &batch = *impl->current_batch;
-  int64_t num_rows = end - begin;
+  int64_t num_rows = *end - begin;
   impl->batch_docs.clear();
+  std::shared_ptr<detail::ResultMemoryAllowance::Lease> memory;
+  detail::ResultMemoryAllowance::PendingCopy pending;
+  if (impl->segments[impl->current_segment_index]->uses_buffer_storage()) {
+    // Row limits alone do not bound string/list copies. Choose a window by
+    // byte admission before materializing Docs, and retain the lease with
+    // returned Docs even after the iterator advances or closes.
+    memory = std::make_shared<detail::ResultMemoryAllowance::Lease>(
+        &detail::SharedResultMemoryAllowance());
+    while (true) {
+      try {
+        memory->add_pending(
+            detail::EstimateQueryResult(*batch.Slice(begin, num_rows)),
+            pending);
+        break;
+      } catch (const std::bad_alloc &) {
+        if (num_rows <= 1) throw;
+        num_rows = std::max<int64_t>(1, num_rows / 2);
+      }
+    }
+    *end = begin + num_rows;
+  }
+  pending.start();
   impl->batch_docs.reserve(num_rows);
   for (int64_t i = 0; i < num_rows; i++) {
-    impl->batch_docs.push_back(std::make_shared<Doc>());
+    impl->batch_docs.push_back(detail::MakeQueryDocument(memory));
   }
 
   const auto *uids = static_cast<const arrow::StringArray *>(
@@ -89,6 +113,7 @@ Status materialize_window(DocIterator::Impl *impl, int64_t begin, int64_t end) {
     }
   }
 
+  pending.finish();
   if (impl->row_id_col >= 0) {
     const auto *row_ids = static_cast<const arrow::UInt64Array *>(
         batch.columns()[impl->row_id_col].get());
@@ -103,6 +128,8 @@ Status materialize_window(DocIterator::Impl *impl, int64_t begin, int64_t end) {
         auto fetched =
             indexer->fetch(static_cast<uint32_t>(row_ids->Value(begin + i)));
         if (!fetched.has_value()) {
+          if (fetched.error().code() == StatusCode::RESOURCE_EXHAUSTED)
+            return fetched.error();
           // Docs without a value for a vector field are accepted by insert
           // (the write path only warns and skips them, regardless of the
           // schema's nullable flag) — no placeholder, no presence bitmap,
@@ -117,8 +144,8 @@ Status materialize_window(DocIterator::Impl *impl, int64_t begin, int64_t end) {
               "vector fetch failed, field: ", field->name(), ": ",
               fetched.error().message());
         }
-        auto s = ConvertVectorDataBufferToDocField(field, fetched.value(),
-                                                   impl->batch_docs[i].get());
+        auto s = ConvertVectorDataBufferToDocField(
+            field, fetched.value(), impl->batch_docs[i].get(), memory.get());
         if (!s.ok()) {
           return s;
         }
@@ -127,6 +154,22 @@ Status materialize_window(DocIterator::Impl *impl, int64_t begin, int64_t end) {
   }
 
   return Status::OK();
+} catch (const std::bad_alloc &) {
+  return Status(StatusCode::RESOURCE_EXHAUSTED,
+                "Insufficient shared budget for iterator result window");
+}
+
+Status materialize_window(DocIterator::Impl *impl, int64_t begin,
+                          int64_t *end) {
+  while (true) {
+    auto status = materialize_window_once(impl, begin, end);
+    if (status.code() != StatusCode::RESOURCE_EXHAUSTED || *end - begin <= 1)
+      return status;
+    // Vector payloads are fetched separately from the Arrow columns. Retry
+    // a smaller window only after releasing every partially admitted Doc.
+    impl->batch_docs.clear();
+    *end = begin + (*end - begin) / 2;
+  }
 }
 
 }  // namespace
@@ -143,7 +186,7 @@ void DocIterator::close() {
   impl_.reset();
 }
 
-Result<Doc::Ptr> DocIterator::next() {
+Result<Doc::Ptr> DocIterator::next() try {
   if (!impl_) {
     return tl::make_unexpected(Status::InternalError("Iterator is closed"));
   }
@@ -154,15 +197,17 @@ Result<Doc::Ptr> DocIterator::next() {
   // Materialize a new window when the current one is exhausted. Readers are
   // opened lazily, at most one segment's reader at a time.
   while (impl_->current_row >= impl_->batch_docs.size()) {
+    // Consumed Docs must not overlap the next decoder batch. Escaped Docs
+    // retain their own allowance independently of this vector.
+    impl_->batch_docs.clear();
     if (!impl_->current_batch ||
         impl_->batch_offset >= impl_->current_batch->num_rows()) {
       impl_->current_batch.reset();
       bool loaded = false;
       while (impl_->current_segment_index < impl_->segments.size()) {
         if (!impl_->current_reader) {
-          auto scalar_reader =
-              impl_->segments[impl_->current_segment_index]->scan(
-                  impl_->iterator_columns);
+          const auto &segment = impl_->segments[impl_->current_segment_index];
+          auto scalar_reader = segment->scan(impl_->iterator_columns);
           if (!scalar_reader) {
             impl_->error =
                 Status::InternalError("Segment::scan failed during iteration");
@@ -172,7 +217,8 @@ Result<Doc::Ptr> DocIterator::next() {
           // bitmap is non-empty; otherwise read the segment as-is.
           if (impl_->filter) {
             impl_->current_reader =
-                FilteringReader::Make(std::move(scalar_reader), impl_->filter);
+                FilteringReader::Make(std::move(scalar_reader), impl_->filter,
+                                      segment->query_memory_pool());
           } else {
             impl_->current_reader = std::move(scalar_reader);
           }
@@ -182,15 +228,33 @@ Result<Doc::Ptr> DocIterator::next() {
             impl_->error = rs;
             return tl::make_unexpected(rs);
           }
+          impl_->replay_rows = impl_->accepted_rows;
         }
         std::shared_ptr<arrow::RecordBatch> batch;
         auto status = impl_->current_reader->ReadNext(&batch);
         if (!status.ok()) {
+          if (status.IsOutOfMemory()) {
+            // A decoder, row-ID builder, or filter may have consumed input
+            // before refusing. Reopen the immutable snapshot and skip only
+            // rows from batches we successfully accepted.
+            impl_->current_reader.reset();
+            return tl::make_unexpected(
+                Status(StatusCode::RESOURCE_EXHAUSTED, status.ToString()));
+          }
           impl_->error =
               Status::InternalError("ReadNext failed: ", status.ToString());
           return tl::make_unexpected(impl_->error);
         }
         if (batch && batch->num_rows() > 0) {
+          if (impl_->replay_rows >= batch->num_rows()) {
+            impl_->replay_rows -= batch->num_rows();
+            continue;
+          }
+          if (impl_->replay_rows != 0) {
+            batch = batch->Slice(impl_->replay_rows);
+            impl_->replay_rows = 0;
+          }
+          impl_->accepted_rows += batch->num_rows();
           impl_->current_batch = std::move(batch);
           impl_->batch_offset = 0;
           loaded = true;
@@ -198,8 +262,14 @@ Result<Doc::Ptr> DocIterator::next() {
         }
         if (!batch) {
           // EOF for this segment: release the reader and advance.
+          if (impl_->replay_rows != 0) {
+            impl_->error =
+                Status::InternalError("Iterator snapshot changed on retry");
+            return tl::make_unexpected(impl_->error);
+          }
           impl_->current_reader.reset();
           impl_->current_segment_index++;
+          impl_->accepted_rows = 0;
         }
       }
       if (!loaded) {
@@ -210,12 +280,13 @@ Result<Doc::Ptr> DocIterator::next() {
     int64_t begin = impl_->batch_offset;
     int64_t end = std::min(begin + kMaxRecordBatchNumRows,
                            impl_->current_batch->num_rows());
-    auto ms = materialize_window(impl_.get(), begin, end);
+    auto ms = materialize_window(impl_.get(), begin, &end);
     if (!ms.ok()) {
-      // Sticky failure: never hand out a partially filled window.
+      // No window row was published and batch_offset is unchanged. Releasing
+      // other results can make this same window admissible on the next call.
       impl_->batch_docs.clear();
-      impl_->error = ms;
-      return tl::make_unexpected(ms);
+      if (ms.code() != StatusCode::RESOURCE_EXHAUSTED) impl_->error = ms;
+      return tl::make_unexpected(std::move(ms));
     }
     impl_->batch_offset = end;
     if (end >= impl_->current_batch->num_rows()) {
@@ -224,7 +295,15 @@ Result<Doc::Ptr> DocIterator::next() {
     impl_->current_row = 0;
   }
 
-  return impl_->batch_docs[impl_->current_row++];
+  // The caller owns the returned document. Keep only unread documents in
+  // the window if the caller releases its row before asking for another.
+  return std::move(impl_->batch_docs[impl_->current_row++]);
+} catch (const std::bad_alloc &) {
+  impl_->batch_docs.clear();
+  impl_->current_reader.reset();
+  return tl::make_unexpected(
+      Status(StatusCode::RESOURCE_EXHAUSTED,
+             "Insufficient memory budget during iteration"));
 }
 
 }  // namespace zvec

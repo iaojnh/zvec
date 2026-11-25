@@ -15,6 +15,7 @@
 #include "hnsw_sparse_algorithm.h"
 #include <chrono>
 #include <iostream>
+#include <mutex>
 #include <vector>
 #include <ailego/internal/cpu_features.h>
 
@@ -26,12 +27,16 @@ HnswSparseAlgorithm::HnswSparseAlgorithm(HnswSparseEntity &entity)
       mt_(std::chrono::system_clock::now().time_since_epoch().count()),
       lock_pool_(kLockCnt) {}
 
-int HnswSparseAlgorithm::cleanup() {
+int HnswSparseAlgorithm::cleanup() try {
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 int HnswSparseAlgorithm::add_node(node_id_t id, level_t level,
-                                  HnswSparseContext *ctx) {
+                                  HnswSparseContext *ctx) try {
   spin_lock_.lock();
 
   // std::cout << "id: " << id << ", level: " << level << std::endl;
@@ -45,13 +50,14 @@ int HnswSparseAlgorithm::add_node(node_id_t id, level_t level,
   }
   spin_lock_.unlock();
 
+  std::unique_lock<decltype(mutex_)> level_lock(mutex_, std::defer_lock);
   if (ailego_unlikely(level > cur_max_level)) {
-    mutex_.lock();
+    level_lock.lock();
     // re-check max level
     cur_max_level = entity_.cur_max_level();
     entry_point = entity_.entry_point();
     if (level <= cur_max_level) {
-      mutex_.unlock();
+      level_lock.unlock();
     }
   }
 
@@ -77,13 +83,26 @@ int HnswSparseAlgorithm::add_node(node_id_t id, level_t level,
     spin_lock_.lock();
     entity_.update_ep_and_level(id, level);
     spin_lock_.unlock();
-    mutex_.unlock();
+    level_lock.unlock();
   }
 
   return 0;
+} catch (const GraphStorageError &error) {
+  ctx->release_build_workspace();
+  return error.code;
+} catch (const std::bad_alloc &) {
+  ctx->release_build_workspace();
+  return IndexError_NoMemory;
 }
 
-int HnswSparseAlgorithm::search(HnswSparseContext *ctx) const {
+int HnswSparseAlgorithm::search(HnswSparseContext *ctx) const try {
+  bool complete = false;
+  AILEGO_DEFER([&] {
+    if (!complete) {
+      ctx->topk_heap().clear();
+      ctx->group_topk_heaps().clear();
+    }
+  });
   spin_lock_.lock();
   auto max_level = entity_.cur_max_level();
   auto entry_point = entity_.entry_point();
@@ -106,7 +125,12 @@ int HnswSparseAlgorithm::search(HnswSparseContext *ctx) const {
     expand_neighbors_by_group(topk_heap, ctx);
   }
 
+  complete = true;
   return 0;
+} catch (const GraphStorageError &error) {
+  return error.code;
+} catch (const std::bad_alloc &) {
+  return IndexError_NoMemory;
 }
 
 //! select_entry_point on hnsw level, ef = 1
@@ -131,9 +155,7 @@ void HnswSparseAlgorithm::select_entry_point(level_t level,
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_vector())++;
     }
-    if (ailego_unlikely(ret != 0)) {
-      break;
-    }
+    CheckGraphStorage(ret);
     bool find_closer = false;
     for (uint32_t i = 0; i < size; ++i) {
       dist_t cur_dist = dc.dist(neighbor_block_vecs[i].data());
@@ -232,9 +254,7 @@ void HnswSparseAlgorithm::search_neighbors(level_t level,
     if (ailego_unlikely(ctx->debugging())) {
       (*ctx->mutable_stats_get_vector())++;
     }
-    if (ailego_unlikely(ret != 0)) {
-      break;
-    }
+    CheckGraphStorage(ret);
 
     static constexpr node_id_t PREFETCH_STEP = 2;
     static constexpr node_id_t SPARSE_PREFETCH_STEP = 1;
@@ -292,7 +312,7 @@ void HnswSparseAlgorithm::expand_neighbors_by_group(
   };
 
   // devide into groups
-  std::map<std::string, TopkHeap> &group_topk_heaps = ctx->group_topk_heaps();
+  auto &group_topk_heaps = ctx->group_topk_heaps();
   for (uint32_t i = 0; i < topk.size(); ++i) {
     node_id_t id = topk[i].first;
     auto score = topk[i].second;
@@ -362,9 +382,7 @@ void HnswSparseAlgorithm::expand_neighbors_by_group(
       if (ailego_unlikely(ctx->debugging())) {
         (*ctx->mutable_stats_get_vector())++;
       }
-      if (ailego_unlikely(ret != 0)) {
-        break;
-      }
+      CheckGraphStorage(ret);
 
       static constexpr node_id_t PREFETCH_STEP = 2;
       for (uint32_t i = 0; i < size; ++i) {
@@ -403,7 +421,8 @@ void HnswSparseAlgorithm::update_neighbors(HnswSparseDistCalculator &dc,
   uint32_t max_neighbor_cnt = entity_.neighbor_cnt(level);
   if (topk_heap.size() <= static_cast<size_t>(entity_.prune_cnt())) {
     if (topk_heap.size() <= static_cast<size_t>(max_neighbor_cnt)) {
-      entity_.update_neighbors(level, id, topk_heap.container());
+      CheckGraphStorage(
+          entity_.update_neighbors(level, id, topk_heap.container()));
       return;
     }
   }
@@ -453,7 +472,7 @@ void HnswSparseAlgorithm::update_neighbors(HnswSparseDistCalculator &dc,
   }
 
   topk_heap.truncate(cur_size);
-  entity_.update_neighbors(level, id, topk_heap.container());
+  CheckGraphStorage(entity_.update_neighbors(level, id, topk_heap.container()));
 
   return;
 }
@@ -466,13 +485,14 @@ void HnswSparseAlgorithm::reverse_update_neighbors(HnswSparseDistCalculator &dc,
   const size_t max_neighbor_cnt = entity_.neighbor_cnt(level);
 
   uint32_t lock_idx = id & kLockMask;
-  lock_pool_[lock_idx].lock();
+  std::unique_lock<std::remove_reference_t<decltype(lock_pool_[lock_idx])>>
+      node_lock(lock_pool_[lock_idx]);
   const Neighbors neighbors = entity_.get_neighbors(level, id);
   size_t size = neighbors.size();
   ailego_assert_with(size <= max_neighbor_cnt, "invalid neighbor size");
   if (size < max_neighbor_cnt) {
     entity_.add_neighbor(level, id, size, link_id);
-    lock_pool_[lock_idx].unlock();
+    node_lock.unlock();
     return;
   }
 
@@ -511,9 +531,10 @@ void HnswSparseAlgorithm::reverse_update_neighbors(HnswSparseDistCalculator &dc,
   }
 
   update_heap.truncate(cur_size);
-  entity_.update_neighbors(level, id, update_heap.container());
+  CheckGraphStorage(
+      entity_.update_neighbors(level, id, update_heap.container()));
 
-  lock_pool_[lock_idx].unlock();
+  node_lock.unlock();
 
   update_heap.clear();
 

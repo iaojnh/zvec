@@ -51,22 +51,33 @@ class FlatSparseIndexProvider : public IndexSparseProvider {
   }
 
   //! Retrieve a vector using a primary key
+  int get_sparse_vector(uint64_t key,
+                        IndexSparseDocument &result) const override {
+    return entity_->decode_sparse_vector(key, result);
+  }
+
   int get_sparse_vector(uint64_t key, uint32_t *sparse_count,
                         std::string *sparse_indices_buffer,
-                        std::string *sparse_values_buffer) const override {
-    std::string sparse_data;
+                        std::string *sparse_values_buffer) const override try {
+    IndexStorage::MemoryBlock sparse_data;
+    uint32_t sparse_length = 0;
 
-    int ret = entity_->get_sparse_vector_by_key(key, &sparse_data);
+    int ret =
+        entity_->get_sparse_vector_ptr_by_key(key, sparse_data, &sparse_length);
     if (ailego_unlikely(ret != 0)) {
       LOG_ERROR("Failed to get sparse vector, key=%zu, ret=%s", (size_t)key,
                 IndexError::What(ret));
       return ret;
     }
 
-    SparseUtility::ReverseSparseFormat(sparse_data, sparse_count,
-                                       sparse_indices_buffer,
-                                       sparse_values_buffer, meta_.unit_size());
+    SparseUtility::ReverseSparseFormatToExternal(
+        sparse_data.data(), sparse_count, sparse_indices_buffer,
+        sparse_values_buffer, meta_.unit_size());
     return 0;
+  } catch (const FlatSparseEntity::ReadError &error) {
+    return error.status;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
   }
 
   //! Retrieve the owner class
@@ -84,19 +95,7 @@ class FlatSparseIndexProvider : public IndexSparseProvider {
     Iterator(const std::shared_ptr<FlatSparseEntityType> &entity,
              const IndexMeta &meta)
         : entity_(entity), meta_(meta), cur_id_(0U), valid_(false) {
-      IndexStorage::MemoryBlock sparse_data_block;
-      entity_->get_sparse_vector(cur_id_, sparse_data_block);
-      const void *sparse_data = sparse_data_block.data();
-      if (sparse_data != nullptr) {
-        valid_ = true;
-
-        sparse_indices_buffer_.clear();
-        sparse_data_buffer_.clear();
-
-        SparseUtility::ReverseSparseFormat(
-            sparse_data, &sparse_count_, &sparse_indices_buffer_,
-            &sparse_data_buffer_, meta.unit_size());
-      }
+      read_current();
     }
 
     //! Retrieve sparse count
@@ -119,58 +118,53 @@ class FlatSparseIndexProvider : public IndexSparseProvider {
       return cur_id_ < entity_->doc_cnt() && valid_;
     }
 
-    //! Retrieve primary key
+    int status() const override {
+      return status_;
+    }
+
     uint64_t key() const override {
-      // std::cout << "iter key=" << cur_id_ << std::endl;
-      return entity_->get_key(cur_id_);
+      return key_;
     }
 
-    //! Next iterator
     void next() override {
-      cur_id_ = get_next_valid_id(cur_id_ + 1);
-
-      if (cur_id_ < entity_->doc_cnt()) {
-        IndexStorage::MemoryBlock sparse_data_block;
-        entity_->get_sparse_vector(cur_id_, sparse_data_block);
-        const void *sparse_data = sparse_data_block.data();
-        if (sparse_data != nullptr) {
-          valid_ = true;
-
-          sparse_indices_buffer_.clear();
-          sparse_data_buffer_.clear();
-
-          SparseUtility::ReverseSparseFormat(
-              sparse_data, &sparse_count_, &sparse_indices_buffer_,
-              &sparse_data_buffer_, meta_.unit_size());
-        } else {
-          valid_ = false;
-        }
+      if (status_ == 0 && cur_id_ < entity_->doc_cnt()) {
+        ++cur_id_;
+        read_current();
       }
     }
 
-    //! Reset the iterator
     void reset() {
-      cur_id_ = get_next_valid_id(0);
-      IndexStorage::MemoryBlock sparse_data_block;
-      entity_->get_sparse_vector(cur_id_, sparse_data_block);
-      const void *sparse_data = sparse_data_block.data();
-      if (sparse_data != nullptr) {
-        valid_ = true;
-
-        SparseUtility::ReverseSparseFormat(
-            sparse_data, &sparse_count_, &sparse_indices_buffer_,
-            &sparse_data_buffer_, meta_.unit_size());
-      }
+      cur_id_ = 0;
+      status_ = 0;
+      read_current();
     }
 
    private:
-    node_id_t get_next_valid_id(node_id_t start_id) {
-      for (node_id_t i = start_id; i < entity_->doc_cnt(); i++) {
-        if (entity_->get_key(i) != kInvalidNodeId) {
-          return i;
-        }
+    void read_current() try {
+      valid_ = false;
+      while (cur_id_ < entity_->doc_cnt()) {
+        key_ = entity_->get_key(cur_id_);
+        if (key_ != kInvalidKey) break;
+        ++cur_id_;
       }
-      return kInvalidNodeId;
+      if (cur_id_ >= entity_->doc_cnt()) return;
+      IndexStorage::MemoryBlock block;
+      status_ = entity_->get_sparse_vector(cur_id_, block);
+      if (status_ != 0) return;
+      if (!block.data()) {
+        status_ = IndexError_ReadData;
+        return;
+      }
+      sparse_indices_buffer_.clear();
+      sparse_data_buffer_.clear();
+      SparseUtility::ReverseSparseFormat(
+          block.data(), &sparse_count_, &sparse_indices_buffer_,
+          &sparse_data_buffer_, meta_.unit_size());
+      valid_ = true;
+    } catch (const FlatSparseEntity::ReadError &error) {
+      status_ = error.status;
+    } catch (const std::bad_alloc &) {
+      status_ = IndexError_NoMemory;
     }
 
    private:
@@ -178,9 +172,11 @@ class FlatSparseIndexProvider : public IndexSparseProvider {
     const IndexMeta &meta_;
     node_id_t cur_id_;
     uint32_t sparse_count_;
-    std::string sparse_indices_buffer_;
-    std::string sparse_data_buffer_;
+    ailego::BudgetedString sparse_indices_buffer_;
+    ailego::BudgetedString sparse_data_buffer_;
     bool valid_{false};
+    int status_{0};
+    uint64_t key_{kInvalidKey};
   };
 
  private:

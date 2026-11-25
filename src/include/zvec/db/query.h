@@ -17,6 +17,9 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 #include <zvec/db/doc.h>
@@ -132,7 +135,16 @@ inline void QueryTarget::set_sparse_vector(std::string indices,
 }
 
 // Buffers returned by the internal-ID query API.
-struct InternalIdsQueryResult {
+struct ResultMemoryOwner {
+  std::shared_ptr<void> memory_owner;
+};
+
+struct InternalIdsQueryResult : ResultMemoryOwner {
+  InternalIdsQueryResult() = default;
+  InternalIdsQueryResult(std::vector<int64_t> doc_ids,
+                         std::vector<float> doc_scores = {})
+      : ids(std::move(doc_ids)), scores(std::move(doc_scores)) {}
+
   std::vector<int64_t> ids;
   std::vector<float> scores;
 };
@@ -182,12 +194,40 @@ struct GroupByVectorQuery {
   uint32_t topk_per_group_{3};
 };
 
-struct GroupResult {
+struct GroupResult : ResultMemoryOwner {
+  GroupResult(std::string value, std::vector<Doc> docs,
+              std::shared_ptr<void> memory = {})
+      : ResultMemoryOwner{std::move(memory)},
+        group_by_value_(std::move(value)),
+        docs_(std::move(docs)) {}
+  GroupResult() = default;
+
   std::string group_by_value_;
   std::vector<Doc> docs_;
 };
 
 using GroupResults = std::vector<GroupResult>;
+
+// Preserve the two public fields of each result for structured bindings.
+template <
+    size_t I, typename Result,
+    std::enable_if_t<
+        std::is_same_v<std::remove_cv_t<std::remove_reference_t<Result>>,
+                       InternalIdsQueryResult> ||
+            std::is_same_v<std::remove_cv_t<std::remove_reference_t<Result>>,
+                           GroupResult>,
+        int> = 0>
+decltype(auto) get(Result &&result) {
+  using Type = std::remove_cv_t<std::remove_reference_t<Result>>;
+  if constexpr (std::is_same_v<Type, InternalIdsQueryResult>) {
+    return std::get<I>(std::forward_as_tuple(
+        std::forward<Result>(result).ids, std::forward<Result>(result).scores));
+  } else {
+    return std::get<I>(
+        std::forward_as_tuple(std::forward<Result>(result).group_by_value_,
+                              std::forward<Result>(result).docs_));
+  }
+}
 
 //! Multi query structure for combining multiple sub-queries
 //! (vector, full-text, etc.) with optional re-ranking of results.
@@ -212,3 +252,22 @@ struct MultiQuery {
 
 
 }  // namespace zvec
+
+namespace std {
+
+template <>
+struct tuple_size<zvec::InternalIdsQueryResult> : integral_constant<size_t, 2> {
+};
+
+template <size_t I>
+struct tuple_element<I, zvec::InternalIdsQueryResult>
+    : tuple_element<I, tuple<vector<int64_t>, vector<float>>> {};
+
+template <>
+struct tuple_size<zvec::GroupResult> : integral_constant<size_t, 2> {};
+
+template <size_t I>
+struct tuple_element<I, zvec::GroupResult>
+    : tuple_element<I, tuple<string, vector<zvec::Doc>>> {};
+
+}  // namespace std

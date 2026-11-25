@@ -48,7 +48,7 @@ class DiskAnnIndexProvider : public IndexProvider {
         : owner(buffer_owner) {}
 
     std::weak_ptr<ResultBufferOwner> owner;
-    std::string data;
+    ailego::BudgetedString data;
   };
 
  public:
@@ -108,8 +108,9 @@ class DiskAnnIndexProvider : public IndexProvider {
       return nullptr;
     }
 
-    const diskann_id_t id = indexer_->get_id(static_cast<diskann_key_t>(key));
-    if (id == kInvalidId) {
+    diskann_id_t id;
+    if (indexer_->find_id(static_cast<diskann_key_t>(key), &id) != 0 ||
+        id == kInvalidId) {
       return nullptr;
     }
 
@@ -121,14 +122,14 @@ class DiskAnnIndexProvider : public IndexProvider {
     // this thread's next fetch through this provider, provider destruction, or
     // thread exit.
     try {
-      std::string &vector_buffer = thread_result_buffer(result_buffer_owner_);
+      auto &vector_buffer = thread_result_buffer(result_buffer_owner_);
       std::lock_guard<std::mutex> lock(fetch_mutex_);
-      if (!fetch_context_) {
-        fetch_context_ =
-            DiskAnnContext::create_fetch_context(meta_, measure_, entity_);
+      if (!fetch_context_ &&
+          DiskAnnContext::create_fetch_context(meta_, measure_, entity_,
+                                               &fetch_context_) != 0) {
+        return nullptr;
       }
-      if (!fetch_context_ ||
-          indexer_->get_vector(id, fetch_context_, vector_buffer) != 0) {
+      if (indexer_->get_vector(id, fetch_context_, vector_buffer) != 0) {
         return nullptr;
       }
       return vector_buffer.data();
@@ -143,12 +144,14 @@ class DiskAnnIndexProvider : public IndexProvider {
   }
 
  private:
-  static std::string &thread_result_buffer(
+  static ailego::BudgetedString &thread_result_buffer(
       const std::shared_ptr<ResultBufferOwner> &owner) {
     // A list keeps every live provider's string object stable when another
     // provider first fetches on this thread. Only the vector bytes are kept in
     // TLS; heavyweight DiskAnnContext and file handles remain provider-owned.
-    static thread_local std::list<ThreadResultBuffer> buffers;
+    static thread_local std::list<ThreadResultBuffer,
+                                  ailego::BudgetedAllocator<ThreadResultBuffer>>
+        buffers;
     for (auto it = buffers.begin(); it != buffers.end();) {
       std::shared_ptr<ResultBufferOwner> entry_owner = it->owner.lock();
       if (!entry_owner) {
@@ -190,13 +193,12 @@ class DiskAnnIndexProvider : public IndexProvider {
         // Context setup owns aligned I/O scratch space and platform resources;
         // iterators that are only inspected should not pay that cost.
         if (!context_) {
-          context_ =
-              DiskAnnContext::create_fetch_context(meta_, measure_, entity_);
+          status_ = DiskAnnContext::create_fetch_context(meta_, measure_,
+                                                         entity_, &context_);
+          if (status_ != 0) return nullptr;
         }
-        if (!context_) {
-          return nullptr;
-        }
-        if (indexer_->get_vector(cur_id_, context_, vector_buffer_) != 0) {
+        status_ = indexer_->get_vector(cur_id_, context_, vector_buffer_);
+        if (status_ != 0) {
           return nullptr;
         }
         data_loaded_ = true;
@@ -205,14 +207,20 @@ class DiskAnnIndexProvider : public IndexProvider {
     }
 
     bool is_valid() const override {
-      return cur_id_ < static_cast<diskann_id_t>(entity_->doc_cnt());
+      return status_ == 0 &&
+             cur_id_ < static_cast<diskann_id_t>(entity_->doc_cnt());
     }
 
     uint64_t key() const override {
-      return static_cast<uint64_t>(entity_->get_key(cur_id_));
+      return is_valid() ? current_key_ : kInvalidKey;
+    }
+
+    int status() const override {
+      return status_;
     }
 
     void next() override {
+      if (!is_valid()) return;
       cur_id_ = next_valid_id(cur_id_ + 1);
       data_loaded_ = false;
       vector_buffer_.clear();
@@ -225,7 +233,9 @@ class DiskAnnIndexProvider : public IndexProvider {
     diskann_id_t next_valid_id(diskann_id_t start_id) const {
       const auto total = static_cast<diskann_id_t>(entity_->doc_cnt());
       for (diskann_id_t i = start_id; i < total; ++i) {
-        if (entity_->get_key(i) != kInvalidKey) {
+        status_ = entity_->read_key(i, &current_key_);
+        if (status_ != 0) return total;
+        if (current_key_ != kInvalidKey) {
           return i;
         }
       }
@@ -237,8 +247,10 @@ class DiskAnnIndexProvider : public IndexProvider {
     DiskAnnEntity::Pointer entity_;
     DiskAnnIndexer::Pointer indexer_;
     mutable IndexContext::Pointer context_;
-    mutable std::string vector_buffer_;
+    mutable ailego::BudgetedString vector_buffer_;
     mutable bool data_loaded_{false};
+    mutable int status_{0};
+    mutable diskann_key_t current_key_{kInvalidKey};
     diskann_id_t cur_id_;
   };
 

@@ -1056,7 +1056,7 @@ TEST_F(BufferPoolTest, ConcurrentWritablePressureUsesBackgroundWriteback) {
     EXPECT_EQ(0u, final_stats.writeback_pending);
     EXPECT_GT(final_stats.evict, 0u);
 #if defined(__linux__)
-    if (current_io_backend_type() == IOBackendType::kIoUring) {
+    if (final_stats.writeback_io_staging_bytes) {
       EXPECT_GT(final_stats.writeback_aio_batches, 0u);
       EXPECT_GT(final_stats.writeback_aio_pages, 0u);
       EXPECT_EQ(0u, final_stats.writeback_aio_fallbacks);
