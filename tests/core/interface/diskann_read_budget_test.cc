@@ -43,6 +43,11 @@ void *operator new(size_t size, std::align_val_t alignment) {
   return memory;
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+// GCC diagnoses the matching aligned new and delete replacements after
+// inlining the free call into a C++ delete expression.
+[[gnu::noinline]]
+#endif
 void operator delete(void *memory, std::align_val_t) noexcept {
   ailego_aligned_free(memory);
 }

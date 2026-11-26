@@ -246,10 +246,14 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
     }
     ASSERT_NO_FATAL_FAILURE(
         add_all(merge ? source : target, values, dimension));
-    if (diskann_source) ASSERT_EQ(0, source->train());
+    if (diskann_source) {
+      ASSERT_EQ(0, source->train());
+    }
     ASSERT_EQ(
         merge ? target->merge({source}, {}, {2, nullptr}) : target->train(), 0);
-    if (pressure) EXPECT_LE(pool.used(), pool_budget_);
+    if (pressure) {
+      EXPECT_LE(pool.used(), pool_budget_);
+    }
     EXPECT_TRUE(target->is_trained());
     EXPECT_TRUE(scratch_directories().empty());
     ASSERT_NO_FATAL_FAILURE(fetch_all(target, values, dimension, fp16));
@@ -281,7 +285,9 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
     }
     // Both providers can legitimately hold budget while open. Once they are
     // closed, only the reservation that created pressure should remain.
-    if (pressure) EXPECT_EQ(pool.external_used(), reservation);
+    if (pressure) {
+      EXPECT_EQ(pool.external_used(), reservation);
+    }
     EXPECT_TRUE(scratch_directories().empty());
     ASSERT_TRUE(std::filesystem::remove(path));
     if (merge) {
