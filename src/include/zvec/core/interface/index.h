@@ -87,11 +87,11 @@ struct SparseVectorBuffer {
 
  public:
   SparseVectorBuffer() = default;
-  SparseVectorBuffer(uint32_t count_, std::string indices_ = {},
-                     std::string values_ = {})
-      : count(count_),
-        indices(std::move(indices_)),
-        values(std::move(values_)) {}
+  SparseVectorBuffer(uint32_t sparse_count, std::string sparse_indices = {},
+                     std::string sparse_values = {})
+      : count(sparse_count),
+        indices(std::move(sparse_indices)),
+        values(std::move(sparse_values)) {}
   explicit SparseVectorBuffer(core::IndexSparseDocument &&document) {
     document.swap_buffers(count, indices, values, memory_);
   }

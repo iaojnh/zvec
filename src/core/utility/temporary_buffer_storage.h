@@ -93,12 +93,11 @@ class TemporaryBufferStorage {
     // Only remove the file we created and our empty, exclusively owned
     // directory. Never recursively remove a caller-supplied path.
     std::error_code error;
-    if (!path_.empty()) {
-      std::filesystem::remove(ailego::FileHelper::PathFromUtf8(path_), error);
+    if (!native_path_.empty()) {
+      std::filesystem::remove(native_path_, error);
     }
     if (!directory_.empty()) {
-      std::filesystem::remove(ailego::FileHelper::PathFromUtf8(directory_),
-                              error);
+      std::filesystem::remove(directory_, error);
     }
   }
 
@@ -135,6 +134,8 @@ class TemporaryBufferStorage {
   int flush() {
     try {
       return storage_->flush();
+    } catch (const std::bad_alloc &) {
+      return IndexError_NoMemory;
     } catch (const std::exception &) {
       return IndexError_WriteData;
     }
@@ -165,14 +166,15 @@ class TemporaryBufferStorage {
     const auto stamp =
         std::chrono::steady_clock::now().time_since_epoch().count();
     for (size_t attempt = 0; attempt < 64; ++attempt) {
-      std::string directory =
+      auto directory = ailego::FileHelper::PathFromUtf8(
           prefix + ".buffer-build-" + std::to_string(stamp) + "-" +
-          std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
-      std::string path = directory + "/data";
+          std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)));
+      auto native_path = directory / "data";
+      std::string path = ailego::FileHelper::PathToUtf8(native_path);
       std::error_code error;
-      if (std::filesystem::create_directory(
-              ailego::FileHelper::PathFromUtf8(directory), error)) {
+      if (std::filesystem::create_directory(directory, error)) {
         directory_ = std::move(directory);
+        native_path_ = std::move(native_path);
         path_ = std::move(path);
         break;
       }
@@ -195,7 +197,8 @@ class TemporaryBufferStorage {
     return 0;
   }
 
-  std::string directory_;
+  std::filesystem::path directory_;
+  std::filesystem::path native_path_;
   std::string path_;
   IndexStorage::Pointer storage_;
   IndexStorage::Segment::Pointer segment_;

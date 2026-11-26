@@ -1,3 +1,4 @@
+#include <cstring>
 #include <future>
 #include <memory>
 #include <string>
@@ -624,14 +625,15 @@ TEST_F(FlatStreamerTest, TestLinearSearchMMap) {
 
 namespace {
 
-struct FlatWriteFailure {
+struct FlatStorageFailure {
   size_t remaining_writes{0};
   size_t failure_count{0};
+  size_t remaining_fetches{0};
 };
 
 class FailingFlatSegment : public IndexStorage::Segment {
  public:
-  FailingFlatSegment(Pointer segment, std::shared_ptr<FlatWriteFailure> failure)
+  FailingFlatSegment(Pointer segment, std::shared_ptr<FlatStorageFailure> failure)
       : segment_(std::move(segment)), failure_(std::move(failure)) {}
 
   size_t data_size() const override {
@@ -647,14 +649,18 @@ class FailingFlatSegment : public IndexStorage::Segment {
     return segment_->capacity();
   }
   size_t fetch(size_t offset, void *data, size_t length) const override {
+    fail_read_ =
+        failure_->remaining_fetches != 0 && --failure_->remaining_fetches == 0;
+    if (fail_read_) return 0;
     return segment_->fetch(offset, data, length);
   }
   size_t read(size_t offset, IndexStorage::MemoryBlock &block,
               size_t length) override {
+    fail_read_ = false;
     return segment_->read(offset, block, length);
   }
   int read_error() const override {
-    return segment_->read_error();
+    return fail_read_ ? IndexError_NoMemory : segment_->read_error();
   }
   size_t write(size_t offset, const void *data, size_t length) override {
     if (failure_->remaining_writes != 0 && --failure_->remaining_writes == 0) {
@@ -677,14 +683,15 @@ class FailingFlatSegment : public IndexStorage::Segment {
 
  private:
   Pointer segment_;
-  std::shared_ptr<FlatWriteFailure> failure_;
+  std::shared_ptr<FlatStorageFailure> failure_;
+  mutable bool fail_read_{false};
 };
 
 class FailingFlatStorage : public IndexStorage {
  public:
   explicit FailingFlatStorage(IndexStorage::Pointer storage)
       : storage_(std::move(storage)),
-        failure_(std::make_shared<FlatWriteFailure>()) {}
+        failure_(std::make_shared<FlatStorageFailure>()) {}
 
   int init(const Params &params) override {
     return storage_->init(params);
@@ -724,8 +731,14 @@ class FailingFlatStorage : public IndexStorage {
   MemoryBlock::MemoryBlockType memory_block_type() const override {
     return storage_->memory_block_type();
   }
+  std::shared_ptr<VecBufferPool> vec_buffer_pool() const override {
+    return storage_->vec_buffer_pool();
+  }
   void fail_write(size_t ordinal) {
     failure_->remaining_writes = ordinal;
+  }
+  void fail_fetch(size_t ordinal) {
+    failure_->remaining_fetches = ordinal;
   }
   size_t failure_count() const {
     return failure_->failure_count;
@@ -733,10 +746,10 @@ class FailingFlatStorage : public IndexStorage {
 
  private:
   IndexStorage::Pointer storage_;
-  std::shared_ptr<FlatWriteFailure> failure_;
+  std::shared_ptr<FlatStorageFailure> failure_;
 };
 
-class FlatStreamerWriteFailureTest : public ::testing::Test {
+class FlatStreamerStorageFailureTest : public ::testing::Test {
  protected:
   void SetUp() override {
     auto &pool = PoolPayloadBudget::get_instance();
@@ -751,7 +764,7 @@ class FlatStreamerWriteFailureTest : public ::testing::Test {
     ASSERT_EQ(0, storage_->open(path_ + "/index", true));
     IndexMeta meta(IndexMeta::DT_FP32, 4);
     meta.set_metric("SquaredEuclidean", 0, Params());
-    entity_ = std::make_unique<FlatStreamerEntity>(stats_);
+    entity_ = std::make_shared<FlatStreamerEntity>(stats_);
     *entity_->mutable_meta() = meta;
     entity_->set_block_vector_count(8);
     entity_->set_linear_list_count(1);
@@ -778,10 +791,10 @@ class FlatStreamerWriteFailureTest : public ::testing::Test {
   size_t previous_capacity_{0};
   IndexStreamer::Stats stats_;
   std::shared_ptr<FailingFlatStorage> storage_;
-  std::unique_ptr<FlatStreamerEntity> entity_;
+  std::shared_ptr<FlatStreamerEntity> entity_;
 };
 
-TEST_F(FlatStreamerWriteFailureTest, PropagatesShortWritesAndRetriesSameId) {
+TEST_F(FlatStreamerStorageFailureTest, PropagatesShortWritesAndRetriesSameId) {
   constexpr uint32_t id = 3;
   constexpr size_t failed_write = 3;
   const std::vector<float> first{1.0f, 2.0f, 3.0f, 4.0f};
@@ -821,6 +834,31 @@ TEST_F(FlatStreamerWriteFailureTest, PropagatesShortWritesAndRetriesSameId) {
   }
   for (uint32_t hole = 1; hole < id; ++hole) {
     EXPECT_EQ(kInvalidKey, entity_->key(hole));
+  }
+}
+
+TEST_F(FlatStreamerStorageFailureTest, PagedIteratorReportsRowAndKeyRefusal) {
+  const float values[] = {1.0f, 2.0f, 3.0f, 4.0f};
+  ASSERT_EQ(0, entity_->add_vector_with_id(0, values, sizeof(values)));
+  ASSERT_NE(nullptr, storage_->vec_buffer_pool());
+
+  // Fetches 1/2/3 read the block header, row payload and key respectively.
+  for (size_t ordinal : {2u, 3u}) {
+    SCOPED_TRACE(ordinal);
+    storage_->fail_fetch(ordinal);
+    auto refused = entity_->creater_iterator();
+    ASSERT_NE(nullptr, refused);
+    EXPECT_FALSE(refused->is_valid());
+    EXPECT_EQ(IndexError_NoMemory, refused->status());
+    EXPECT_EQ(nullptr, refused->data());
+
+    auto retry = entity_->creater_iterator();
+    ASSERT_NE(nullptr, retry);
+    ASSERT_TRUE(retry->is_valid());
+    EXPECT_EQ(0, retry->status());
+    EXPECT_EQ(0u, retry->key());
+    ASSERT_NE(nullptr, retry->data());
+    EXPECT_EQ(0, std::memcmp(values, retry->data(), sizeof(values)));
   }
 }
 

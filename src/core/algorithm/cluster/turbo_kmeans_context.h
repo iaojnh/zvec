@@ -88,7 +88,8 @@ class TurboKmeansContext
  private:
   static size_t vector_dimension(size_t dim) {
     if constexpr (Cosine) {
-      constexpr size_t extra = sizeof(float) / sizeof(T);
+      constexpr size_t coordinate_bytes = sizeof(T);
+      constexpr size_t extra = sizeof(float) / coordinate_bytes;
       ailego_check_with(dim > extra, "Cosine record has no vector coordinates");
       return dim - extra;
     }

@@ -1248,7 +1248,7 @@ void FlatStreamerEntity::Iterator::read_row() try {
   if (segment->fetch(offset + size_t{block_vector_index_} * element_size,
                      row_.data(), element_size) != element_size ||
       segment->fetch(key_offset, &key_, sizeof(key_)) != sizeof(key_)) {
-    status_ = IndexError_ReadData;
+    status_ = segment->read_error();
     is_valid_ = false;
   }
 } catch (const std::bad_alloc &) {

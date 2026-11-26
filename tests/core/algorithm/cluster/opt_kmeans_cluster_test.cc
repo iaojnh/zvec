@@ -1041,7 +1041,8 @@ void CheckCosineTraining(IndexMeta::DataType type, bool seeded,
   // Full 32-row blocks and both remainder paths. The same unit direction is
   // repeated with unrelated original lengths: cosine must keep them together.
   constexpr size_t coordinates = 37, centers = 35;
-  constexpr size_t dim = coordinates + sizeof(float) / sizeof(T);
+  constexpr size_t coordinate_bytes = sizeof(T);
+  constexpr size_t dim = coordinates + sizeof(float) / coordinate_bytes;
   IndexMeta meta(type, dim);
   meta.set_metric("Cosine", 0, Params());
   auto features = std::make_shared<CompactIndexFeatures>(meta);
@@ -1103,8 +1104,8 @@ void CheckCosineTraining(IndexMeta::DataType type, bool seeded,
 template <typename T>
 void CheckCosineContext() {
   using Context = TurboKmeansContext<T, true, true>;
-  constexpr size_t coordinates = 7,
-                   dim = coordinates + sizeof(float) / sizeof(T);
+  constexpr size_t coordinates = 7, coordinate_bytes = sizeof(T);
+  constexpr size_t dim = coordinates + sizeof(float) / coordinate_bytes;
   std::vector<T> data(Context::BatchCount * dim, static_cast<T>(0.0f));
   std::vector<T> query(2 * dim, static_cast<T>(0.0f));
   for (size_t i = 0; i < Context::BatchCount; ++i) {

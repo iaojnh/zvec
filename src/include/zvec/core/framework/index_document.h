@@ -469,10 +469,7 @@ class GroupIndexDocument {
                      const std::vector<IndexDocument> &docs)
       : group_id_(group_id), docs_(docs) {}
 
-  GroupIndexDocument(const GroupIndexDocument &other)
-      : group_memory_(other.group_memory_),
-        group_id_(other.group_id_),
-        docs_(other.docs_) {}
+  GroupIndexDocument(const GroupIndexDocument &) = default;
   GroupIndexDocument(GroupIndexDocument &&) noexcept = default;
   GroupIndexDocument &operator=(GroupIndexDocument other) noexcept {
     group_memory_.swap(other.group_memory_);
