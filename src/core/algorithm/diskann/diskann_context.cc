@@ -267,7 +267,7 @@ int DiskAnnContext::init(ContextType type, uint32_t /*graph_degree*/,
       ret = visit_filter_.init(VisitFilter::EpochBitMap, entity_->doc_cnt(),
                                entity_->doc_cnt(), negative_probility_);
       if (ret != 0) {
-        LOG_ERROR("Create filter failed,  mode %d", filter_mode_);
+        LOG_ERROR("Create build visit filter failed");
         return ret;
       }
       break;
@@ -278,12 +278,7 @@ int DiskAnnContext::init(ContextType type, uint32_t /*graph_degree*/,
         return IndexError_InvalidArgument;
       }
 
-      ret = visit_filter_.init(filter_mode_, entity_->doc_cnt(),
-                               entity_->doc_cnt(), negative_probility_);
-      if (ret != 0) {
-        LOG_ERROR("Create filter failed,  mode %d", filter_mode_);
-        return ret;
-      }
+      search_visit_filter_.init(entity_->doc_cnt());
 
       if (setup_io_context) {
         ret = setup_io_ctx(io_ctx_);
