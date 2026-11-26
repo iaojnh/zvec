@@ -28,6 +28,8 @@
 #include "mixed_reducer/mixed_reducer_params.h"
 #include "utility/utility_params.h"
 
+#include "indexes/buffered_input.h"
+
 namespace zvec::core_interface {
 
 namespace {
@@ -311,6 +313,7 @@ bool Index::is_trained() const {
 }
 
 uint32_t Index::get_doc_count() const {
+  if (buffered_input_ && !is_trained_) return buffered_input_->count();
   if (pending_quantizer_training_) return 0;
   if (streamer_ == nullptr) {
     return -1;
@@ -781,7 +784,8 @@ int Index::close() {
     return core::IndexError_Runtime;
   }
 
-  if (!is_read_only_ && !pending_quantizer_training_) {
+  if (!is_read_only_ && !pending_quantizer_training_ &&
+      !(buffered_input_ && !is_trained_)) {
     if (ailego_unlikely(flush() != 0)) {
       LOG_ERROR("Failed to cleanup streamer");
       return core::IndexError_Runtime;
@@ -807,6 +811,11 @@ int Index::close() {
     LOG_ERROR("Failed to close storage");
     return core::IndexError_Runtime;
   }
+  if (buffered_input_) {
+    if (builder_) builder_->cleanup();
+    buffered_input_->clear();
+    buffered_input_.reset();
+  }
   is_open_ = false;
   return 0;
 }
@@ -822,6 +831,7 @@ int Index::flush() {
     LOG_ERROR("Cannot flush read-only index");
     return core::IndexError_Runtime;
   }
+  if (buffered_input_ && !is_trained_) return buffered_input_->flush();
   if (ailego_unlikely(streamer_->flush(0) != 0)) {
     LOG_ERROR("Failed to flush streamer");
     return core::IndexError_Runtime;

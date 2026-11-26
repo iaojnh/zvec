@@ -18,6 +18,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <turbo/serialization.h>
 #include <zvec/ailego/container/params.h>
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_meta.h>
@@ -343,6 +344,13 @@ class Quantizer {
     return 0;
   }
 
+  virtual size_t serialized_size() const {
+    return 0;
+  }
+  virtual int serialize_to(const SerializationSink &) const {
+    return kErrUnsupported;
+  }
+
   //! Deserialize quantizer parameters
   virtual int deserialize(std::string & /*in*/) {
     return 0;
@@ -386,6 +394,7 @@ class Quantizer {
 
   QuantizeType type_;
   uint32_t extra_meta_size_{0};
+  bool buffered_training_{false};
 };
 
 }  // namespace turbo

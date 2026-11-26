@@ -17,9 +17,12 @@
 #include <cstring>
 #include <random>
 #include <type_traits>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include "core/utility/prefix_index_holder.h"
 #include "quantizer/common/pq_training_samples.h"
+#include "quantizer/pq_fast_quantizer/pq_fast_quantizer.h"
+#include "quantizer/pq_int4_quantizer/pq_int4_quantizer.h"
 #include "quantizer/pq_int8_quantizer/pq_int8_quantizer.h"
 
 namespace zvec::turbo {
@@ -212,15 +215,15 @@ class FailingHolder : public StableHolder {
   using StableHolder::StableHolder;
   Iterator::Pointer create_iterator() override {
     struct FailingIterator : Iterator {
-      FailingIterator(Iterator::Pointer input, bool on_data)
-          : input_(std::move(input)), on_data_(on_data) {}
+      FailingIterator(Iterator::Pointer input, bool on_data, int failure)
+          : input_(std::move(input)), on_data_(on_data), failure_(failure) {}
       const void *data() const override {
-        if (on_data_) error_ = core::IndexError_ReadData;
+        if (on_data_) error_ = failure_;
         return input_->data();
       }
       bool is_valid() const override {
         bool valid = input_->is_valid();
-        if (!valid) error_ = core::IndexError_ReadData;
+        if (!valid) error_ = failure_;
         return valid;
       }
       int status() const override {
@@ -234,12 +237,14 @@ class FailingHolder : public StableHolder {
       }
       Iterator::Pointer input_;
       bool on_data_;
+      int failure_;
       mutable int error_ = 0;
     };
     return std::make_unique<FailingIterator>(source_->create_iterator(),
-                                             fail_on_data);
+                                             fail_on_data, error);
   }
   bool fail_on_data = false;
+  int error = core::IndexError_ReadData;
 };
 
 TEST(PqTrainingSamples, ReadErrorsLeaveBothOutputsUnchanged) {
@@ -266,6 +271,36 @@ TEST(PqTrainingSamples, ReadErrorsLeaveBothOutputsUnchanged) {
     EXPECT_FALSE(
         CollectPqTrainingSamples(input, 65536, 4 * sizeof(float), &copied));
     EXPECT_EQ(std::vector<uint8_t>{0x5a}, copied);
+  }
+}
+
+TEST(PqTrainingSamples, QuantizersPropagateInputMemoryFailureAndCanRetry) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous_capacity = pool.capacity();
+  ASSERT_EQ(0, pool.init(64 * 1024 * 1024));
+  auto restore = ailego::ScopeGuard::Make(
+      [&] { EXPECT_EQ(0, pool.init(previous_capacity)); });
+
+  constexpr size_t kDim = 16;
+  auto source = MakeSource<IndexMeta::DT_FP32>(512, kDim);
+  auto failing = std::make_shared<FailingHolder>(source);
+  failing->error = core::IndexError_NoMemory;
+  IndexMeta meta(IndexMeta::DT_FP32, kDim);
+  meta.set_metric("Cosine", 0, ailego::Params());
+  ailego::Params params;
+  params.set("num_chunk", uint32_t{4});
+  params.set("thread_count", uint32_t{1});
+
+  for (bool buffered : {false, true}) {
+    SCOPED_TRACE(buffered);
+    PqInt8Quantizer quantizer;
+    params.set("buffered_training", buffered);
+    ASSERT_EQ(0, quantizer.init(meta, params));
+    for (bool on_data : {false, true}) {
+      failing->fail_on_data = on_data;
+      EXPECT_EQ(core::IndexError_NoMemory, quantizer.train(failing));
+    }
+    EXPECT_EQ(0, quantizer.train(source));
   }
 }
 

@@ -60,7 +60,7 @@ class DiskAnnQuantizer {
   // PQ keeps its existing dimension/budget-based chunk selection. Fixed-width
   // encodings must fit the budget without silently changing their precision.
   int prepare(size_t count, bool has_budget, size_t budget_bytes,
-              uint32_t thread_count) {
+              uint32_t thread_count, bool buffered_build = false) {
     if (count == 0) return IndexError_InvalidLength;
     training_threads_ = std::max(1U, thread_count);
     if (name_ == "PqInt8Quantizer") {
@@ -80,6 +80,7 @@ class DiskAnnQuantizer {
       settings_.set("use_zero_mean", false);
       // Graph construction uses raw vectors; ADC does not need the SDC table.
       settings_.set("precompute_sdc", false);
+      settings_.set("buffered_training", buffered_build);
       int ret = create();
       if (ret != 0) return ret;
     }

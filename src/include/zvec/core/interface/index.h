@@ -111,6 +111,8 @@ struct SearchResult {
   std::vector<std::vector<std::string>> group_reverted_sparse_values_list_{};
 };
 
+class BufferedInput;
+
 class ZVEC_CORE_API Index {
  public:
   typedef std::shared_ptr<Index> Pointer;
@@ -316,6 +318,7 @@ class ZVEC_CORE_API Index {
 
   size_t context_index_{std::numeric_limits<size_t>::max()};
   core::IndexStorage::Pointer storage_{};
+  std::shared_ptr<BufferedInput> buffered_input_;
 
   bool is_open_{false};
   bool is_sparse_{false};

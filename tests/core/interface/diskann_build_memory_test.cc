@@ -124,7 +124,6 @@ TEST(DiskAnnBuildMemory, ReleaseStateAndReopenDirectAndMerged) {
                       fp16 ? 0.002 : 0.00001);
         }
         ASSERT_EQ(0, target->close());
-        target = IndexFactory::CreateAndInitIndex(*param);
         ASSERT_EQ(0, target->open(path, {StorageOptions::StorageType::kMMAP,
                                          false, true}));
         VectorDataBuffer after;

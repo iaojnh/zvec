@@ -17,7 +17,8 @@
 #include <cstdint>
 #include <mutex>
 #include <utility>
-#include <vector>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/process_rss_budget.h>
 
 namespace zvec {
 namespace core {
@@ -47,8 +48,12 @@ class DiskAnnNeighborBuffer {
   }
 
  private:
+  bool release_mapping();
+
   char *data_{nullptr};
   size_t size_{0};
+  size_t charged_bytes_{0};
+  ailego::ProcessRssBudget::MaterializationStamp projection_;
 };
 
 // Mutable rows use capacity classes in dedicated mapped chunks. Callers guard
@@ -80,8 +85,8 @@ class DiskAnnNeighborPool {
   void remove_available(Chunk *chunk);
 
   static constexpr uint32_t kCapacityStep = 16;
-  std::vector<uint8_t *> rows_;
-  std::vector<Chunk *> available_;
+  ailego::BudgetedVector<uint8_t *> rows_;
+  ailego::BudgetedVector<Chunk *> available_;
   Chunk *chunks_{nullptr};
   mutable std::mutex mutex_;
   uint32_t max_degree_{0};

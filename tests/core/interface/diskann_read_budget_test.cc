@@ -651,8 +651,11 @@ TEST_P(DiskAnnReadBudgetTest, InternalIdsPreserveNoMemoryFromAutoTrain) {
 
   const auto param = parameters(false);
   auto &rss = ailego::MemoryLimitPool::get_instance();
-  ASSERT_TRUE(rss.configure_process_rss_limit(kHighRss));
   for (bool refine : {false, true}) {
+    // The fault targets the first medoid read, after construction. Start each
+    // build without RSS accounting so its writable stores do not retain
+    // process-lifetime worker-stack reservations in this shared pool fixture.
+    ASSERT_TRUE(rss.configure_process_rss_limit(0));
     SCOPED_TRACE(refine);
     auto index = IndexFactory::CreateAndInitIndex(*param);
     ASSERT_NE(nullptr, index);
