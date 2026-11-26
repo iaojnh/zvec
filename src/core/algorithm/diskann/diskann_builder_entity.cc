@@ -22,6 +22,7 @@
 #include <ailego/pattern/defer.h>
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/core/framework/index_factory.h>
 #include "utility/immutable_segment_view.h"
