@@ -262,8 +262,7 @@ TEST_P(QueryContextOomTest, DiskAnnReadersReleaseFailedContexts) {
   const float query = 256.0F;
   auto check_reader = [&](auto &reader) {
     ASSERT_NO_FATAL_FAILURE(
-        check_context_failure(reader, sizeof(core::DiskAnnContext),
-                            sizeof(core::VisitByteMap::Context)));
+        check_context_failure(reader, sizeof(core::DiskAnnContext)));
     auto context = reader.create_context();
     ASSERT_NE(nullptr, context);
     context->set_topk(1);

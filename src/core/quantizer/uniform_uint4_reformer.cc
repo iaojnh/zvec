@@ -159,7 +159,7 @@ class UniformUint4Reformer : public IndexReformer {
     out->resize(static_cast<size_t>(count) * output_stride);
     auto *output = reinterpret_cast<uint8_t *>(out->data());
     const auto *source_bytes = static_cast<const uint8_t *>(source);
-    static thread_local ailego::BudgetedVector<float> decoded;
+    ailego::BudgetedVector<float> decoded;
     if (!is_fp32) decoded.resize(original_dimension_);
     for (uint32_t i = 0; i < count; ++i) {
       const void *source_row =

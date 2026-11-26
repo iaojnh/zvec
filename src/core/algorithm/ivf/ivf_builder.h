@@ -281,11 +281,14 @@ class IVFBuilder : public IndexBuilder {
 
   //! Select the nearest centroid id for the vector
   void label(const std::shared_ptr<VectorList> &vecs) {
+    // The labeling task owns its Flat context, including budgeted results.
+    // A worker can outlive this builder and must not retain the index's state.
+    IndexSearcher::Context::Pointer context;
     for (size_t i = 0; i < vecs->size(); ++i) {
       auto &vec = (*vecs)[i];
 
-      uint32_t centroid_idx =
-          centroid_index_->search_nearest_centroid(vec.data(), vec.size());
+      uint32_t centroid_idx = centroid_index_->search_nearest_centroid(
+          vec.data(), vec.size(), context);
       if (centroid_idx == IVFCentroidIndex::kInvalidID) {
         LOG_ERROR("Failed to search nearest centroid in CentroidIndex");
         if (!error_.exchange(true)) {

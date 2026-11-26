@@ -13,10 +13,12 @@
 // limitations under the License.
 #include <cmath>
 #include <set>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/core/framework/index_factory.h>
 #include "flat/flat_distance_matrix.h"
 #include "quantizer/distance_quantizer.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
 
 using namespace zvec;
 using namespace zvec::core;
@@ -102,6 +104,19 @@ TEST(FlatQuantizerDistance, Fp16Matrices) {
   for (const auto *name : {"SquaredEuclidean", "InnerProduct", "Cosine"}) {
     CheckMatrices<ailego::Float16>(IndexMeta::DT_FP16, name);
   }
+}
+TEST(FlatQuantizerDistance, StandaloneMatricesReleaseTheirScratch) {
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const auto previous_capacity = pool.capacity();
+  ASSERT_EQ(0, pool.init(8U << 20));
+  auto restore = ailego::ScopeGuard::Make([&] {
+    EXPECT_EQ(0, pool.init(previous_capacity));
+  });
+  ASSERT_NO_FATAL_FAILURE(
+      CheckMatrices<float>(IndexMeta::DT_FP32, "SquaredEuclidean"));
+  ASSERT_NO_FATAL_FAILURE(
+      CheckMatrices<ailego::Float16>(IndexMeta::DT_FP16, "Cosine"));
+  EXPECT_EQ(0u, pool.used());
 }
 TEST(FlatQuantizerDistance, UnsupportedRepresentationRetainsLegacyPath) {
   IndexMeta meta;

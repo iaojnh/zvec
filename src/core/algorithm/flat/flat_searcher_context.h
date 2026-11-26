@@ -203,6 +203,7 @@ class FlatSearcherContext : public IndexSearcher::Context {
     decltype(result_heaps_)().swap(result_heaps_);
     decltype(batch_queries_)().swap(batch_queries_);
     row_topk_.release();
+    matrix_scratch_ = {};
     decltype(row_query_buffer_)().swap(row_query_buffer_);
     group_topk_heaps_.clear();
     decltype(group_results_)().swap(group_results_);
@@ -210,6 +211,7 @@ class FlatSearcherContext : public IndexSearcher::Context {
 
   //! Reset the context
   void reset(const FlatSearcher<BATCH_SIZE> *owner) {
+    matrix_scratch_ = {};
     magic_ = owner->magic();
     feature_size_ = owner->meta().element_size();
 
@@ -351,7 +353,7 @@ class FlatSearcherContext : public IndexSearcher::Context {
       owner_->distance_matrix().template distance<BATCH_SIZE, K>(
           block,
           &batch_queries_[(query_index - query_base_) * qmeta.element_size()],
-          qmeta.dimension(), scores_);
+          qmeta.dimension(), scores_, &matrix_scratch_);
 
       for (size_t k = 0; k != K; ++k) {
         BudgetedIndexCandidateHeap *heap = &result_heaps_[query_index++];
@@ -380,7 +382,7 @@ class FlatSearcherContext : public IndexSearcher::Context {
     owner_->distance_matrix().template distance<BATCH_SIZE, 1>(
         block,
         &batch_queries_[(query_index - query_base_) * qmeta.element_size()],
-        qmeta.dimension(), scores_);
+        qmeta.dimension(), scores_, &matrix_scratch_);
 
     BudgetedIndexCandidateHeap *heap = &result_heaps_[query_index];
     for (size_t i = 0; i != BATCH_SIZE; ++i) {
@@ -400,7 +402,7 @@ class FlatSearcherContext : public IndexSearcher::Context {
       owner_->distance_matrix().template distance<BATCH_SIZE, K>(
           block,
           &batch_queries_[(query_index - query_base_) * qmeta.element_size()],
-          qmeta.dimension(), scores_);
+          qmeta.dimension(), scores_, &matrix_scratch_);
 
       for (size_t k = 0; k != K; ++k) {
         BudgetedIndexCandidateHeap *heap = &result_heaps_[query_index++];
@@ -431,7 +433,7 @@ class FlatSearcherContext : public IndexSearcher::Context {
     owner_->distance_matrix().template distance<BATCH_SIZE, 1>(
         block,
         &batch_queries_[(query_index - query_base_) * qmeta.element_size()],
-        qmeta.dimension(), scores_);
+        qmeta.dimension(), scores_, &matrix_scratch_);
 
     BudgetedIndexCandidateHeap *heap = &result_heaps_[query_index];
     for (size_t i = 0; i != BATCH_SIZE; ++i) {
@@ -452,7 +454,7 @@ class FlatSearcherContext : public IndexSearcher::Context {
     for (size_t i = 0; i != query_batch_count; ++i) {
       owner_->distance_matrix().template distance<K, 1>(
           &batch_queries_[(query_index - query_base_) * qmeta.element_size()],
-          feature, qmeta.dimension(), scores_);
+          feature, qmeta.dimension(), scores_, &matrix_scratch_);
 
       for (size_t k = 0; k != K; ++k) {
         result_heaps_[query_index++].emplace(0, scores_[k], feature_index);
@@ -725,6 +727,7 @@ class FlatSearcherContext : public IndexSearcher::Context {
   std::vector<char, ailego::BudgetedAllocator<char>> batch_queries_{};
   size_t query_base_{0};
   turbo::BatchTopK row_topk_;
+  FlatMatrixScratch matrix_scratch_;
   IndexMetric::MatrixBatchDistance row_batch_distance_{};
   IndexMetric::DistanceBatchQueryPreprocessFunc row_query_preprocess_{};
   size_t row_extra_size_{0};
@@ -768,8 +771,9 @@ int FlatSearcherContext<BATCH_SIZE>::search_column_nofilter(
     }
 
     for (size_t offset = 0; offset < actual_read_size_; offset += block_size) {
-      matrix.template distance<BATCH_SIZE, 1>(
-          (const char *)data + offset, query, qmeta.dimension(), scores_);
+      matrix.template distance<BATCH_SIZE, 1>((const char *)data + offset,
+                                              query, qmeta.dimension(), scores_,
+                                              &matrix_scratch_);
 
       for (size_t i = 0; i != BATCH_SIZE; ++i) {
         heap->emplace(0, scores_[i], feature_index++);
@@ -791,7 +795,8 @@ int FlatSearcherContext<BATCH_SIZE>::search_column_nofilter(
   size_t left_size_aligned = left_size / block_size * block_size;
   for (size_t offset = 0; offset != left_size_aligned; offset += block_size) {
     matrix.template distance<BATCH_SIZE, 1>((const char *)data + offset, query,
-                                            qmeta.dimension(), scores_);
+                                            qmeta.dimension(), scores_,
+                                            &matrix_scratch_);
 
     for (size_t i = 0; i != BATCH_SIZE; ++i) {
       heap->emplace(0, scores_[i], feature_index++);
@@ -841,8 +846,9 @@ int FlatSearcherContext<BATCH_SIZE>::search_column_filter(
     }
 
     for (size_t offset = 0; offset < actual_read_size_; offset += block_size) {
-      matrix.template distance<BATCH_SIZE, 1>(
-          (const char *)data + offset, query, qmeta.dimension(), scores_);
+      matrix.template distance<BATCH_SIZE, 1>((const char *)data + offset,
+                                              query, qmeta.dimension(), scores_,
+                                              &matrix_scratch_);
 
       for (size_t i = 0; i != BATCH_SIZE; ++i) {
         uint64_t feature_key = owner_->key(feature_index);
@@ -871,7 +877,8 @@ int FlatSearcherContext<BATCH_SIZE>::search_column_filter(
   size_t left_size_aligned = left_size / block_size * block_size;
   for (size_t offset = 0; offset != left_size_aligned; offset += block_size) {
     matrix.template distance<BATCH_SIZE, 1>((const char *)data + offset, query,
-                                            qmeta.dimension(), scores_);
+                                            qmeta.dimension(), scores_,
+                                            &matrix_scratch_);
 
     for (size_t i = 0; i != BATCH_SIZE; ++i) {
       uint64_t feature_key = owner_->key(feature_index);

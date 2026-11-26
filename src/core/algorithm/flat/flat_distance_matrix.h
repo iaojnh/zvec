@@ -13,12 +13,30 @@
 // limitations under the License.
 
 #pragma once
+#include <limits>
+#include <type_traits>
 #include <zvec/ailego/buffer/budgeted_buffer.h>
 #include "turbo/quantizer/quantizer.h"
 #include "flat_utility.h"
 
 namespace zvec {
 namespace core {
+
+struct FlatMatrixScratch {
+  template <typename T>
+  auto &values() {
+    if constexpr (std::is_same_v<T, float>) {
+      return fp32;
+    } else {
+      static_assert(std::is_same_v<T, ailego::Float16>);
+      return fp16;
+    }
+  }
+
+  ailego::BudgetedVector<float> fp32;
+  ailego::BudgetedVector<ailego::Float16> fp16;
+  ailego::BudgetedVector<const void *> pointers;
+};
 
 // Flat stores complete blocks in column order. Quantizers consume encoded
 // row vectors; preserve every stored component, including any cosine norm.
@@ -27,37 +45,42 @@ template <typename T>
 inline void QuantizedFlatMatrixDistance(const turbo::Quantizer &quantizer,
                                         const void *m, const void *q,
                                         size_t rows_count, size_t queries_count,
-                                        float *out) {
+                                        float *out,
+                                        FlatMatrixScratch *scratch = nullptr) {
+  if (rows_count == 0 || queries_count == 0) return;
   if (rows_count == 1 && queries_count == 1) {
     *out = quantizer.calc_distance_dp_dp(m, q);
     return;
   }
   const size_t dim = quantizer.quantized_datapoint_vector_length() / sizeof(T);
-  // These buffers outlive the search context. Keep their admission for the
-  // entire thread-local lifetime, including replacement allocation overlap.
-  thread_local ailego::BudgetedVector<T> rows, query;
-  thread_local ailego::BudgetedVector<const void *> pointers;
-  if ((dim && rows_count > rows.max_size() / dim) || dim > query.max_size() ||
+  FlatMatrixScratch local;
+  if (!scratch) scratch = &local;
+  auto &values = scratch->template values<T>();
+  auto &pointers = scratch->pointers;
+  if (rows_count > static_cast<size_t>((std::numeric_limits<int>::max)()) ||
+      dim > values.max_size() / (rows_count + 1) ||
       rows_count > pointers.max_size()) {
     throw std::bad_alloc();
   }
-  rows.resize(rows_count * dim);
-  query.resize(dim);
+  values.resize((rows_count + 1) * dim);
   pointers.resize(rows_count);
+  auto *rows = values.data();
+  auto *query = rows + rows_count * dim;
   const auto *a = static_cast<const T *>(m);
   const auto *b = static_cast<const T *>(q);
   for (size_t i = 0; i < rows_count; ++i) {
     for (size_t d = 0; d < dim; ++d) {
       rows[i * dim + d] = a[d * rows_count + i];
     }
-    pointers[i] = rows.data() + i * dim;
+    pointers[i] = rows + i * dim;
   }
   for (size_t j = 0; j < queries_count; ++j) {
     for (size_t d = 0; d < dim; ++d) {
       query[d] = b[d * queries_count + j];
     }
-    quantizer.calc_distance_dp_query_batch(pointers.data(), rows_count,
-                                           query.data(), out + j * rows_count);
+    quantizer.calc_distance_dp_query_batch(pointers.data(),
+                                           static_cast<int>(rows_count), query,
+                                           out + j * rows_count);
   }
 }
 
@@ -225,14 +248,16 @@ class FlatDistanceMatrix<
 
   //! Compute the distance between matrix and query
   template <size_t M, size_t N>
-  auto distance(const void *m, const void *q, size_t dim, float *out) const ->
+  auto distance(const void *m, const void *q, size_t dim, float *out,
+                FlatMatrixScratch *scratch = nullptr) const ->
       typename std::enable_if<(K == M) && (K >= N)>::type {
     if (quantizer_) {
       if (quantizer_->meta().data_type() == IndexMeta::DT_FP16) {
         QuantizedFlatMatrixDistance<ailego::Float16>(*quantizer_, m, q, M, N,
-                                                     out);
+                                                     out, scratch);
       } else {
-        QuantizedFlatMatrixDistance<float>(*quantizer_, m, q, M, N, out);
+        QuantizedFlatMatrixDistance<float>(*quantizer_, m, q, M, N, out,
+                                           scratch);
       }
       return;
     }
@@ -241,14 +266,16 @@ class FlatDistanceMatrix<
 
   //! Compute the distance between matrix and query
   template <size_t M, size_t N = 1u>
-  auto distance(const void *m, const void *q, size_t dim, float *out) const ->
+  auto distance(const void *m, const void *q, size_t dim, float *out,
+                FlatMatrixScratch *scratch = nullptr) const ->
       typename std::enable_if<(K > M) && (N == 1u)>::type {
     if (quantizer_) {
       if (quantizer_->meta().data_type() == IndexMeta::DT_FP16) {
         QuantizedFlatMatrixDistance<ailego::Float16>(*quantizer_, m, q, M, N,
-                                                     out);
+                                                     out, scratch);
       } else {
-        QuantizedFlatMatrixDistance<float>(*quantizer_, m, q, M, N, out);
+        QuantizedFlatMatrixDistance<float>(*quantizer_, m, q, M, N, out,
+                                           scratch);
       }
       return;
     }

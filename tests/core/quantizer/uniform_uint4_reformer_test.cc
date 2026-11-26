@@ -12,6 +12,8 @@
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/interface/index_param.h>
 #include "quantizer/quantizer_params.h"
+#include <ailego/pattern/scope_guard.h>
+#include "../../ailego/buffer/pool_payload_budget.h"
 
 namespace zvec::core {
 namespace {
@@ -170,6 +172,14 @@ TEST(UniformUint4Reformer, AcceptsFp16ForTransformAndConvert) {
   ASSERT_EQ(0, reformer->init(converter->meta().reformer_params()));
   auto native_iter = holder->create_iterator();
   const IndexQueryMeta fp16_meta(IndexMeta::DataType::DT_FP16, dimension);
+
+  auto &pool = ailego::PoolPayloadBudget::get_instance();
+  const auto previous_capacity = pool.capacity();
+  ASSERT_EQ(0, pool.init(8U << 20));
+  auto restore = ailego::ScopeGuard::Make([&] {
+    EXPECT_EQ(0u, pool.used());
+    EXPECT_EQ(0, pool.init(previous_capacity));
+  });
 
   std::string transformed;
   IndexQueryMeta transformed_meta;

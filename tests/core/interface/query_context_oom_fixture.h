@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
@@ -13,18 +14,17 @@
 #include <gtest/gtest.h>
 #include <ailego/pattern/scope_guard.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
-#include <zvec/ailego/logger/logger.h>
 #include <zvec/core/framework/index_framework.h>
 
 namespace {
 struct AllocationProbe {
   size_t context_size;
-  size_t filter_size;
-  bool throw_from_logging;
+  size_t fail_after_aligned;
   void *context{nullptr};
-  bool refused_filter{false};
+  std::array<void *, 2> aligned_blocks{};
+  size_t allocated_aligned{0};
+  bool refused{false};
   bool destroyed_context{false};
-  bool logger_threw{false};
 };
 
 thread_local AllocationProbe *probe = nullptr;
@@ -45,18 +45,24 @@ void *operator new(std::size_t size) {
 }
 
 void *operator new(std::size_t size, const std::nothrow_t &) noexcept {
-  // VisitByteMap uses nothrow new for its context. The distance callable can
-  // allocate the same size through throwing new before the filter is created.
-  if (probe && probe->context && !probe->refused_filter &&
-      size == probe->filter_size) {
-    probe->refused_filter = true;
-    return nullptr;
-  }
   try {
     return ::operator new(size);
   } catch (...) {
     return nullptr;
   }
+}
+
+void *operator new(std::size_t size, std::align_val_t alignment) {
+  const bool track = probe && probe->context && !probe->refused;
+  if (track && probe->allocated_aligned == probe->fail_after_aligned) {
+    probe->refused = true;
+    throw std::bad_alloc();
+  }
+  void *ptr =
+      ailego_aligned_malloc(size ? size : 1, static_cast<size_t>(alignment));
+  if (!ptr) throw std::bad_alloc();
+  if (track) probe->aligned_blocks[probe->allocated_aligned++] = ptr;
+  return ptr;
 }
 
 void operator delete(void *ptr) noexcept {
@@ -70,54 +76,53 @@ void operator delete(void *ptr, std::size_t) noexcept {
   ::operator delete(ptr);
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+[[gnu::noinline]]
+#endif
+void operator delete(void *ptr, std::align_val_t) noexcept {
+  if (probe && ptr) {
+    for (auto &block : probe->aligned_blocks) {
+      if (block == ptr) block = nullptr;
+    }
+  }
+  ailego_aligned_free(ptr);
+}
+
+void operator delete(void *ptr, std::size_t,
+                     std::align_val_t alignment) noexcept {
+  ::operator delete(ptr, alignment);
+}
+
 namespace zvec {
 namespace {
 namespace fs = std::filesystem;
 
-class ContextFailureLogger final : public ailego::Logger {
- public:
-  int init(const ailego::Params &) override {
-    return 0;
-  }
-  int cleanup() override {
-    return 0;
-  }
-  void log(int level, const char *, int, const char *, va_list) override {
-    if (level == LEVEL_ERROR && probe && probe->refused_filter &&
-        probe->throw_from_logging) {
-      probe->logger_threw = true;
-      throw std::bad_alloc();
-    }
-  }
-};
-
 template <typename Index>
-void check_context_failure(Index &index, size_t context_size, size_t filter_size) {
-  auto previous_logger =
-      ailego::LoggerBroker::Register(std::make_shared<ContextFailureLogger>());
-  const auto restore = ailego::ScopeGuard::Make([&] {
-    ailego::LoggerBroker::Register(std::move(previous_logger));
-  });
-  for (bool throw_from_logging : {false, true}) {
-    SCOPED_TRACE(throw_from_logging);
-    AllocationProbe attempt{context_size, filter_size, throw_from_logging};
+void check_context_failure(Index &index, size_t context_size) {
+  // After allocating DiskAnnContext, init allocates the aligned query
+  // workspace, the visit bits and the generation bytes in that order.
+  for (size_t fail_after : {0u, 1u, 2u}) {
+    SCOPED_TRACE(fail_after);
+    AllocationProbe attempt{context_size, fail_after};
     core::IndexContext::Pointer result;
     bool threw = false;
-    probe = &attempt;
-    try {
-      result = index.create_context();
-    } catch (const std::bad_alloc &) {
-      threw = true;
+    {
+      probe = &attempt;
+      auto clear_probe = ailego::ScopeGuard::Make([] { probe = nullptr; });
+      try {
+        result = index.create_context();
+      } catch (const std::bad_alloc &) {
+        threw = true;
+      }
     }
-    probe = nullptr;
 
-    ASSERT_TRUE(attempt.refused_filter);
-    ASSERT_EQ(throw_from_logging, attempt.logger_threw);
+    ASSERT_TRUE(attempt.refused);
+    EXPECT_FALSE(threw);
     EXPECT_EQ(nullptr, result);
-    if (!throw_from_logging) {
-      EXPECT_FALSE(threw);
-    }
     EXPECT_TRUE(attempt.destroyed_context);
+    for (const auto *block : attempt.aligned_blocks) {
+      EXPECT_EQ(nullptr, block);
+    }
   }
 }
 
