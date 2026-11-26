@@ -803,14 +803,14 @@ int DiskAnnBuilderEntity::dump_pq_meta_segment(
   // Write bounded chunks directly from the retained trained quantizer.
   size_t size_meta_buffer = 0;
   auto write_meta = [&](const void *data, size_t bytes) -> int {
-        if (bytes > pq_meta_.quantizer_meta_buffer_size - size_meta_buffer ||
-            dumper->write(data, bytes) != bytes) {
-          return IndexError_WriteData;
-        }
-        crc = ailego::Crc32c::Hash(data, bytes, crc);
-        size_meta_buffer += bytes;
-        return 0;
-      };
+    if (bytes > pq_meta_.quantizer_meta_buffer_size - size_meta_buffer ||
+        dumper->write(data, bytes) != bytes) {
+      return IndexError_WriteData;
+    }
+    crc = ailego::Crc32c::Hash(data, bytes, crc);
+    size_meta_buffer += bytes;
+    return 0;
+  };
   int ret = serialized_quantizer_.empty()
                 ? pq_quantizer_->serialize_to(write_meta)
                 : write_meta(serialized_quantizer_.data(),

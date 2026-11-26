@@ -14,6 +14,7 @@
 #pragma once
 
 #include <array>
+#include <limits>
 #include <memory>
 #include <vector>
 #include <ailego/pattern/scope_guard.h>
@@ -278,17 +279,19 @@ class DistCalculator {
 
   int quantize_query(const void *query_rotated) try {
     if (!quantizer_ || !query_rotated) return IndexError_InvalidArgument;
-    quant_query_scratch_.resize(quantizer_->quantized_query_vector_length());
+    const size_t bytes = quantizer_->quantized_query_vector_length();
+    if (!bytes) return IndexError_Unsupported;
+    quant_query_scratch_.resize(bytes);
     quantizer_->quantize_query(query_rotated, quant_query_scratch_.data());
-    quant_dist_impl_ = quantizer_->distance(quant_query_scratch_.data(),
-                                            quantizer_->quantized_query_meta());
-    return quant_dist_impl_.valid() ? 0 : IndexError_Unsupported;
+    return 0;
   } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;
   }
 
   int quantized_dist(const diskann_id_t *ids, uint32_t n, float *dists) try {
     if (n == 0) return 0;
+    if (n > static_cast<uint32_t>((std::numeric_limits<int>::max)()))
+      return IndexError_InvalidLength;
     auto release =
         ailego::ScopeGuard::Make([&] { resident_pq_batch_.release(); });
     quant_dp_list_.resize(n);
@@ -310,7 +313,11 @@ class DistCalculator {
                                   quant_code_scratch_, quant_dp_list_.data());
       if (status != 0) return status;
     }
-    quant_dist_impl_.batch(quant_dp_list_.data(), n, dists);
+    // The LUT is already owned by this RSS-accounted context. Use it
+    // directly so a second copy does not consume the page-cache budget.
+    quantizer_->calc_distance_dp_query_batch(
+        quant_dp_list_.data(), static_cast<int>(n), quant_query_scratch_.data(),
+        dists);
     return 0;
   } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;
@@ -443,7 +450,6 @@ class DistCalculator {
   const uint8_t *quant_codes_{nullptr};
   uint32_t quant_code_size_{0};
 
-  turbo::DistanceImpl quant_dist_impl_{};
 
   DiskAnnReadVector<const void *> quant_dp_list_;
   DiskAnnReadVector<uint8_t> quant_query_scratch_;

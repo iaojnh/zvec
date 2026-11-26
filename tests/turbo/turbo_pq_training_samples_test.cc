@@ -14,6 +14,7 @@
 
 #include <array>
 #include <cmath>
+#include <array>
 #include <cstring>
 #include <random>
 #include <type_traits>
@@ -293,14 +294,21 @@ TEST(PqTrainingSamples, QuantizersPropagateInputMemoryFailureAndCanRetry) {
 
   for (bool buffered : {false, true}) {
     SCOPED_TRACE(buffered);
-    PqInt8Quantizer quantizer;
-    params.set("buffered_training", buffered);
-    ASSERT_EQ(0, quantizer.init(meta, params));
-    for (bool on_data : {false, true}) {
-      failing->fail_on_data = on_data;
-      EXPECT_EQ(core::IndexError_NoMemory, quantizer.train(failing));
+    PqInt8Quantizer pq8;
+    PqInt4Quantizer pq4;
+    PqFastQuantizer fast_pq4;
+    const std::array<Quantizer *, 3> quantizers{&pq8, &pq4, &fast_pq4};
+    for (auto *quantizer : quantizers) {
+      SCOPED_TRACE(static_cast<int>(quantizer->type()));
+      params.set("buffered_training", buffered);
+      ASSERT_EQ(0, quantizer->init(meta, params));
+      quantizer->set_buffered_training(buffered);
+      for (bool on_data : {false, true}) {
+        failing->fail_on_data = on_data;
+        EXPECT_EQ(core::IndexError_NoMemory, quantizer->train(failing));
+      }
+      EXPECT_EQ(0, quantizer->train(source));
     }
-    EXPECT_EQ(0, quantizer.train(source));
   }
 }
 

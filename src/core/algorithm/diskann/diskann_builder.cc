@@ -480,7 +480,7 @@ void DiskAnnBuilder::encode_pq_batch(const uint8_t *block_data,
   const size_t elem_size = build_meta_.element_size();
   for (uint64_t i = begin; i < end; ++i) {
     candidate_quantizer_.get()->quantize_data(block_data + i * elem_size,
-                              block_codes + i * code_size_);
+                                              block_codes + i * code_size_);
   }
 }
 

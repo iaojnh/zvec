@@ -17,8 +17,10 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_filter.h>
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_provider.h>
@@ -34,7 +36,8 @@ class Quantizer;
 namespace core {
 
 /*! A multi-pass holder that presents multiple source providers as one dense
- *  sequence without materializing all source vectors.
+ *  sequence. Budgeted rebuilds may spool decoded vectors once in pageable
+ *  temporary storage; ordinary callers continue borrowing source providers.
  */
 class MergedProviderIndexHolder final : public IndexHolder,
                                         public OrdinalAccessHolder,
@@ -57,11 +60,13 @@ class MergedProviderIndexHolder final : public IndexHolder,
     uint64_t logical_id_base{0};
     size_t provider_count{0};
     size_t iterated_count{0};
-    std::vector<uint64_t> keep_bits{};
+    ailego::BudgetedVector<uint64_t> keep_bits{};
   };
 
   MergedProviderIndexHolder(IndexQueryMeta output_meta,
-                            std::vector<Source> sources);
+                            std::vector<Source> sources,
+                            ailego::MemoryReservation source_memory = {},
+                            bool spool_vectors = false);
 
   //! Scan source keys once, cache the filter decisions and calculate count.
   int init(const IndexFilter &filter, std::atomic<bool> *stop_flag = nullptr);
@@ -86,6 +91,10 @@ class MergedProviderIndexHolder final : public IndexHolder,
  private:
   class Iterator;
   class OrdinalReader;
+  class SpoolIterator;
+  struct OrdinalMap;
+
+  int prepare_ordinal_map();
 
   IndexProvider::Pointer acquire_provider(size_t source_index,
                                           bool validate_planned_count);
@@ -94,11 +103,16 @@ class MergedProviderIndexHolder final : public IndexHolder,
   void set_status(int status);
 
   IndexQueryMeta output_meta_{};
+  ailego::MemoryReservation source_memory_;
   std::vector<Source> sources_{};
   size_t count_{0};
   size_t filtered_count_{0};
   bool has_filter_{false};
   bool initialized_{false};
+  bool spool_vectors_{false};
+  // One immutable, optionally paged key map shared by all worker readers.
+  std::mutex ordinal_mutex_;
+  std::shared_ptr<OrdinalMap> ordinal_map_;
   std::atomic<int> status_{0};
   std::atomic<bool> *stop_flag_{nullptr};
 };

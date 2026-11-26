@@ -14,9 +14,9 @@
 #pragma once
 
 #include <memory>
-#include <numeric>
 #include <zvec/core/framework/index_builder.h>
 #include <zvec/core/framework/index_helper.h>
+#include "flat_dump_keys.h"
 #include "flat_utility.h"
 
 namespace zvec {
@@ -69,18 +69,12 @@ class FlatBuilder : public IndexBuilder {
   }
 
  protected:
-  //! Dump index keys
-  int write_keys(const std::vector<uint64_t> &keys, IndexDumper *dumper);
-
-  //! Dump index keys mapping
-  int write_mapping(const std::vector<uint64_t> &keys, IndexDumper *dumper);
-
   //! Dump index using column-major-order format
   template <typename T>
-  int write_column_index(IndexDumper *dumper, std::vector<uint64_t> *keys);
+  int write_column_index(IndexDumper *dumper, FlatDumpKeys *keys);
 
   //! Dump index using column-major-order format
-  int write_column_index(IndexDumper *dumper, std::vector<uint64_t> *keys) {
+  int write_column_index(IndexDumper *dumper, FlatDumpKeys *keys) {
     switch (IndexMeta::AlignSizeof(meta_.data_type())) {
       case 2:
         return this->write_column_index<uint16_t>(dumper, keys);
@@ -95,7 +89,7 @@ class FlatBuilder : public IndexBuilder {
   }
 
   //! Dump index using row-major-order format
-  int write_row_index(IndexDumper *dumper, std::vector<uint64_t> *keys);
+  int write_row_index(IndexDumper *dumper, FlatDumpKeys *keys);
 
  private:
   int init_impl(const IndexMeta &meta, const ailego::Params &params,

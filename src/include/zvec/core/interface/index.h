@@ -81,7 +81,31 @@ struct DenseVectorBuffer {
 };
 
 struct SparseVectorBuffer {
-  uint32_t count;
+ private:
+  // Keep capacity charged until both strings are destroyed, including copies.
+  ailego::MemoryReservation memory_;
+
+ public:
+  SparseVectorBuffer() = default;
+  SparseVectorBuffer(uint32_t count_, std::string indices_ = {},
+                     std::string values_ = {})
+      : count(count_),
+        indices(std::move(indices_)),
+        values(std::move(values_)) {}
+  explicit SparseVectorBuffer(core::IndexSparseDocument &&document) {
+    document.swap_buffers(count, indices, values, memory_);
+  }
+  SparseVectorBuffer(const SparseVectorBuffer &) = default;
+  SparseVectorBuffer(SparseVectorBuffer &&) noexcept = default;
+  SparseVectorBuffer &operator=(SparseVectorBuffer other) noexcept {
+    memory_.swap(other.memory_);
+    std::swap(count, other.count);
+    indices.swap(other.indices);
+    values.swap(other.values);
+    return *this;
+  }
+
+  uint32_t count{0};
   std::string indices;
   std::string values;
 
@@ -329,6 +353,7 @@ class ZVEC_CORE_API Index {
 
 class ZVEC_CORE_API FlatIndex : public Index {
  public:
+  BaseIndexParam::Pointer get_param() const override;
   FlatIndex() = default;
 
   // External Flat supports raw row-major FP32 L2/IP. Register IDs after

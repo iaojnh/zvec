@@ -16,6 +16,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/budgeted_heap.h>
 #include <zvec/ailego/container/heap.h>
 #include <zvec/core/framework/index_storage.h>
 
@@ -28,6 +30,47 @@ class IndexSparseDocument {
  public:
   //! Constructor
   IndexSparseDocument() = default;
+  IndexSparseDocument(const IndexSparseDocument &other)
+      : sparse_count_(other.sparse_count_) {
+    reserve_sparse_buffers(other.sparse_indices_.size(),
+                           other.sparse_values_.size());
+    sparse_indices_ = other.sparse_indices_;
+    sparse_values_ = other.sparse_values_;
+  }
+  IndexSparseDocument(IndexSparseDocument &&) noexcept = default;
+  IndexSparseDocument &operator=(IndexSparseDocument other) noexcept {
+    memory_.swap(other.memory_);
+    std::swap(sparse_count_, other.sparse_count_);
+    sparse_indices_.swap(other.sparse_indices_);
+    sparse_values_.swap(other.sparse_values_);
+    return *this;
+  }
+
+  // Public string accessors retain their standard allocator. Engine decoders
+  // must admit their capacity before filling them; retained capacity stays
+  // charged across reuse and the reservation follows copies/moves.
+  void reserve_sparse_buffers(size_t indices_bytes, size_t values_bytes) {
+    if (indices_bytes <= sparse_indices_.capacity() &&
+        values_bytes <= sparse_values_.capacity())
+      return;
+    indices_bytes = std::max(indices_bytes, sparse_indices_.size());
+    values_bytes = std::max(values_bytes, sparse_values_.size());
+    ailego::MemoryReservation replacement_memory;
+    if (indices_bytes == SIZE_MAX || values_bytes == SIZE_MAX)
+      throw std::bad_alloc();
+    replacement_memory.add_array(indices_bytes + 1, 2);
+    replacement_memory.add_array(values_bytes + 1, 2);
+    std::string indices, values;
+    indices.reserve(indices_bytes);
+    values.reserve(values_bytes);
+    indices = sparse_indices_;
+    values = sparse_values_;
+    replacement_memory.retain_at_most(indices.capacity() + values.capacity() +
+                                      2);
+    sparse_indices_.swap(indices);
+    sparse_values_.swap(values);
+    memory_.swap(replacement_memory);
+  }
 
   //! Retrieve mutable sparse count
   uint32_t *mutable_sparse_count() {
@@ -59,7 +102,17 @@ class IndexSparseDocument {
     return sparse_values_;
   }
 
+  // Transfer public string outputs together with their capacity reservation.
+  void swap_buffers(uint32_t &count, std::string &indices, std::string &values,
+                    ailego::MemoryReservation &memory) noexcept {
+    std::swap(sparse_count_, count);
+    sparse_indices_.swap(indices);
+    sparse_values_.swap(values);
+    memory_.swap(memory);
+  }
+
  private:
+  ailego::MemoryReservation memory_;
   uint32_t sparse_count_{0};
   std::string sparse_indices_{};
   std::string sparse_values_{};
@@ -320,6 +373,94 @@ class IndexDocumentHeap : public ailego::Heap<IndexDocument> {
   float threshold_{std::numeric_limits<float>::max()};
 };
 
+// Search scratch does not own vectors. Materialize IndexDocument only at the
+// result boundary, rather than carrying its payload holders in every heap slot.
+class IndexCandidate {
+ public:
+  IndexCandidate() = default;
+  IndexCandidate(uint64_t key, float score, uint32_t index = 0)
+      : key_(key), score_(score), index_(index) {}
+  uint64_t key() const {
+    return key_;
+  }
+  float score() const {
+    return score_;
+  }
+  uint32_t index() const {
+    return index_;
+  }
+  uint64_t *mutable_key() {
+    return &key_;
+  }
+  float *mutable_score() {
+    return &score_;
+  }
+  uint32_t *mutable_index() {
+    return &index_;
+  }
+  void set_key(uint64_t key) {
+    key_ = key;
+  }
+  bool operator<(const IndexCandidate &rhs) const {
+    return score_ < rhs.score_;
+  }
+  operator IndexDocument() const {
+    return IndexDocument(key_, score_, index_);
+  }
+
+ private:
+  uint64_t key_{0};
+  float score_{0};
+  uint32_t index_{0};
+};
+static_assert(sizeof(IndexCandidate) == 16,
+              "Candidate payload must stay compact");
+
+template <typename Base>
+class BasicIndexCandidateHeap : public Base {
+ public:
+  using Base::mutable_container;
+  using Container = std::remove_reference_t<
+      decltype(std::declval<Base &>().mutable_container())>;
+  BasicIndexCandidateHeap() = default;
+  explicit BasicIndexCandidateHeap(size_t max) {
+    limit(max);
+  }
+  void emplace(uint64_t key, float score, uint32_t index = 0) {
+    if (score <= threshold_) Base::emplace(key, score, index);
+  }
+  void set_threshold(float value) {
+    threshold_ = value;
+  }
+  float threshold() const {
+    return threshold_;
+  }
+  void clear() {
+    auto &items = mutable_container();
+    items.clear();
+    // Retain small scratch for the hot path, not a rare query's high-water
+    // mark.
+    if (items.capacity() > 4096) Container().swap(items);
+  }
+  void release() {
+    Container().swap(mutable_container());
+  }
+  void limit(size_t max) {
+    // Do not reserve user-supplied topk before seeing any candidates.
+    Base::limit(max, false);
+  }
+  size_t limit() const {
+    return Base::limit();
+  }
+
+ private:
+  float threshold_{std::numeric_limits<float>::max()};
+};
+
+using IndexCandidateHeap =
+    BasicIndexCandidateHeap<ailego::BudgetedHeap<IndexCandidate>>;
+using BudgetedIndexCandidateHeap = IndexCandidateHeap;
+
 class GroupIndexDocument {
  public:
   GroupIndexDocument() = default;
@@ -327,6 +468,18 @@ class GroupIndexDocument {
   GroupIndexDocument(const std::string &group_id,
                      const std::vector<IndexDocument> &docs)
       : group_id_(group_id), docs_(docs) {}
+
+  GroupIndexDocument(const GroupIndexDocument &other)
+      : group_memory_(other.group_memory_),
+        group_id_(other.group_id_),
+        docs_(other.docs_) {}
+  GroupIndexDocument(GroupIndexDocument &&) noexcept = default;
+  GroupIndexDocument &operator=(GroupIndexDocument other) noexcept {
+    group_memory_.swap(other.group_memory_);
+    group_id_.swap(other.group_id_);
+    docs_.swap(other.docs_);
+    return *this;
+  }
 
   const std::string &group_id() const {
     return group_id_;
@@ -340,15 +493,17 @@ class GroupIndexDocument {
     return &group_id_;
   }
 
+  void set_group_id(const std::string &group_id) {
+    ailego::ReserveStringCapacity(group_id_, group_memory_, group_id.size());
+    group_id_ = group_id;
+  }
+
   std::vector<IndexDocument> *mutable_docs() {
     return &docs_;
   }
 
-  void set_group_id(const std::string &group_id) {
-    group_id_ = group_id;
-  }
-
  private:
+  ailego::MemoryReservation group_memory_;
   std::string group_id_;
   std::vector<IndexDocument> docs_;
 };

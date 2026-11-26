@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/export.h>
 
 namespace zvec {
@@ -65,6 +66,21 @@ class BatchTopK {
   // Call before consuming size()/result(); further pushes and repeated finish
   // are valid. result(i) requires i < size() after finish().
   ZVEC_TURBO_API void finish();
+  // Invalidate results and release retained dynamic scratch on context reset.
+  // The next reset() selects and initializes the working layout again.
+  void release() noexcept {
+    decltype(allocated_entries_)().swap(allocated_entries_);
+    decltype(allocated_distances_)().swap(allocated_distances_);
+    decltype(allocated_ids_)().swap(allocated_ids_);
+    decltype(allocated_masks_)().swap(allocated_masks_);
+    allocated_aos_capacity_ = allocated_soa_capacity_ = 0;
+    entries_ = inline_entries_.data();
+    distances_ = inline_distances_.data();
+    ids_ = inline_ids_.data();
+    masks_ = inline_masks_.data();
+    capacity_ = limit_ = size_ = 0;
+    needs_finish_ = false;
+  }
   size_t size() const {
     return size_;
   }
@@ -88,10 +104,10 @@ class BatchTopK {
   alignas(64) std::array<float, kInlineCapacity> inline_distances_;
   alignas(64) std::array<uint64_t, kInlineCapacity> inline_ids_;
   std::array<uint32_t, kInlineCapacity / 32> inline_masks_;
-  std::unique_ptr<Candidate[]> allocated_entries_;
-  std::unique_ptr<float[]> allocated_distances_;
-  std::unique_ptr<uint64_t[]> allocated_ids_;
-  std::unique_ptr<uint32_t[]> allocated_masks_;
+  ailego::BudgetedVector<Candidate> allocated_entries_;
+  ailego::BudgetedVector<float> allocated_distances_;
+  ailego::BudgetedVector<uint64_t> allocated_ids_;
+  ailego::BudgetedVector<uint32_t> allocated_masks_;
   Candidate *entries_{inline_entries_.data()};
   float *distances_{inline_distances_.data()};
   uint64_t *ids_{inline_ids_.data()};

@@ -297,7 +297,9 @@ class PqInt8Quantizer : public Quantizer, public PrecomputeTableQuantizer {
       }
     }
 
-    bool budgeted() const { return budgeted_; }
+    bool budgeted() const {
+      return budgeted_;
+    }
     template <typename U>
     bool operator==(const ModelAllocator<U> &other) const {
       return budgeted_ == other.budgeted();

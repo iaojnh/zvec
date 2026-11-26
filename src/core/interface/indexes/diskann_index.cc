@@ -244,7 +244,7 @@ int DiskAnnIndex::open(const std::string &file_path,
   std::shared_ptr<BufferedInput> input;
   if (buffered_build) {
     input = std::make_shared<BufferedInput>(input_vector_meta_,
-                                             file_path_ + ".input");
+                                            file_path_ + ".input");
   }
   proxima_index_params_.set(core::PARAM_DISKANN_BUILDER_BUFFERED_BUILD,
                             buffered_build);
@@ -268,7 +268,8 @@ int DiskAnnIndex::generate_holder() {
     if (prepared != 0) return prepared;
     core::IndexHolder::Pointer input = buffered_input_;
     if (converter_) {
-      const int ret = core::IndexConverter::TrainAndTransform(converter_, input);
+      const int ret =
+          core::IndexConverter::TrainAndTransform(converter_, input);
       if (ret != 0) return ret;
       input = converter_->result();
       if (!input) return core::IndexError_Runtime;
@@ -330,7 +331,8 @@ int DiskAnnIndex::train() try {
   }
   return dump_and_open();
 } catch (const std::bad_alloc &) {
-  if (build_stage_ == BuildStage::kTrained) build_stage_ = BuildStage::kCollecting;
+  if (build_stage_ == BuildStage::kTrained)
+    build_stage_ = BuildStage::kCollecting;
   return core::IndexError_NoMemory;
 }
 
@@ -458,7 +460,7 @@ int DiskAnnIndex::_prepare_for_search(
 
 int DiskAnnIndex::merge(const std::vector<Index::Pointer> &indexes,
                         const IndexFilter &filter,
-                        const MergeOptions &options) {
+                        const MergeOptions &options) try {
   if (indexes.empty()) return 0;
   if (is_trained_) return core::IndexError_Unsupported;
   int ret = reset_builder();
@@ -469,6 +471,8 @@ int DiskAnnIndex::merge(const std::vector<Index::Pointer> &indexes,
   build_stage_ = BuildStage::kBuilt;
   is_trained_ = false;
   return dump_and_open();
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 #endif  // DISKANN_SUPPORTED

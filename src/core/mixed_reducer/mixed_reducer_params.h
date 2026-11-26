@@ -23,6 +23,8 @@ inline const std::string PARAM_MIXED_STREAMER_REDUCER_ENABLE_PK_REWRITE(
     "proxima.mixed.reducer.enable_pk_rewrite");
 inline const std::string PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS(
     "proxima.mixed.reducer.num_of_add_threads");
+inline const std::string PARAM_MIXED_STREAMER_REDUCER_SPOOL_VECTORS(
+    "proxima.mixed.reducer.spool_vectors");
 
 inline const std::string PARAM_MIXED_REDUCER_WORKING_PATH(
     "proxima.mixed.reducer.working_path");

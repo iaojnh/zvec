@@ -287,13 +287,17 @@ template <class T>
 int PqInt8Quantizer::train_buffered(const IndexHolder::Pointer &holder,
                                     size_t num) {
   const PqBufferedTrainingOptions options{
-      "PqInt8Quantizer", original_dim_,
+      "PqInt8Quantizer",
+      original_dim_,
       ailego::BudgetedVector<uint32_t>(chunk_offsets_.begin(),
                                        chunk_offsets_.end()),
       kNumCentroids,
-      kMaxTrainVectors,  kMaxKmeansIters,
-      thread_count_,     markov_chain_length_,
-      epsilon_,          meta_.metric_name() == "Cosine",
+      kMaxTrainVectors,
+      kMaxKmeansIters,
+      thread_count_,
+      markov_chain_length_,
+      epsilon_,
+      meta_.metric_name() == "Cosine",
       use_zero_mean_};
   return TrainPqBuffered<T>(
       holder, num, options, centroids_, centroid_, opq_,
@@ -499,7 +503,7 @@ void PqInt8Quantizer::build_centroid_ptrs_cache() {
 
   centroid_ptrs_cache_.resize(
       num_chunk_, ModelVector<const void *>(
-                       ModelAllocator<const void *>(buffered_training_)));
+                      ModelAllocator<const void *>(buffered_training_)));
   for (uint32_t m = 0; m < num_chunk_; ++m) {
     const size_t d = chunk_dim(m);
     const size_t offset = chunk_offsets_[m];
@@ -1135,8 +1139,7 @@ DistanceImpl PqInt8Quantizer::distance(const void *query,
 
   // The query is already quantized (LUT) by the caller; copy it directly.
   size_t lut_bytes = quantized_query_vector_length();
-  std::string lut_storage(static_cast<const char *>(query),
-                                     lut_bytes);
+  std::string lut_storage(static_cast<const char *>(query), lut_bytes);
 
   return DistanceImpl(std::move(adc_func), std::move(batch_func),
                       std::move(lut_storage), static_cast<size_t>(num_chunk_));
@@ -1151,11 +1154,10 @@ DistanceImpl PqInt8Quantizer::sym_distance(const void *query,
                                  float *out) {
       *out = calc_distance_dp_dp(a, b);
     };
-    return DistanceImpl(
-        std::move(direct),
-        std::string(static_cast<const char *>(query),
-                               quantized_datapoint_vector_length()),
-        static_cast<size_t>(num_chunk_));
+    return DistanceImpl(std::move(direct),
+                        std::string(static_cast<const char *>(query),
+                                    quantized_datapoint_vector_length()),
+                        static_cast<size_t>(num_chunk_));
   }
 
   // SDC kernel needs a lambda: 5 parameters (extra dist_table pointer)
@@ -1175,8 +1177,7 @@ DistanceImpl PqInt8Quantizer::sym_distance(const void *query,
   // The query is a PQ code (uint8_t[num_chunk]), NOT a LUT: SDC compares two
   // PQ codes via the centroid-to-centroid dist_table_.
   size_t code_bytes = quantized_datapoint_vector_length();
-  std::string code_storage(static_cast<const char *>(query),
-                                      code_bytes);
+  std::string code_storage(static_cast<const char *>(query), code_bytes);
 
   BatchDistanceFunc batch_func;
   if (batch_sdc_fn_ && !paged_dist_table_) {

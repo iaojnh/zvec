@@ -189,8 +189,11 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
     }
   }
 
-  void run_lifecycle(bool fp16, bool merge, bool pressure) {
-    const uint32_t dimension = pressure ? 768 : 32;
+  void run_lifecycle(bool fp16, bool merge, bool pressure,
+                     bool diskann_source = false) {
+    uint32_t dimension = pressure ? 768 : 32;
+    // Force the non-Flat merge snapshot past its 64 KiB inline limit.
+    if (diskann_source) dimension = 128;
     const uint32_t count = pressure ? 1024 : kDocCount;
     const auto values = BuildValues(count, dimension);
     const auto path = (directory_ / "target.index").string();
@@ -234,7 +237,8 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
                             .with_metric_type(MetricType::kL2sq)
                             .with_data_type(DataType::DT_FP32)
                             .build();
-      source = IndexFactory::CreateAndInitIndex(*flat_param);
+      source = IndexFactory::CreateAndInitIndex(
+          diskann_source ? *param : *flat_param);
       ASSERT_NE(source, nullptr);
       ASSERT_EQ(source->open(source_path,
                              {StorageOptions::StorageType::kBufferPool, true}),
@@ -242,6 +246,7 @@ class DiskAnnBufferedBuildTest : public ::testing::Test {
     }
     ASSERT_NO_FATAL_FAILURE(
         add_all(merge ? source : target, values, dimension));
+    if (diskann_source) ASSERT_EQ(0, source->train());
     ASSERT_EQ(
         merge ? target->merge({source}, {}, {2, nullptr}) : target->train(), 0);
     if (pressure) EXPECT_LE(pool.used(), pool_budget_);
@@ -300,6 +305,45 @@ TEST_F(DiskAnnBufferedBuildTest, MergedBuildSurvivesPagePressure) {
     SCOPED_TRACE(fp16);
     ASSERT_NO_FATAL_FAILURE(run_lifecycle(fp16, true, true));
   }
+}
+
+TEST_F(DiskAnnBufferedBuildTest, MergedDiskAnnSourcePreservesFp16Vectors) {
+  ASSERT_NO_FATAL_FAILURE(run_lifecycle(true, true, false, true));
+}
+
+TEST_F(DiskAnnBufferedBuildTest, MergeReportsRssRefusalAndRetries) {
+  constexpr uint32_t dimension = 32;
+  auto flat = FlatIndexParamBuilder()
+                  .with_dimension(dimension)
+                  .with_metric_type(MetricType::kL2sq)
+                  .with_data_type(DataType::DT_FP32)
+                  .build();
+  auto source = IndexFactory::CreateAndInitIndex(*flat);
+  auto target = IndexFactory::CreateAndInitIndex(*BuildParam(false, dimension));
+  ASSERT_NE(source, nullptr);
+  ASSERT_NE(target, nullptr);
+  using Storage = StorageOptions::StorageType;
+  ASSERT_EQ(0, source->open((directory_ / "merge-src.index").string(),
+                           {Storage::kBufferPool, true}));
+  ASSERT_EQ(0, target->open((directory_ / "merge-dst.index").string(),
+                           {Storage::kBufferPool, true}));
+  const auto values = BuildValues(kDocCount, dimension);
+  ASSERT_NO_FATAL_FAILURE(add_all(source, values, dimension));
+  ASSERT_EQ(0, source->flush());
+
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t previous_limit = pool.process_rss_limit();
+  auto restore = ailego::ScopeGuard::Make([&] {
+    EXPECT_TRUE(pool.configure_process_rss_limit(previous_limit));
+  });
+  ASSERT_TRUE(pool.configure_process_rss_limit(1));
+  EXPECT_EQ(core::IndexError_NoMemory, target->merge({source}, {}, {2, nullptr}));
+  EXPECT_FALSE(target->is_trained());
+  ASSERT_TRUE(pool.configure_process_rss_limit(previous_limit));
+  ASSERT_EQ(0, target->merge({source}, {}, {2, nullptr}));
+  ASSERT_NO_FATAL_FAILURE(fetch_all(target, values, dimension, false));
+  ASSERT_EQ(0, target->close());
+  ASSERT_EQ(0, source->close());
 }
 
 TEST_F(DiskAnnBufferedBuildTest, InputAdmissionFailureCanRetry) {
