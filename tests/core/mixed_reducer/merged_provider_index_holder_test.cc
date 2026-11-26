@@ -1486,6 +1486,7 @@ class GeneratedSpoolProvider final : public IndexProvider {
  public:
   static constexpr size_t kRows = 8192;
   static constexpr size_t kColumns = 256;
+  static constexpr size_t kPayload = kRows * kColumns * sizeof(float);
   explicit GeneratedSpoolProvider(std::shared_ptr<size_t> reads)
       : reads_(std::move(reads)) {}
   class Iterator final : public IndexHolder::Iterator {
@@ -1526,9 +1527,22 @@ class GeneratedSpoolProvider final : public IndexProvider {
   std::shared_ptr<size_t> reads_;
 };
 
+size_t GeneratedSpoolBudget() {
+  const size_t page = ailego::PoolPayloadBudget::page_buffer_size();
+  const size_t data_pages = (GeneratedSpoolProvider::kPayload + page - 1) / page;
+  // A writable spool keeps backend staging and directory metadata. The
+  // bounded key map and active payload pages also need space.
+  const size_t metadata =
+      ailego::PoolPayloadBudget::storage_metadata_bytes(data_pages + 8);
+  const size_t key_bytes = GeneratedSpoolProvider::kRows * sizeof(uint64_t);
+  return std::max<size_t>(2UL << 20, metadata + key_bytes + 8 * page);
+}
+
 TEST(MergedProviderIndexHolderTest, PageableSpoolReadsSourceOnceAcrossPasses) {
   RestoreSpoolTestBudget restore;
-  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(2UL << 20));
+  const size_t budget = GeneratedSpoolBudget();
+  ASSERT_LT(budget, GeneratedSpoolProvider::kPayload);
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(budget));
   auto reads = std::make_shared<size_t>(0);
   auto lifetime = std::make_shared<ProviderLifetimeStats>();
   auto streamer = std::make_shared<TestStreamer>(
@@ -1541,13 +1555,11 @@ TEST(MergedProviderIndexHolderTest, PageableSpoolReadsSourceOnceAcrossPasses) {
       source.provider_meta, {source}, {}, true);
   ASSERT_EQ(0, holder.init({}));
   const size_t planned_reads = *reads;
-  // The 8MiB payload exceeds the 2MiB page/workspace budget. The source
+  // The 8 MiB payload exceeds the page/workspace budget. The source
   // generator owns just one transient row; the snapshot must be pageable.
-  static_assert(GeneratedSpoolProvider::kRows *
-                    GeneratedSpoolProvider::kColumns * sizeof(float) > (2UL << 20));
   for (size_t pass = 0; pass < 3; ++pass) {
     auto iter = holder.create_iterator();
-    ASSERT_NE(nullptr, iter);
+    ASSERT_NE(nullptr, iter) << IndexError::What(holder.status());
     size_t ordinal = 0;
     for (; iter->is_valid(); iter->next(), ++ordinal) {
       EXPECT_EQ(ordinal, iter->key());
@@ -1718,7 +1730,9 @@ TEST(MergedProviderIndexHolderTest, PageableSpoolDoesNotFallbackWhenBudgetFull) 
 
 TEST(MergedProviderIndexHolderTest, BudgetedReducerSelectsSpoolForRebuilds) {
   RestoreSpoolTestBudget restore;
-  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(2UL << 20));
+  const size_t budget = GeneratedSpoolBudget();
+  ASSERT_LT(budget, GeneratedSpoolProvider::kPayload);
+  ASSERT_EQ(0, ailego::PoolPayloadBudget::get_instance().init(budget));
   for (bool enable_spool : {false, true}) {
     for (const auto *name : {"IVFBuilder", "DiskAnnBuilder", "IvfRabitqBuilder"}) {
       auto reads = std::make_shared<size_t>(0);

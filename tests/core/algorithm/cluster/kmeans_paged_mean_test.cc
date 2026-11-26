@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <cstring>
 #include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
@@ -112,9 +113,11 @@ TEST_F(KmeansPagedMeanTest, OptKmeansLabelBorrowsCentroidsUnderPressure) {
 TEST_F(KmeansPagedMeanTest,
        ExactStateSurvivesEvictionForNumericAndPackedMeans) {
   auto &pool = ailego::PoolPayloadBudget::get_instance();
+  constexpr size_t rows = 4096;
+  const size_t page_headroom = 4 * pool.page_buffer_size();
   ASSERT_EQ(pool.init(ailego::PoolPayloadBudget::storage_metadata_bytes(
-                          4096) +
-                      64 * 1024),
+                          rows) +
+                      64 * 1024 + page_headroom),
             0);
   std::vector<std::shared_ptr<VectorMean>> means{
       std::make_shared<NumericalVectorMean<float>>(16),
@@ -140,10 +143,11 @@ TEST_F(KmeansPagedMeanTest,
     std::vector<uint8_t> expected(mean.state_size()), scratch;
     mean.save_state(expected.data());
     PagedMeanTable table;
-    ASSERT_EQ(table.init(4096, mean), 0);
-    for (size_t i = 0; i < 4096; ++i)
+    ASSERT_EQ(table.init(rows, mean), 0);
+    for (size_t i = 0; i < rows; ++i)
       ASSERT_EQ(table.write(i, mean, &scratch), 0);
-    for (size_t i = 0; i < 4096; i += 17) {
+    EXPECT_LT(pool.stats().page_used, rows * mean.state_size());
+    for (size_t i = 0; i < rows; i += 17) {
       mean.reset();
       ASSERT_EQ(table.read(i, &mean, &scratch), 0);
       EXPECT_EQ(scratch, expected);
@@ -169,9 +173,10 @@ TEST_F(KmeansPagedMeanTest, FixedCentroidsMatchHeapAndReleasePool) {
     auto &pool = ailego::PoolPayloadBudget::get_instance();
     const size_t budget_bytes =
         2 * ailego::PoolPayloadBudget::storage_metadata_bytes(4096) +
-        // Keep 64 KiB for pages after admitting the newly charged worker
-        // rows and initialization tile; the means still exceed resident pages.
-        64 * 1024 + (kDimension * 40 + 256) + 64 * 1024 +
+        // Budget live pages at the platform's page size, in addition to the
+        // worker rows and initialization tile.
+        std::max<size_t>(64 * 1024, 8 * pool.page_buffer_size()) +
+        (kDimension * 40 + 256) + 64 * 1024 +
         // The retained centers now keep their own capacity reservation.
         64 * (meta.element_size() + 64);
     for (size_t budget : {size_t{0}, budget_bytes}) {
