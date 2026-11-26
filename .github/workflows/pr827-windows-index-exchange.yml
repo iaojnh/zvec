@@ -1,0 +1,152 @@
+name: PR827 Windows index exchange
+
+on:
+  push:
+    branches: [codex/verify-pr827-windows-portability-20261126]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PRODUCTION_SHA: ae3c1afa7d9658debf6876bb159e15b442dfb35f
+  OPENBLAS_NUM_THREADS: '1'
+  OMP_NUM_THREADS: '2'
+  SCCACHE_GHA_ENABLED: 'true'
+
+jobs:
+  native:
+    name: Native build and indexes (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: windows, runner: windows-2022}
+          - {name: macos, runner: macos-15}
+          - {name: linux, runner: ubuntu-24.04}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 16
+      - name: Verify production source revision
+        shell: bash
+        run: |
+          git diff --exit-code "$PRODUCTION_SHA" HEAD -- src python thirdparty cmake CMakeLists.txt pyproject.toml
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          disable_annotations: true
+      - name: Install build tools
+        run: python -m pip install cmake==3.30.0 ninja==1.11.1 pybind11==3.0.0 scikit-build-core setuptools_scm numpy==2.2.6
+      - name: Build exact-source wheel
+        env:
+          CMAKE_GENERATOR: Ninja
+          CMAKE_BUILD_PARALLEL_LEVEL: '4'
+        run: python -m pip wheel . --no-deps --no-build-isolation --wheel-dir wheels --config-settings=cmake.define.CMAKE_C_COMPILER_LAUNCHER=sccache --config-settings=cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=sccache
+      - name: Install native wheel
+        shell: bash
+        run: python -m pip install wheels/*.whl
+      - name: Generate native indexes and references
+        id: verify
+        continue-on-error: true
+        run: python scripts/verify_windows_index_exchange.py native --os ${{ matrix.name }} --root exchange-native
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: native-${{ matrix.name }}
+          path: |
+            wheels/*.whl
+            exchange-native/out/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Check native results
+        if: steps.verify.outcome != 'success'
+        run: python -c "raise SystemExit('Native validation failed; artifacts retain evidence')"
+
+  exchange:
+    name: Receive foreign indexes (${{ matrix.name }})
+    needs: native
+    if: always()
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: windows, runner: windows-2022}
+          - {name: macos, runner: macos-15}
+          - {name: linux, runner: ubuntu-24.04}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: native-*
+          path: bundles
+      - name: Install matching native runtime
+        shell: bash
+        run: python -m pip install numpy==2.2.6 bundles/native-${{ matrix.name }}/wheels/*.whl
+      - name: Read, mutate and reopen foreign indexes
+        id: verify
+        continue-on-error: true
+        run: python scripts/verify_windows_index_exchange.py exchange --os ${{ matrix.name }} --root exchange-receiver --bundles bundles
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mutated-by-${{ matrix.name }}
+          path: exchange-receiver/out/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Check exchange results
+        if: steps.verify.outcome != 'success'
+        run: python -c "raise SystemExit('Exchange validation failed; artifacts retain evidence')"
+
+  returned:
+    name: Reopen returned indexes (${{ matrix.name }})
+    needs: [native, exchange]
+    if: always()
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: windows, runner: windows-2022}
+          - {name: macos, runner: macos-15}
+          - {name: linux, runner: ubuntu-24.04}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v8
+        with:
+          path: bundles
+      - name: Install matching native runtime
+        shell: bash
+        run: python -m pip install numpy==2.2.6 bundles/native-${{ matrix.name }}/wheels/*.whl
+      - name: Verify mutations after returning to origin OS
+        id: verify
+        continue-on-error: true
+        run: python scripts/verify_windows_index_exchange.py return --os ${{ matrix.name }} --root exchange-return --bundles bundles
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: return-${{ matrix.name }}
+          path: exchange-return/out/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Check return results
+        if: steps.verify.outcome != 'success'
+        run: python -c "raise SystemExit('Return validation failed; artifacts retain evidence')"
