@@ -18,6 +18,7 @@
 #include <parquet/arrow/reader.h>
 #include "db/common/constants.h"
 #include "parquet_buffer_pool.h"
+#include "parquet_memory_pool.h"
 
 
 namespace zvec {
@@ -116,7 +117,9 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
     return projected_schema_;
   }
 
-  arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override {
+  arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *batch) override try {
+    batch->reset();
+    auto *pool = detail::GetParquetQueryMemoryPool().get();
     if (current_row_group_ >= num_row_groups_) {
       return arrow::Status::OK();
     }
@@ -129,14 +132,15 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
       for (size_t col_idx = 0; col_idx < col_indices_.size(); ++col_idx) {
         auto buffer_id =
             ParquetBufferID(file_path_, col_indices_[col_idx], rg_id);
-        auto buffer_handle =
-            ParquetBufferPool::get_instance().acquire_buffer(buffer_id);
+        ARROW_ASSIGN_OR_RAISE(
+            auto buffer_handle,
+            ParquetBufferPool::get_instance().acquire_buffer_checked(buffer_id));
         std::shared_ptr<arrow::ChunkedArray> col_chunked_array =
             buffer_handle.data();
         if (col_chunked_array) {
           std::shared_ptr<arrow::Array> concat;
           auto concat_result = arrow::Concatenate(col_chunked_array->chunks(),
-                                                  arrow::default_memory_pool());
+                                                  pool);
           if (!concat_result.ok()) {
             return concat_result.status();
           }
@@ -151,7 +155,7 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
       for (size_t i = 0; i < col_indices_.size(); ++i) {
         std::shared_ptr<arrow::Array> concat;
         auto concat_result = arrow::Concatenate(rg_table->column(i)->chunks(),
-                                                arrow::default_memory_pool());
+                                                pool);
         if (!concat_result.ok()) {
           return concat_result.status();
         }
@@ -164,6 +168,8 @@ class ParquetRecordBatchReader : public arrow::RecordBatchReader {
         arrow::RecordBatch::Make(projected_schema_, num_rows_in_rg, chunks);
     current_row_group_++;
     return arrow::Status::OK();
+  } catch (const std::bad_alloc &) {
+    return arrow::Status::OutOfMemory("Parquet scan allocation refused");
   }
 
  private:

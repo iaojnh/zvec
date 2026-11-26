@@ -25,6 +25,8 @@
 #include "db/index/storage/store_helper.h"
 #include "lazy_record_batch_reader.h"
 #include "parquet_buffer_pool.h"
+#include "parquet_memory_pool.h"
+#include "db/common/managed_arrow.h"
 
 
 namespace zvec {
@@ -33,6 +35,8 @@ BufferPoolForwardStore::BufferPoolForwardStore(const std::string &uri)
     : file_path_(uri) {}
 
 Status BufferPoolForwardStore::open() {
+  auto budget = detail::ConfigureManagedDbRss();
+  if (!budget.ok()) return detail::ArrowQueryError(budget);
   std::string uri = file_path_;
   auto status = CreateRandomAccessFileByUri(uri, &file_, &file_path_);
   if (!status.ok()) {
@@ -43,6 +47,7 @@ Status BufferPoolForwardStore::open() {
   if (format == FileFormat::PARQUET) {
     status = open_parquet(file_);
     if (!status.ok()) {
+      if (status.IsOutOfMemory()) return detail::ArrowQueryError(status);
       return Status::InternalError("Failed to open parquet file: ", file_path_,
                                    " : ", status.ToString());
     }
@@ -53,10 +58,9 @@ Status BufferPoolForwardStore::open() {
 }
 arrow::Status BufferPoolForwardStore::open_parquet(
     const std::shared_ptr<arrow::io::RandomAccessFile> &file) {
-  auto parquet_file_reader = parquet::ParquetFileReader::Open(file);
-  ARROW_RETURN_NOT_OK(parquet::arrow::FileReader::Make(
-      arrow::default_memory_pool(), std::move(parquet_file_reader),
-      &parquet_reader_));
+  ARROW_ASSIGN_OR_RAISE(
+      parquet_reader_, detail::OpenManagedParquetReader(
+                           file, detail::GetParquetMemoryPool().get()));
 
   auto parquet_metadata = parquet_reader_->parquet_reader()->metadata();
   num_rows_ = parquet_metadata->num_rows();
@@ -192,8 +196,13 @@ TablePtr BufferPoolForwardStore::fetch(const std::vector<std::string> &columns,
     for (size_t i = 0; i < col_indices.size(); ++i) {
       int col_idx = col_indices[i];
       auto buffer_id = ParquetBufferID(file_path_, col_idx, rg_id);
-      auto buffer_handle =
-          ParquetBufferPool::get_instance().acquire_buffer(buffer_id);
+      auto acquired = ParquetBufferPool::get_instance().acquire_buffer_checked(buffer_id);
+      if (!acquired.ok()) {
+        if (acquired.status().IsOutOfMemory()) throw std::bad_alloc();
+        LOG_ERROR("Parquet read failed: %s", acquired.status().ToString().c_str());
+        return nullptr;
+      }
+      auto &buffer_handle = *acquired;
       std::shared_ptr<arrow::ChunkedArray> col_chunked_array =
           buffer_handle.data();
       if (!col_chunked_array) {
@@ -222,9 +231,11 @@ TablePtr BufferPoolForwardStore::fetch(const std::vector<std::string> &columns,
         }
         auto scalar_result = col_chunked_array->GetScalar(local_idx);
         if (!scalar_result.ok()) {
+          if (scalar_result.status().IsOutOfMemory()) throw std::bad_alloc();
           LOG_ERROR("Failed to get scalar for row %zu status: %s",
                     (size_t)local_idx,
                     scalar_result.status().ToString().c_str());
+          return nullptr;
         }
         dst.emplace_back(tmp_output_row, std::move(scalar_result.ValueOrDie()));
       }
@@ -242,8 +253,10 @@ TablePtr BufferPoolForwardStore::fetch(const std::vector<std::string> &columns,
     }
 
     std::shared_ptr<arrow::Array> arr;
-    auto status = ConvertScalarVectorToArrayByType(ordered_scalars, &arr);
+    auto status = ConvertScalarVectorToArrayByType(ordered_scalars, &arr,
+                                           detail::GetParquetQueryMemoryPool().get());
     if (!status.ok()) {
+      if (status.IsOutOfMemory()) throw std::bad_alloc();
       LOG_ERROR("ConvertScalarVectorToArrayByType failed: %s",
                 status.message().c_str());
       return nullptr;
@@ -263,8 +276,11 @@ TablePtr BufferPoolForwardStore::fetch(const std::vector<std::string> &columns,
 
     // Create UInt64Array
     auto buffer_result = arrow::AllocateBuffer(values.size() * sizeof(uint64_t),
-                                               arrow::default_memory_pool());
-    if (!buffer_result.ok()) return nullptr;
+                                               detail::GetParquetQueryMemoryPool().get());
+    if (!buffer_result.ok()) {
+      if (buffer_result.status().IsOutOfMemory()) throw std::bad_alloc();
+      return nullptr;
+    }
     auto buffer = std::move(buffer_result.ValueOrDie());
     std::memcpy(buffer->mutable_data(), values.data(),
                 values.size() * sizeof(uint64_t));
@@ -318,8 +334,13 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
   for (size_t i = 0; i < col_indices.size(); ++i) {
     int col_idx = col_indices[i];
     auto buffer_id = ParquetBufferID(file_path_, col_idx, rg_id);
-    auto buffer_handle =
-        ParquetBufferPool::get_instance().acquire_buffer(buffer_id);
+    auto acquired = ParquetBufferPool::get_instance().acquire_buffer_checked(buffer_id);
+    if (!acquired.ok()) {
+      if (acquired.status().IsOutOfMemory()) throw std::bad_alloc();
+      LOG_ERROR("Parquet read failed: %s", acquired.status().ToString().c_str());
+      return nullptr;
+    }
+    auto &buffer_handle = *acquired;
     std::shared_ptr<arrow::ChunkedArray> col_chunked_array =
         buffer_handle.data();
 
@@ -339,8 +360,9 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
       continue;
     }
     auto concat_result = arrow::Concatenate(col_chunked_array->chunks(),
-                                            arrow::default_memory_pool());
+                                            detail::GetParquetQueryMemoryPool().get());
     if (!concat_result.ok()) {
+      if (concat_result.status().IsOutOfMemory()) throw std::bad_alloc();
       LOG_ERROR("Concatenate failed for file: %s, column: %d, row_group: %d",
                 file_path_.c_str(), col_idx, rg_id);
       return nullptr;
@@ -348,8 +370,10 @@ ExecBatchPtr BufferPoolForwardStore::fetch(
     auto concat = concat_result.ValueOrDie();
     auto scalar_result = concat->GetScalar(index - offset);
     if (!scalar_result.ok()) {
+      if (scalar_result.status().IsOutOfMemory()) throw std::bad_alloc();
       LOG_ERROR("Failed to get scalar for row %zu status: %s", (size_t)offset,
                 scalar_result.status().ToString().c_str());
+      return nullptr;
     }
 
     scalars.emplace_back(std::move(scalar_result.ValueOrDie()));
@@ -364,16 +388,14 @@ RecordBatchReaderPtr BufferPoolForwardStore::scan(
     return nullptr;
   }
 
-  // Create a new parquet reader for scanning
-  std::unique_ptr<parquet::arrow::FileReader> parquet_reader;
-  auto parquet_file_reader = parquet::ParquetFileReader::Open(file_);
-  auto status = parquet::arrow::FileReader::Make(arrow::default_memory_pool(),
-                                                 std::move(parquet_file_reader),
-                                                 &parquet_reader);
-  if (!status.ok()) {
-    LOG_ERROR("Failed to create parquet reader: %s", status.message().c_str());
+  auto reader = detail::OpenManagedParquetReader(
+      file_, detail::GetParquetMemoryPool().get());
+  if (!reader.ok()) {
+    if (reader.status().IsOutOfMemory()) throw std::bad_alloc();
+    LOG_ERROR("Failed to create parquet reader: %s", reader.status().ToString().c_str());
     return nullptr;
   }
+  auto parquet_reader = std::move(*reader);
 
   return std::make_shared<ParquetRecordBatchReader>(parquet_reader, columns,
                                                     physic_schema_, file_path_);

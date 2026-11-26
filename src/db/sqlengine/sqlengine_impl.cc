@@ -20,6 +20,7 @@
 #include <zvec/db/index_params.h>
 #include <zvec/db/type.h>
 #include "db/common/constants.h"
+#include "db/common/managed_arrow.h"
 #include "db/index/column/fts_column/fts_ast_rewriter.h"
 #include "db/index/column/fts_column/fts_pipeline.h"
 #include "db/index/column/fts_column/fts_query_ast.h"
@@ -337,7 +338,7 @@ Result<QueryInfo::Ptr> SQLEngineImpl::build_query_info(
 Result<std::unique_ptr<arrow::RecordBatchReader>>
 SQLEngineImpl::search_by_query_info(
     CollectionSchema::Ptr collection, const std::vector<Segment::Ptr> &segments,
-    std::vector<sqlengine::QueryInfo::Ptr> *query_infos) {
+    std::vector<sqlengine::QueryInfo::Ptr> *query_infos) try {
   global_init();
 
   ScopedProfilerStage stage_guard(profiler_, "build_query_plan");
@@ -350,6 +351,9 @@ SQLEngineImpl::search_by_query_info(
   }
   // LOG_DEBUG("plan_info: [%s]", plan_info->to_string().c_str());
   return plan_info.value()->execute_to_reader();
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(
+      Status(StatusCode::RESOURCE_EXHAUSTED, "Query plan exceeds memory budget"));
 }
 
 #define GET_FIELD_FROM_RECORD_BATCH(res, field_name)                    \
@@ -538,6 +542,9 @@ Result<DocPtrList> SQLEngineImpl::fill_result(
   while (true) {
     auto read_res = reader->ReadNext(&record_batch);
     if (!read_res.ok()) {
+      if (read_res.IsOutOfMemory()) {
+        return tl::make_unexpected(detail::ArrowQueryError(read_res));
+      }
       return tl::make_unexpected(
           Status::InternalError("Read next record batch failed (fill_result): ",
                                 read_res.ToString()));
@@ -571,6 +578,9 @@ Result<GroupResults> SQLEngineImpl::fill_group_by_result(
   while (true) {
     auto read_res = reader->ReadNext(&record_batch);
     if (!read_res.ok()) {
+      if (read_res.IsOutOfMemory()) {
+        return tl::make_unexpected(detail::ArrowQueryError(read_res));
+      }
       return tl::make_unexpected(Status::InternalError(
           "Read next record batch failed (group_by): ", read_res.ToString()));
     }

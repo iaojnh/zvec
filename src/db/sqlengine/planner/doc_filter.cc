@@ -17,6 +17,7 @@
 #include <arrow/acero/exec_plan.h>
 #include <arrow/table.h>
 #include <zvec/ailego/logger/logger.h>
+#include "db/common/managed_arrow.h"
 #include "db/sqlengine/planner/invert_search.h"
 
 namespace zvec::sqlengine {
@@ -38,10 +39,21 @@ Status DocFilter::compute_filter() {
   }
 
   if (forward_plan_) {
-    auto forward_result = arrow::acero::DeclarationToTable(*forward_plan_);
+    auto declaration = *forward_plan_;
+    arrow::acero::QueryOptions options;
+    if (segment_->uses_buffer_storage()) {
+      // This filter may run on a managed CPU worker. Use that caller for CPU
+      // continuations rather than waiting for work queued on the same pool.
+      auto managed = detail::ManagedArrowOptions(segment_->query_memory_pool(),
+                                                  /*use_threads=*/false);
+      if (!managed.ok()) return detail::ArrowQueryError(managed.status());
+      options = *managed;
+      detail::BindManagedArrowIo(declaration, options.custom_io_executor);
+    }
+    auto forward_result =
+        arrow::acero::DeclarationToTable(std::move(declaration), options);
     if (!forward_result.ok()) {
-      return Status::InternalError("Execute filter bitmap failed: ",
-                                   forward_result.status().ToString());
+      return detail::ArrowQueryError(forward_result.status());
     }
     // has only one column with boolean type
     auto &forward_table = forward_result.ValueUnsafe();
@@ -189,9 +201,11 @@ std::optional<bool> DocFilter::is_matched_by_forward_filter(uint64_t id) const {
     LOG_ERROR("Fetch forward failed, id[%zu]", (size_t)id);
     return std::nullopt;
   }
+  arrow::compute::ExecContext context(segment_->query_memory_pool());
   auto maybe_result = arrow::compute::ExecuteScalarExpression(
-      *forward_filter_expr_, *exec_batch);
+      *forward_filter_expr_, *exec_batch, &context);
   if (!maybe_result.ok()) {
+    if (maybe_result.status().IsOutOfMemory()) throw std::bad_alloc();
     LOG_ERROR("Execute scalar expression failed, id[%zu] err[%s]", (size_t)id,
               maybe_result.status().ToString().c_str());
     return std::nullopt;

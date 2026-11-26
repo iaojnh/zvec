@@ -2199,7 +2199,7 @@ Result<GroupResults> CollectionImpl::group_by_query(
 Result<DocPtrMap> CollectionImpl::fetch(
     const std::vector<std::string> &pks,
     const std::optional<std::vector<std::string>> &output_fields,
-    bool include_vector) const {
+    bool include_vector) const try {
   std::shared_lock lock(schema_handle_mtx_);
 
   CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
@@ -2230,6 +2230,9 @@ Result<DocPtrMap> CollectionImpl::fetch(
   }
 
   return results;
+} catch (const std::bad_alloc &) {
+  return tl::make_unexpected(
+      Status(StatusCode::RESOURCE_EXHAUSTED, "Fetch exceeds shared memory budget"));
 }
 
 Result<std::string> CollectionImpl::debug_get_hnsw_storage_mode(

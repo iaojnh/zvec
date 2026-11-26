@@ -28,8 +28,12 @@ class PlanInfo {
   using Ptr = std::shared_ptr<PlanInfo>;
 
   PlanInfo(arrow::acero::Declaration plan,
-           std::shared_ptr<arrow::Schema> schema)
-      : plan_(std::move(plan)), schema_(std::move(schema)) {}
+           std::shared_ptr<arrow::Schema> schema, bool managed = false,
+           bool reads_segment_plans = false)
+      : plan_(std::move(plan)),
+        schema_(std::move(schema)),
+        managed_(managed),
+        reads_segment_plans_(reads_segment_plans) {}
 
   Result<std::unique_ptr<arrow::RecordBatchReader>> execute_to_reader();
 
@@ -40,6 +44,8 @@ class PlanInfo {
  private:
   arrow::acero::Declaration plan_;
   std::shared_ptr<arrow::Schema> schema_;
+  bool managed_;
+  bool reads_segment_plans_;
 };
 
 }  // namespace zvec::sqlengine

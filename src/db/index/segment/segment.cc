@@ -56,6 +56,7 @@
 #include "db/index/segment/segment_helper.h"
 #include "db/index/storage/base_forward_store.h"
 #include "db/index/storage/bufferpool_forward_store.h"
+#include "db/index/storage/parquet_memory_pool.h"
 #include "db/index/storage/memory_forward_store.h"
 #include "db/index/storage/mmap_forward_store.h"
 #include "db/index/storage/store_helper.h"
@@ -65,6 +66,12 @@
 #include "sql_expr_parser.h"
 
 namespace zvec {
+
+arrow::MemoryPool *Segment::query_memory_pool() const {
+  return uses_buffer_storage() ? detail::GetParquetQueryMemoryPool().get()
+                               : arrow::default_memory_pool();
+}
+
 
 void global_init() {
   static std::once_flag once;
@@ -280,6 +287,8 @@ class SegmentImpl : public Segment,
   Status drop_column(const std::string &column_name) override;
 
  public:
+  bool uses_buffer_storage() const override { return !options_.enable_mmap_; }
+
   Status Open(const SegmentOptions &options);
   Status create(const SegmentOptions &options, uint64_t min_doc_id);
 
@@ -2612,8 +2621,9 @@ TablePtr SegmentImpl::fetch_normal(
 
       auto chunked_array = block_table->column(i)->chunks();
       auto flat_array_res =
-          arrow::Concatenate(chunked_array, arrow::default_memory_pool());
+          arrow::Concatenate(chunked_array, query_memory_pool());
       if (!flat_array_res.ok()) {
+        if (flat_array_res.status().IsOutOfMemory()) throw std::bad_alloc();
         LOG_ERROR("Concatenate failed: %s",
                   flat_array_res.status().message().c_str());
         return nullptr;
@@ -2664,8 +2674,9 @@ TablePtr SegmentImpl::fetch_normal(
     }
 
     auto status = ConvertScalarVectorToArrayByType(ordered_scalars,
-                                                   &result_arrays[col_index]);
+                                                   &result_arrays[col_index], query_memory_pool());
     if (!status.ok()) {
+      if (status.IsOutOfMemory()) throw std::bad_alloc();
       LOG_ERROR("Failed to convert scalars to array for column '%s': %s",
                 col.c_str(), status.message().c_str());
       return nullptr;
@@ -2681,15 +2692,17 @@ TablePtr SegmentImpl::fetch_normal(
       values.push_back(segment_row_id);
     }
 
-    arrow::UInt64Builder builder;
+    arrow::UInt64Builder builder(query_memory_pool());
     auto s = builder.AppendValues(values);
     if (!s.ok()) {
+      if (s.IsOutOfMemory()) throw std::bad_alloc();
       LOG_ERROR("Failed to append values to builder: %s", s.message().c_str());
       return nullptr;
     }
     std::shared_ptr<arrow::Array> array;
     s = builder.Finish(&array);
     if (!s.ok()) {
+      if (s.IsOutOfMemory()) throw std::bad_alloc();
       LOG_ERROR("Failed to finish builder: %s", s.message().c_str());
       return nullptr;
     }
