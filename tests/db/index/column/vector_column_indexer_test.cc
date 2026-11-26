@@ -16,6 +16,7 @@
 #include "db/index/column/vector_column/vector_column_indexer.h"
 #include <cassert>
 #include <cstdint>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include "db/index/column/vector_column/engine_helper.hpp"
@@ -32,6 +33,42 @@
 #endif
 
 using namespace zvec;
+
+
+TEST(VectorColumnIndexerTest, MovesAdmittedSparseFetchWithoutMoreBudget) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const size_t capacity = pool.capacity();
+  const size_t rss_limit = pool.process_rss_limit();
+  auto restore = ailego::ScopeGuard::Make([&] {
+    EXPECT_TRUE(pool.configure_process_rss_limit(rss_limit));
+    EXPECT_EQ(0, pool.init(capacity));
+  });
+  ASSERT_TRUE(pool.configure_process_rss_limit(0));
+  ASSERT_EQ(0, pool.init(64U << 20));
+
+  constexpr size_t bytes = 1024;
+  core::IndexSparseDocument decoded;
+  decoded.reserve_sparse_buffers(bytes, bytes);
+  decoded.mutable_sparse_indices()->assign(bytes, 'i');
+  decoded.mutable_sparse_values()->assign(bytes, 'v');
+  core_interface::VectorDataBuffer buffer{
+      core_interface::SparseVectorBuffer(std::move(decoded))};
+  const auto &accepted =
+      std::get<core_interface::SparseVectorBuffer>(buffer.vector_buffer);
+  const auto *indices = accepted.indices.data();
+  const auto *values = accepted.values.data();
+
+  ASSERT_TRUE(pool.configure_process_rss_limit(1));
+  auto result = ProximaEngineHelper::move_from_engine_vector_buffer(
+      std::move(buffer), true);
+  ASSERT_TRUE(result);
+  const auto &transferred =
+      std::get<vector_column_params::SparseVectorBuffer>(result->vector_buffer);
+  EXPECT_EQ(static_cast<const void *>(indices), transferred.indices.data());
+  EXPECT_EQ(static_cast<const void *>(values), transferred.values.data());
+  EXPECT_EQ(std::string(bytes, 'i'), transferred.indices);
+  EXPECT_EQ(std::string(bytes, 'v'), transferred.values);
+}
 
 
 TEST(VectorColumnIndexerTest, ReusedQueryParametersAndFlatFallback) {
