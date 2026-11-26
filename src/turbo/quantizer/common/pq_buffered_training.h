@@ -176,11 +176,11 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
       const size_t width = chunk_dim(m);
       const size_t offset = offsets[m] * num * sizeof(T);
       const size_t bytes = num * width * sizeof(T);
-      NumericalKmeans<T, core::SingleQueueIndexThreads> algorithm(
-          options.centroid_count, width);
+      using Algorithm = NumericalKmeans<T, core::SingleQueueIndexThreads>;
+      Algorithm algorithm(options.centroid_count, width);
       auto matrix_status = [&] {
         const int status = algorithm.matrix_status();
-        return status == decltype(algorithm)::kWorkspaceNoMemory
+        return status == Algorithm::kWorkspaceNoMemory
                    ? static_cast<int>(core::IndexError_NoMemory)
                    : status;
       };
@@ -205,8 +205,7 @@ int TrainPqBuffered(const core::IndexHolder::Pointer &holder, size_t num,
       // retained 64 KiB tiles can otherwise consume the last I/O pages.
       Workspace().swap(rows);
       core::SingleQueueIndexThreads local_threads(1, false);
-      Kmc2CentroidsGenerator<decltype(algorithm), core::SingleQueueIndexThreads>
-          gen;
+      Kmc2CentroidsGenerator<Algorithm, core::SingleQueueIndexThreads> gen;
       gen.set_chain_length(options.chain_length);
       gen.set_assumption_free(false);
       algorithm.init_centroids(local_threads, gen);
