@@ -1,0 +1,101 @@
+name: PR827 migration numerical diagnostics
+on:
+  push:
+    branches: [codex/verify-pr827-numeric-diagnostics-20261126]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+env:
+  OPENBLAS_NUM_THREADS: '1'
+  OMP_NUM_THREADS: '2'
+jobs:
+  exchange:
+    name: Diagnose full exchange (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: windows, runner: windows-2022}
+          - {name: macos, runner: macos-15}
+          - {name: linux, runner: ubuntu-24.04}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 16
+      - name: Verify unchanged production source
+        shell: bash
+        run: git diff --exit-code ae3c1afa7d9658debf6876bb159e15b442dfb35f HEAD -- src python thirdparty cmake CMakeLists.txt pyproject.toml
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: native-*
+          path: bundles
+          run-id: 45774216017
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install original exact-source runtime
+        shell: bash
+        run: python -m pip install numpy==2.2.6 bundles/native-${{ matrix.name }}/wheels/*.whl
+      - name: Record all comparison failures and complete CUD
+        id: diagnostic
+        continue-on-error: true
+        run: python scripts/diagnose_index_exchange.py exchange --os ${{ matrix.name }} --root diagnostic-exchange --bundles bundles
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: diagnostic-mutated-by-${{ matrix.name }}
+          path: diagnostic-exchange/out/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Preserve strict failure outcome
+        if: steps.diagnostic.outcome != 'success'
+        run: python -c "raise SystemExit('Strict diagnostics failed; original thresholds unchanged')"
+  returned:
+    name: Diagnose returned files (${{ matrix.name }})
+    needs: exchange
+    if: always()
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: windows, runner: windows-2022}
+          - {name: macos, runner: macos-15}
+          - {name: linux, runner: ubuntu-24.04}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: native-*
+          path: bundles
+          run-id: 45774216017
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: diagnostic-mutated-by-*
+          path: bundles
+      - name: Install original exact-source runtime
+        shell: bash
+        run: python -m pip install numpy==2.2.6 bundles/native-${{ matrix.name }}/wheels/*.whl
+      - name: Verify every returned mutation
+        id: diagnostic
+        continue-on-error: true
+        run: python scripts/diagnose_index_exchange.py return --os ${{ matrix.name }} --root diagnostic-return --bundles bundles
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: diagnostic-return-${{ matrix.name }}
+          path: diagnostic-return/out/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Preserve strict failure outcome
+        if: steps.diagnostic.outcome != 'success'
+        run: python -c "raise SystemExit('Strict diagnostics failed; original thresholds unchanged')"
