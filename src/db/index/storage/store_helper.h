@@ -144,16 +144,16 @@ inline arrow::Status ConvertCollectionSchemaToArrowFields(
 template <typename BuilderType, typename ScalarType>
 inline arrow::Status ConvertScalarVectorToArray(
     std::vector<std::shared_ptr<arrow::Scalar>> ordered_scalars,
-    std::shared_ptr<arrow::Array> *out) {
+    std::shared_ptr<arrow::Array> *out, arrow::MemoryPool *pool) {
   std::shared_ptr<arrow::Array> arr;
-  BuilderType builder;
+  BuilderType builder(pool);
   for (const auto &scalar : ordered_scalars) {
     if (scalar == nullptr || scalar->is_valid == false) {
       ARROW_RETURN_NOT_OK(builder.AppendNull());
       continue;
     }
-    auto status =
-        builder.Append(dynamic_cast<const ScalarType &>(*scalar).value);
+    ARROW_RETURN_NOT_OK(
+        builder.Append(dynamic_cast<const ScalarType &>(*scalar).value));
   }
   ARROW_RETURN_NOT_OK(builder.Finish(&arr));
   *out = arr;
@@ -164,9 +164,9 @@ template <>
 inline arrow::Status
 ConvertScalarVectorToArray<arrow::StringBuilder, arrow::StringScalar>(
     std::vector<std::shared_ptr<arrow::Scalar>> ordered_scalars,
-    std::shared_ptr<arrow::Array> *out) {
+    std::shared_ptr<arrow::Array> *out, arrow::MemoryPool *pool) {
   std::shared_ptr<arrow::Array> arr;
-  arrow::StringBuilder builder;
+  arrow::StringBuilder builder(pool);
   for (const auto &scalar : ordered_scalars) {
     if (scalar == nullptr || scalar->is_valid == false) {
       ARROW_RETURN_NOT_OK(builder.AppendNull());
@@ -185,9 +185,9 @@ template <>
 inline arrow::Status
 ConvertScalarVectorToArray<arrow::BinaryBuilder, arrow::BinaryScalar>(
     std::vector<std::shared_ptr<arrow::Scalar>> ordered_scalars,
-    std::shared_ptr<arrow::Array> *out) {
+    std::shared_ptr<arrow::Array> *out, arrow::MemoryPool *pool) {
   std::shared_ptr<arrow::Array> arr;
-  arrow::BinaryBuilder builder;
+  arrow::BinaryBuilder builder(pool);
   for (const auto &scalar : ordered_scalars) {
     if (scalar == nullptr || scalar->is_valid == false) {
       ARROW_RETURN_NOT_OK(builder.AppendNull());
@@ -210,7 +210,8 @@ ConvertScalarVectorToArray<arrow::BinaryBuilder, arrow::BinaryScalar>(
 
 inline arrow::Status ConvertScalarVectorToArrayByType(
     std::vector<std::shared_ptr<arrow::Scalar>> ordered_scalars,
-    std::shared_ptr<arrow::Array> *out) {
+    std::shared_ptr<arrow::Array> *out,
+    arrow::MemoryPool *pool = arrow::default_memory_pool()) {
   auto type = ordered_scalars.empty() ? nullptr : ordered_scalars[0]->type;
   if (type == nullptr)
     return arrow::Status::Invalid("Cannot convert empty vector to array");
@@ -219,47 +220,47 @@ inline arrow::Status ConvertScalarVectorToArrayByType(
     case arrow::Type::BINARY:
       status =
           ConvertScalarVectorToArray<arrow::BinaryBuilder, arrow::BinaryScalar>(
-              ordered_scalars, out);
+              ordered_scalars, out, pool);
       break;
     case arrow::Type::BOOL:
       status = ConvertScalarVectorToArray<arrow::BooleanBuilder,
-                                          arrow::BooleanScalar>(ordered_scalars,
-                                                                out);
+                                          arrow::BooleanScalar>(
+          ordered_scalars, out, pool);
       break;
     case arrow::Type::INT32:
       status =
           ConvertScalarVectorToArray<arrow::Int32Builder, arrow::Int32Scalar>(
-              ordered_scalars, out);
+              ordered_scalars, out, pool);
       break;
     case arrow::Type::UINT32:
       status =
           ConvertScalarVectorToArray<arrow::UInt32Builder, arrow::UInt32Scalar>(
-              ordered_scalars, out);
+              ordered_scalars, out, pool);
       break;
     case arrow::Type::INT64:
       status =
           ConvertScalarVectorToArray<arrow::Int64Builder, arrow::Int64Scalar>(
-              ordered_scalars, out);
+              ordered_scalars, out, pool);
       break;
     case arrow::Type::UINT64:
       status =
           ConvertScalarVectorToArray<arrow::UInt64Builder, arrow::UInt64Scalar>(
-              ordered_scalars, out);
+              ordered_scalars, out, pool);
       break;
     case arrow::Type::FLOAT:
       status =
           ConvertScalarVectorToArray<arrow::FloatBuilder, arrow::FloatScalar>(
-              ordered_scalars, out);
+              ordered_scalars, out, pool);
       break;
     case arrow::Type::DOUBLE:
       status =
           ConvertScalarVectorToArray<arrow::DoubleBuilder, arrow::DoubleScalar>(
-              ordered_scalars, out);
+              ordered_scalars, out, pool);
       break;
     case arrow::Type::STRING:
       status =
           ConvertScalarVectorToArray<arrow::StringBuilder, arrow::StringScalar>(
-              ordered_scalars, out);
+              ordered_scalars, out, pool);
       break;
     case arrow::Type::LIST: {
       if (ordered_scalars.empty()) {
@@ -268,11 +269,11 @@ inline arrow::Status ConvertScalarVectorToArrayByType(
       }
       auto list_type = std::static_pointer_cast<arrow::ListType>(type);
       std::unique_ptr<arrow::ArrayBuilder> value_builder;
-      ARROW_RETURN_NOT_OK(arrow::MakeBuilder(arrow::default_memory_pool(),
+      ARROW_RETURN_NOT_OK(arrow::MakeBuilder(pool,
                                              list_type->value_type(),
                                              &value_builder));
 
-      arrow::ListBuilder builder(arrow::default_memory_pool(),
+      arrow::ListBuilder builder(pool,
                                  std::move(value_builder), list_type);
 
       for (const auto &scalar : ordered_scalars) {

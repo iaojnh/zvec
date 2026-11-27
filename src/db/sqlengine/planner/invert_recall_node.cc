@@ -25,57 +25,61 @@ arrow::AsyncGenerator<std::optional<cp::ExecBatch>> InvertRecallNode::gen() {
   auto state_ptr = std::make_shared<State>();
   return [self = shared_from_this(), state_ptr = std::move(state_ptr)]()
              -> arrow::Future<std::optional<cp::ExecBatch>> {
-    auto &state = *state_ptr;
+    try {
+      auto &state = *state_ptr;
 
-    if (!state.iter_) {
-      auto invert_ret = self->prepare();
-      if (!invert_ret) {
+      if (!state.iter_) {
+        auto invert_ret = self->prepare();
+        if (!invert_ret) {
+          return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+              arrow::Status::ExecutionError("prepare invert failed:",
+                                            invert_ret.error().c_str()));
+        }
+        state.invert_result_ = invert_ret.value();
+        state.iter_ = state.invert_result_->create_iterator();
+      }
+
+      if (!state.iter_->valid()) {
+        // return nullopt to indicate end
         return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-            arrow::Status::ExecutionError("prepare invert failed:",
-                                          invert_ret.error().c_str()));
+            std::nullopt);
       }
-      state.invert_result_ = invert_ret.value();
-      state.iter_ = state.invert_result_->create_iterator();
-    }
 
-    if (!state.iter_->valid()) {
-      // return nullopt to indicate end
-      return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-          std::nullopt);
-    }
-
-    // collect a batch
-    std::vector<int> indices;
-    indices.reserve(self->batch_size_);
-    for (int i = 0; state.iter_->valid() && i < self->batch_size_;
-         state.iter_->next()) {
-      if (self->seg_filter_ &&
-          self->seg_filter_->is_filtered(state.iter_->doc_id())) {
-        continue;
+      // collect a batch
+      std::vector<int> indices;
+      indices.reserve(self->batch_size_);
+      for (int i = 0; state.iter_->valid() && i < self->batch_size_;
+           state.iter_->next()) {
+        if (self->seg_filter_ &&
+            self->seg_filter_->is_filtered(state.iter_->doc_id())) {
+          continue;
+        }
+        i++;
+        indices.push_back(state.iter_->doc_id());
       }
-      i++;
-      indices.push_back(state.iter_->doc_id());
-    }
-    if (indices.empty()) {
-      // return nullopt to indicate end
-      return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-          std::nullopt);
-    }
+      if (indices.empty()) {
+        // return nullopt to indicate end
+        return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+            std::nullopt);
+      }
 
-    auto table = self->segment_->fetch(self->fetched_columns_, indices);
-    if (!table) {
+      auto table = self->segment_->fetch(self->fetched_columns_, indices);
+      if (!table) {
+        return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+            arrow::Status::UnknownError("fetch table failed"));
+      }
+      auto batch = table->CombineChunksToBatch(self->segment_->query_memory_pool());
+      if (!batch.ok()) {
+        return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+            batch.status());
+      }
+      cp::ExecBatch exec_batch(*batch.ValueUnsafe());
       return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-          arrow::Status::UnknownError("fetch table failed"));
-    }
-    auto batch = table->CombineChunksToBatch();
-    if (!batch.ok()) {
+          std::move(exec_batch));
+    } catch (const std::bad_alloc &) {
       return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-          arrow::Status::ExecutionError("combine chunks to batch failed:",
-                                        batch.status().ToString()));
+          arrow::Status::OutOfMemory("Query result allocation refused"));
     }
-    cp::ExecBatch exec_batch(*batch.ValueUnsafe());
-    return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-        std::move(exec_batch));
   };
 }
 

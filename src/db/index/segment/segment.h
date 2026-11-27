@@ -44,6 +44,8 @@ class CombinedRecordBatchReader;
 
 class Segment {
  public:
+  virtual bool uses_buffer_storage() const { return false; }
+  arrow::MemoryPool *query_memory_pool() const;
   using Ptr = std::shared_ptr<Segment>;
 
   // How one query reads forward columns. A null view selects locked

@@ -10,6 +10,7 @@ cc_library(
             roaring
             rocksdb
             utf8proc
+            Arrow::arrow_static
     INCS .
     VERSION "${PROXIMA_ZVEC_VERSION}"
 )

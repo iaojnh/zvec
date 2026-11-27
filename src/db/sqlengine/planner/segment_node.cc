@@ -30,6 +30,10 @@ SegmentNode::gen() {
     if (!self->prepared_.exchange(true)) {
       auto status = self->prepare();
       if (!status.ok()) {
+        if (status.code() == StatusCode::RESOURCE_EXHAUSTED) {
+          return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
+              arrow::Status::OutOfMemory(status.message()));
+        }
         return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
             arrow::Status::ExecutionError("prepare segment node failed:",
                                           status.c_str()));
@@ -42,8 +46,7 @@ SegmentNode::gen() {
       auto status = back->ReadNext(&batch);
       if (!status.ok()) {
         return arrow::Future<std::optional<cp::ExecBatch>>::MakeFinished(
-            arrow::Status::ExecutionError("read next batch failed:",
-                                          status.ToString()));
+            status);
       }
       if (batch == nullptr) {
         LOG_DEBUG("batch finished: %p", back.get());

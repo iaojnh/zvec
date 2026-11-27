@@ -15,11 +15,13 @@
 #pragma once
 
 #include <sys/stat.h>
+#include <arrow/result.h>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 #include <zvec/ailego/buffer/external_cache.h>
+#include <zvec/ailego/buffer/memory_reservation.h>
 
 namespace arrow {
 class Buffer;
@@ -68,9 +70,14 @@ struct ParquetBufferIDEqual {
 
 namespace detail {
 
+class ParquetMemoryPool;
+
 struct ParquetBufferPayload {
+  ailego::MemoryReservation metadata;
+  // Arrow's buffers hold a raw allocator pointer. Destroy them before the
+  // shared pool owner, including when an entry outlives the loading reader.
+  std::shared_ptr<ParquetMemoryPool> memory_pool;
   std::shared_ptr<arrow::ChunkedArray> arrow{nullptr};
-  std::vector<std::shared_ptr<arrow::Buffer>> arrow_refs{};
 };
 
 class ParquetBufferLoader {
@@ -116,6 +123,8 @@ class ParquetBufferPool {
   typedef std::shared_ptr<ParquetBufferPool> Pointer;
 
   ParquetBufferContextHandle acquire_buffer(ParquetBufferID buffer_id);
+  arrow::Result<ParquetBufferContextHandle> acquire_buffer_checked(
+      const ParquetBufferID &buffer_id);
 
   static ParquetBufferPool &get_instance() {
     static ParquetBufferPool instance;
@@ -133,7 +142,7 @@ class ParquetBufferPool {
   using Cache =
       ailego::ExternalCache<ParquetBufferID, detail::ParquetBufferPayload,
                             detail::ParquetBufferLoader, ParquetBufferIDHash,
-                            ParquetBufferIDEqual>;
+                            ParquetBufferIDEqual, /*PayloadOwnsBudget=*/true>;
 
   ParquetBufferPool() = default;
 

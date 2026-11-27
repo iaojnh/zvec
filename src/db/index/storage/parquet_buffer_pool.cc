@@ -20,9 +20,11 @@
 #include <arrow/result.h>
 #include <arrow/status.h>
 #include <arrow/table.h>
+#include <arrow/util/byte_size.h>
 #include <parquet/arrow/reader.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/file_helper.h>
+#include "parquet_memory_pool.h"
 
 namespace zvec {
 
@@ -71,73 +73,73 @@ ParquetBufferContextHandle::~ParquetBufferContextHandle() {
   }
 }
 
+namespace {
+struct ParquetLoadError {
+  arrow::Status status;
+};
+
+arrow::Status LoadColumn(const ParquetBufferID &id,
+                         detail::ParquetBufferPayload &payload) {
+  payload.memory_pool = detail::GetParquetMemoryPool();
+  auto *pool = payload.memory_pool.get();
+  ARROW_ASSIGN_OR_RAISE(auto input, arrow::io::ReadableFile::Open(id.filename, pool));
+  ARROW_ASSIGN_OR_RAISE(auto reader, detail::OpenManagedParquetReader(input, pool));
+  if (id.row_group < 0 || id.row_group >= reader->num_row_groups() ||
+      id.column < 0 ||
+      id.column >= reader->parquet_reader()->metadata()->schema()->group_node()->field_count()) {
+    return arrow::Status::Invalid("Invalid Parquet row group or column");
+  }
+  return reader->RowGroup(id.row_group)->Column(id.column)->Read(&payload.arrow);
+}
+}  // namespace
+
 bool detail::ParquetBufferLoader::load(const ParquetBufferID &buffer_id,
                                        ParquetBufferPayload &payload,
                                        size_t &size) {
-  arrow::MemoryPool *mem_pool = arrow::default_memory_pool();
-
-  std::shared_ptr<arrow::io::RandomAccessFile> input;
-  const auto &file_name = buffer_id.filename;
-  auto input_result = arrow::io::ReadableFile::Open(file_name);
-  if (!input_result.ok()) {
-    LOG_ERROR("Failed to open parquet file[%s]: %s", file_name.c_str(),
-              input_result.status().ToString().c_str());
-    return false;
+  auto status = LoadColumn(buffer_id, payload);
+  if (!status.ok()) throw ParquetLoadError{std::move(status)};
+  if (!payload.arrow) {
+    throw ParquetLoadError{arrow::Status::Invalid("Missing Parquet column")};
   }
-  input = *input_result;
-
-  std::unique_ptr<parquet::arrow::FileReader> reader;
-  auto reader_result = parquet::arrow::OpenFile(input, mem_pool);
-  if (!reader_result.ok()) {
-    LOG_ERROR("Failed to create parquet reader[%s]: %s", file_name.c_str(),
-              reader_result.status().ToString().c_str());
-    return false;
-  }
-  reader = std::move(*reader_result);
-
-  int row_group = buffer_id.row_group;
-  int column = buffer_id.column;
-  auto s = reader->RowGroup(row_group)->Column(column)->Read(&payload.arrow);
-  if (!s.ok()) {
-    LOG_ERROR("Failed to read parquet file[%s]: %s", file_name.c_str(),
-              s.ToString().c_str());
-    payload.arrow = nullptr;
-    return false;
-  }
-
-  size = 0;
-  payload.arrow_refs.clear();
-  for (auto &array : payload.arrow->chunks()) {
-    auto &buffers = array->data()->buffers;
-    for (size_t buf_idx = 0; buf_idx < buffers.size(); ++buf_idx) {
-      if (buffers[buf_idx] == nullptr) {
-        continue;
-      }
-      payload.arrow_refs.emplace_back(buffers[buf_idx]);
-      size += buffers[buf_idx]->capacity();
-      std::shared_ptr<arrow::Buffer> hijacked_buffer(buffers[buf_idx].get(),
-                                                     [](arrow::Buffer *) {});
-      buffers[buf_idx] = hijacked_buffer;
-    }
-  }
-
+  // The precharged cache accounts for Arrow buffers at allocation. Keep a
+  // separate allowance for the object wrappers outside Arrow's MemoryPool.
+  payload.metadata.add_array(payload.arrow->num_chunks(),
+                             sizeof(arrow::ArrayData) + sizeof(arrow::Array));
+  size = arrow::util::TotalBufferSize(*payload.arrow);
   return true;
 }
 
 void detail::ParquetBufferLoader::clear(ParquetBufferPayload &payload) const {
-  payload.arrow = nullptr;
-  payload.arrow_refs.clear();
+  payload.arrow.reset();
+  payload.memory_pool.reset();
+  payload.metadata.retain_at_most(0);
 }
 
 ParquetBufferContextHandle ParquetBufferPool::acquire_buffer(
     ParquetBufferID buffer_id) {
-  auto arrow = cache_.acquire(buffer_id);
-  if (!arrow) {
-    LOG_ERROR("Failed to acquire parquet buffer: %s",
-              buffer_id.to_string().c_str());
-    return ParquetBufferContextHandle();
+  auto result = acquire_buffer_checked(buffer_id);
+  if (!result.ok()) {
+    LOG_ERROR("Failed to acquire parquet buffer: %s: %s",
+              buffer_id.to_string().c_str(), result.status().ToString().c_str());
+    return {};
   }
-  return ParquetBufferContextHandle(buffer_id, arrow);
+  return std::move(*result);
+}
+
+arrow::Result<ParquetBufferContextHandle> ParquetBufferPool::acquire_buffer_checked(
+    const ParquetBufferID &buffer_id) try {
+  auto arrow = cache_.acquire(buffer_id);
+  if (!arrow) return arrow::Status::OutOfMemory("Parquet cache admission refused");
+  try {
+    return ParquetBufferContextHandle(buffer_id, std::move(arrow));
+  } catch (...) {
+    cache_.release(buffer_id);
+    throw;
+  }
+} catch (const ParquetLoadError &error) {
+  return error.status;
+} catch (const std::bad_alloc &) {
+  return arrow::Status::OutOfMemory("Parquet cache allocation refused");
 }
 
 void ParquetBufferPool::release(ParquetBufferID buffer_id) {
