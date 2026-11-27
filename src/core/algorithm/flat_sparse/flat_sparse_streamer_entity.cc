@@ -838,6 +838,13 @@ int FlatSparseStreamerEntity::get_sparse_data_slot(
       LOG_ERROR("allocate data chunk failed");
       return ret;
     }
+    if (sparse_data_chunk_index != -1U) {
+      const auto &completed = sparse_data_chunks_[sparse_data_chunk_index];
+      if (auto pool = storage_->vec_buffer_pool()) {
+        pool->request_writeback(completed->data_offset(),
+                                completed->data_size());
+      }
+    }
     sparse_data_chunks_.emplace_back(sparse_data_chunk);
     sparse_data_chunk_index = sparse_data_chunks_.size() - 1U;
     sparse_data_chunk_offset = 0UL;

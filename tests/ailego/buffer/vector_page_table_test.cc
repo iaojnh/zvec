@@ -1000,6 +1000,43 @@ TEST_F(BufferPoolTest, WritablePoolCanFlushWithoutOptionalIoUringStaging) {
   EXPECT_EQ(value, std::fgetc(file.get()));
 }
 
+TEST_F(BufferPoolTest, CompletedRangeWritebackKeepsPagesResident) {
+  using namespace std::chrono_literals;
+  constexpr size_t pages = 3;
+  init_vec_pool(/*capacity_pages=*/16, pages, /*writable=*/true);
+  const auto path = new_file(pages);
+  VecBufferPool pool(path, true);
+  ASSERT_EQ(0, pool.init());
+  for (size_t page = 0; page < pages; ++page) {
+    ASSERT_EQ(0, pool.write_range(page * kVectorPageSize, 1, "X"));
+  }
+
+  // Limit the request to the one complete page between its partial edges.
+  pool.request_writeback(1, pages * kVectorPageSize - 2);
+  ASSERT_TRUE(pool.extend_file((pages + 1) * kVectorPageSize));
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (pool.stats().writeback_pages == 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_EQ(1u, pool.stats().writeback_pages);
+  EXPECT_TRUE(pool.is_page_resident(1));
+
+  File persisted;
+  ASSERT_TRUE(persisted.open(path, /*rdonly=*/true));
+  for (size_t page = 0; page < pages; ++page) {
+    char value = 0;
+    ASSERT_EQ(1u, persisted.read(page * kVectorPageSize, &value, 1));
+    EXPECT_EQ(page == 1 ? 'X' : static_cast<char>(page), value);
+  }
+  ASSERT_EQ(0, pool.flush_all());
+  for (size_t page = 0; page < pages; ++page) {
+    char value = 0;
+    ASSERT_EQ(1u, persisted.read(page * kVectorPageSize, &value, 1));
+    EXPECT_EQ('X', value);
+  }
+}
+
 TEST_F(BufferPoolTest, ConcurrentWritablePressureUsesBackgroundWriteback) {
   constexpr size_t kFilePages = 64;
   constexpr size_t kThreadCount = 8;
