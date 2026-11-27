@@ -200,6 +200,76 @@ struct Neighbor {
 };
 
 //! NeighborPriorityQueue
+using PruneCandidates =
+    std::vector<Neighbor, ailego::BudgetedAllocator<Neighbor>>;
+
+// Retain exactly the prefix that sort + resize would pass to occlusion. The
+// traversal queue is independent: discarded history must not stop exploration.
+inline void CollectPruneCandidate(PruneCandidates &candidates,
+                                  const Neighbor &candidate,
+                                  diskann_id_t excluded, size_t limit) {
+  if (candidate.id == excluded || limit == 0) return;
+  if (candidates.size() == limit) {
+    if (!(candidate < candidates.front())) return;
+    std::pop_heap(candidates.begin(), candidates.end());
+    candidates.back() = candidate;
+  } else {
+    candidates.push_back(candidate);
+  }
+  std::push_heap(candidates.begin(), candidates.end());
+}
+
+// One reservation covers both encoding input and output. Shrink the batch on
+// pressure; even a one-row batch must be admitted before either buffer exists.
+class DiskAnnEncodeBuffer {
+ public:
+  int init(size_t rows, size_t element_bytes, size_t code_bytes) {
+    decltype(data_)().swap(data_);
+    rows_ = 0;
+    input_bytes_ = 0;
+    if (!rows || !element_bytes || !code_bytes ||
+        element_bytes > SIZE_MAX - code_bytes)
+      return IndexError_InvalidArgument;
+    const size_t row_bytes = element_bytes + code_bytes;
+    if (row_bytes > data_.max_size()) return IndexError_InvalidArgument;
+    size_t budget = 4u * 1024u * 1024u;
+    auto &pool = ailego::MemoryLimitPool::get_instance();
+    if (pool.capacity()) {
+      size_t available = pool.capacity();
+      available -= std::min(available, pool.external_used());
+      available -= std::min(available, pool.metadata_used());
+      budget = std::min(budget, available / 2);
+    }
+    size_t batch = std::min(rows, std::max<size_t>(1, budget / row_bytes));
+    for (;;) {
+      try {
+        data_.resize(batch * row_bytes);
+        rows_ = batch;
+        input_bytes_ = batch * element_bytes;
+        return 0;
+      } catch (const std::bad_alloc &) {
+        if (batch == 1) return IndexError_NoMemory;
+        batch /= 2;
+      }
+    }
+  }
+  size_t rows() const {
+    return rows_;
+  }
+  uint8_t *input() {
+    return data_.data();
+  }
+  uint8_t *codes() {
+    return rows_ ? data_.data() + input_bytes_ : nullptr;
+  }
+
+ private:
+  std::vector<uint8_t, ailego::BudgetedAllocator<uint8_t>> data_;
+  size_t rows_{0};
+  size_t input_bytes_{0};
+};
+
+//! NeighborPriorityQueue
 class NeighborPriorityQueue {
  public:
   NeighborPriorityQueue() : size_(0), capacity_(0), cur_(0) {}
@@ -208,6 +278,7 @@ class NeighborPriorityQueue {
       : size_(0), capacity_(capacity), cur_(0), data_(capacity + 1) {}
 
   void insert(const Neighbor &nbr) {
+    if (capacity_ == 0) return;
     if (size_ == capacity_ && data_[size_ - 1] < nbr) {
       return;
     }
@@ -269,8 +340,15 @@ class NeighborPriorityQueue {
     return capacity_;
   }
 
+  void admit_build_workspace() {
+    budget_build_workspace_ = true;
+  }
+
   void reserve(size_t capacity) {
+    if (capacity == SIZE_MAX) throw std::bad_alloc();
     if (capacity + 1 > data_.size()) {
+      if (budget_build_workspace_)
+        ailego::ReserveVectorCapacity(data_, build_memory_, capacity + 1);
       data_.resize(capacity + 1);
     }
     capacity_ = capacity;
@@ -293,10 +371,18 @@ class NeighborPriorityQueue {
     cur_ = 0;
   }
 
+  void release() {
+    decltype(data_)().swap(data_);
+    build_memory_.retain_at_most(0);
+    size_ = capacity_ = cur_ = 0;
+  }
+
  private:
   size_t size_;
   size_t capacity_;
   size_t cur_;
+  bool budget_build_workspace_{false};
+  ailego::MemoryReservation build_memory_;
   std::vector<Neighbor> data_;
 };
 

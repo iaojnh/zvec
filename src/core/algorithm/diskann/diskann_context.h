@@ -290,11 +290,11 @@ class DiskAnnContext : public IndexContext,
     return best_list_nodes_;
   }
 
-  std::vector<Neighbor> &expanded_nodes() {
+  PruneCandidates &expanded_nodes() {
     return expanded_nodes_;
   }
 
-  std::vector<float> &occlude_factor() {
+  ailego::BudgetedVector<float> &occlude_factor() {
     return occlude_factor_;
   }
 
@@ -450,8 +450,8 @@ class DiskAnnContext : public IndexContext,
   int error_code_{0};
 
   NeighborPriorityQueue best_list_nodes_;
-  std::vector<Neighbor> expanded_nodes_;
-  std::vector<float> occlude_factor_;
+  PruneCandidates expanded_nodes_;
+  ailego::BudgetedVector<float> occlude_factor_;
 
   VisitFilter visit_filter_{};
   DiskAnnSearchVisitFilter search_visit_filter_;

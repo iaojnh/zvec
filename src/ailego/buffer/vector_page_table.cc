@@ -1212,8 +1212,8 @@ VecBufferPool::VecBufferPool(const std::string &filename, bool writable,
     throw std::runtime_error("Backing file changed while opening: " + filename);
   }
 #endif
-  file_size_ = st.st_size;
-  initial_file_size_ = file_size_;
+  initial_file_size_ = st.st_size;
+  file_size_.store(initial_file_size_, std::memory_order_release);
 #if defined(__linux__) && !defined(__ANDROID__)
   // Select the process-wide backend; thread-local contexts are created lazily.
   io_backend_type_ = direct_io_enabled_ ? IOBackend::Instance().available()
@@ -1268,8 +1268,8 @@ int VecBufferPool::init() {
     }
   }
 
-  const size_t block_num =
-      file_size_ == 0 ? 0 : (file_size_ - 1) / kVectorPageSize + 1;
+  const size_t extent = file_size();
+  const size_t block_num = extent == 0 ? 0 : (extent - 1) / kVectorPageSize + 1;
   if (block_num > VectorPageTable::kMaxEntries) {
     LOG_ERROR(
         "VecBufferPool::init: file[%s] needs %zu entries, exceeding "
@@ -1349,7 +1349,7 @@ int VecBufferPool::init() {
     LOG_ERROR(
         "VecBufferPool::init: page_table_ init failed for file[%s], "
         "file_size=%zu, block_num=%zu, required_metadata=%zu",
-        file_name_.c_str(), file_size_, block_num,
+        file_name_.c_str(), file_size(), block_num,
         metadata_bytes_for_page_count(block_num, writable_));
     return -1;
   }
@@ -1380,7 +1380,7 @@ int VecBufferPool::init() {
   }
 #endif
   LOG_DEBUG("entry num: %zu, file_size: %zu", page_table_.entry_num(),
-            file_size_);
+            file_size());
 
   initialized_ = true;
   if (writable_) {
@@ -1405,6 +1405,24 @@ int VecBufferPool::init() {
 
 VecBufferPoolHandle VecBufferPool::get_handle() {
   return VecBufferPoolHandle(*this);
+}
+
+void VecBufferPool::request_writeback(size_t offset, size_t length) {
+  if (length > std::numeric_limits<size_t>::max() - offset) return;
+  const auto first = offset / kVectorPageSize + (offset % kVectorPageSize != 0);
+  const auto end =
+      std::min((offset + length) / kVectorPageSize, page_table_.entry_num());
+  if (first >= end) return;
+  {
+    std::lock_guard<std::mutex> lock(writeback_mutex_);
+    if (writeback_stopping_ || !writeback_thread_.joinable() ||
+        writeback_error() != 0 || writeback_hint_next_ != writeback_hint_end_)
+      return;
+    writeback_hint_next_ = first;
+    writeback_hint_end_ = end;
+    writeback_requests_.fetch_add(end - first, std::memory_order_relaxed);
+  }
+  writeback_cv_.notify_one();
 }
 
 bool VecBufferPool::enqueue_writeback(block_id_t page_id) {
@@ -1471,32 +1489,35 @@ void VecBufferPool::drain_writeback() {
   if (!writeback_thread_.joinable()) {
     return;
   }
-  writeback_drained_cv_.wait(lock, [this] {
-    return writeback_queue_.empty() && writeback_inflight_ == 0;
-  });
+  writeback_drained_cv_.wait(lock, [this] { return writeback_idle_locked(); });
 }
 
 void VecBufferPool::writeback_loop() {
   std::vector<block_id_t> page_ids;
   page_ids.reserve(kBlockingAioBatchSize);
   while (true) {
+    bool reclaim;
     {
       std::unique_lock<std::mutex> lock(writeback_mutex_);
       writeback_cv_.wait(lock, [this] {
-        return writeback_stopping_ || !writeback_queue_.empty();
+        return writeback_stopping_ || !writeback_queue_.empty() ||
+               writeback_hint_next_ != writeback_hint_end_;
       });
-      if (writeback_queue_.empty()) {
-        if (writeback_stopping_) {
-          break;
-        }
-        continue;
-      }
+      reclaim = !writeback_queue_.empty();
       page_ids.clear();
-      while (!writeback_queue_.empty() &&
-             page_ids.size() < kBlockingAioBatchSize) {
-        page_ids.push_back(writeback_queue_.front());
-        writeback_queue_.pop_front();
+      if (reclaim) {
+        while (!writeback_queue_.empty() &&
+               page_ids.size() < kBlockingAioBatchSize) {
+          page_ids.push_back(writeback_queue_.front());
+          writeback_queue_.pop_front();
+        }
+      } else {
+        while (writeback_hint_next_ != writeback_hint_end_ &&
+               page_ids.size() < kBlockingAioBatchSize) {
+          page_ids.push_back(writeback_hint_next_++);
+        }
       }
+      if (page_ids.empty()) break;
       writeback_inflight_ += page_ids.size();
     }
 
@@ -1512,18 +1533,20 @@ void VecBufferPool::writeback_loop() {
                 file_name_.c_str(), page_ids.size());
     }
 
-    for (block_id_t page_id : page_ids) {
-      page_table_.clear_writeback_pending(page_id);
-    }
-    writeback_pending_.fetch_sub(page_ids.size(), std::memory_order_relaxed);
-    for (block_id_t page_id : page_ids) {
-      (void)page_table_.reclaim_clean_block(page_id);
+    if (reclaim) {
+      for (block_id_t page_id : page_ids) {
+        page_table_.clear_writeback_pending(page_id);
+      }
+      writeback_pending_.fetch_sub(page_ids.size(), std::memory_order_relaxed);
+      for (block_id_t page_id : page_ids) {
+        (void)page_table_.reclaim_clean_block(page_id);
+      }
     }
 
     {
       std::lock_guard<std::mutex> lock(writeback_mutex_);
       writeback_inflight_ -= page_ids.size();
-      if (writeback_queue_.empty() && writeback_inflight_ == 0) {
+      if (writeback_idle_locked()) {
         writeback_drained_cv_.notify_all();
       }
     }
@@ -1531,7 +1554,7 @@ void VecBufferPool::writeback_loop() {
 
   {
     std::lock_guard<std::mutex> lock(writeback_mutex_);
-    if (writeback_queue_.empty() && writeback_inflight_ == 0) {
+    if (writeback_idle_locked()) {
       writeback_drained_cv_.notify_all();
     }
   }
@@ -1568,7 +1591,7 @@ char *VecBufferPool::acquire_writeback_block(block_id_t page_id, bool *failed) {
 }
 
 void VecBufferPool::register_metadata_range(size_t offset, size_t length) {
-  assert(length > 0 && offset <= file_size_ && length <= file_size_ - offset);
+  assert(length > 0 && offset <= file_size() && length <= file_size() - offset);
   const size_t end = offset + length;
   if (offset % kVectorPageSize == 0 && end % kVectorPageSize == 0) {
     return;
@@ -1629,7 +1652,7 @@ int VecBufferPool::writeback_page(size_t offset, size_t length,
   // Never grow the physical file past its recorded size: an index written
   // with a smaller format page size ends inside the final host page, and a
   // full-page writeback must not push the physical EOF beyond it.
-  const size_t end = std::min(offset + length, file_size_);
+  const size_t end = std::min(offset + length, file_size());
   const auto write = [&](int fd, size_t begin, size_t limit) {
     if (begin >= limit) return 0;
     const size_t size = limit - begin;
@@ -1799,7 +1822,7 @@ bool VecBufferPool::flush_whole_pages(const block_id_t *page_ids, size_t count,
         // A format page smaller than the host page ends inside the last
         // host page: cap the writeback at the recorded file size.
         const size_t write_size = std::min(
-            kVectorPageSize, file_size_ - selected_pages[i] * kVectorPageSize);
+            kVectorPageSize, file_size() - selected_pages[i] * kVectorPageSize);
         requests[i] = IoUringWrite(selected_pages[i] * kVectorPageSize,
                                    write_size, buffers[i]);
       }
@@ -1829,7 +1852,7 @@ bool VecBufferPool::flush_whole_pages(const block_id_t *page_ids, size_t count,
           errno = 0;
           const size_t write_size =
               std::min(kVectorPageSize,
-                       file_size_ - selected_pages[i] * kVectorPageSize);
+                       file_size() - selected_pages[i] * kVectorPageSize);
           const ssize_t written = zvec_pwrite(
               fd_, buffers[i], write_size, selected_pages[i] * kVectorPageSize);
           page_ok = written == static_cast<ssize_t>(write_size);
@@ -1932,7 +1955,7 @@ bool VecBufferPool::flush_whole_pages(const block_id_t *page_ids, size_t count,
     // the physical EOF past it.
     const size_t submitted_size =
         std::min(submitted_pages * kVectorPageSize,
-                 file_size_ - run_start * kVectorPageSize);
+                 file_size() - run_start * kVectorPageSize);
     writeback_batches_.fetch_add(1, std::memory_order_relaxed);
     const ssize_t written = zvec_pwrite(fd_, write_buffer, submitted_size,
                                         run_start * kVectorPageSize);
@@ -2128,7 +2151,7 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry,
       const size_t read_len =
           direct_io_enabled_
               ? kVectorPageSize
-              : std::min(kVectorPageSize, file_size_ - page_offset);
+              : std::min(kVectorPageSize, file_size() - page_offset);
       if (read_len < kVectorPageSize) {
         std::memset(buffer + read_len, 0, kVectorPageSize - read_len);
       }
@@ -2136,7 +2159,7 @@ char *VecBufferPool::acquire_buffer(block_id_t page_id, int retry,
       if (read_bytes != static_cast<ssize_t>(read_len)) {
         // Accept short read at EOF: last page may not be full kVectorPageSize.
         if (read_bytes > 0 &&
-            (page_offset + static_cast<size_t>(read_bytes) >= file_size_)) {
+            (page_offset + static_cast<size_t>(read_bytes) >= file_size())) {
           std::memset(buffer + read_bytes, 0, kVectorPageSize - read_bytes);
         } else {
           LOG_ERROR(
@@ -2289,7 +2312,7 @@ bool VecBufferPool::should_admit_page(block_id_t page_id) {
   // passes. Otherwise pressure clearing briefly admits the entire cold scan
   // again, displacing useful pages and repeatedly materializing new backing.
   const bool oversized_scan =
-      budget.page_admission_reserve() != 0 && file_size_ > budget.capacity();
+      budget.page_admission_reserve() != 0 && file_size() > budget.capacity();
   if (writable_ || (!oversized_scan && !budget.under_cache_pressure())) {
     return true;
   }
@@ -2319,8 +2342,8 @@ int VecBufferPool::get_meta(size_t offset, size_t length, char *buffer) {
   if (length == 0) {
     return 0;
   }
-  if (buffer == nullptr || offset > file_size_ ||
-      length > file_size_ - offset) {
+  const size_t extent = file_size();
+  if (buffer == nullptr || offset > extent || length > extent - offset) {
     return -1;
   }
   ssize_t read_bytes = zvec_pread(meta_fd_, buffer, length, offset);
@@ -2354,8 +2377,9 @@ bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
   if (length == 0) {
     return true;
   }
-  if (buffer == nullptr || file_offset > file_size_ ||
-      length > file_size_ - file_offset) {
+  const size_t extent = file_size();
+  if (buffer == nullptr || file_offset > extent ||
+      length > extent - file_offset) {
     return false;
   }
 
@@ -2421,7 +2445,7 @@ bool VecBufferPool::read_range_bypass(size_t file_offset, size_t length,
       direct_destination = true;
     }
     char *page = direct_destination ? buffer + copied : scratch.data();
-    const size_t available = file_size_ - page_offset;
+    const size_t available = file_size() - page_offset;
     // Cancel this iteration's load claim (if any) on every exit, including
     // an exception from the read below.
     auto claim_cleanup = ScopeGuard::Make([&] {
@@ -2463,7 +2487,8 @@ bool VecBufferPool::read_ranges_bypass(const ReadRange *ranges, size_t count) {
   if (!ranges) return false;
   for (size_t i = 0; i < count; ++i) {
     const auto &range = ranges[i];
-    if (range.offset > file_size_ || range.length > file_size_ - range.offset ||
+    if (range.offset > file_size() ||
+        range.length > file_size() - range.offset ||
         (range.length != 0 && !range.buffer))
       return false;
   }
@@ -2555,12 +2580,12 @@ PageWriteStatus VecBufferPool::write_range_status(size_t file_offset,
   if (length == 0) {
     return PageWriteStatus::kOk;
   }
-  if (src == nullptr || file_offset > file_size_ ||
-      length > file_size_ - file_offset) {
+  const size_t extent = file_size();
+  if (src == nullptr || file_offset > extent || length > extent - file_offset) {
     LOG_ERROR(
         "write_range exceeds file bounds: file[%s], offset[%zu], "
         "length[%zu], file_size[%zu]",
-        file_name_.c_str(), file_offset, length, file_size_);
+        file_name_.c_str(), file_offset, length, extent);
     return PageWriteStatus::kError;
   }
   size_t first_page = file_offset / kVectorPageSize;
@@ -2606,11 +2631,12 @@ bool VecBufferPool::validate_write_fragments(
     WriteFragmentLayout &layout) const {
   if (writeback_quarantined() || !writable_ || (count && !fragments))
     return false;
+  const size_t extent = file_size();
   for (size_t i = 0; i < count; ++i) {
     const auto &fragment = fragments[i];
     if (!fragment.length) continue;
-    if (fragment.src == nullptr || fragment.file_offset > file_size_ ||
-        fragment.length > file_size_ - fragment.file_offset)
+    if (fragment.src == nullptr || fragment.file_offset > extent ||
+        fragment.length > extent - fragment.file_offset)
       return false;
     const size_t fragment_page = fragment.file_offset / kVectorPageSize;
     const size_t offset_in_page = fragment.file_offset % kVectorPageSize;
@@ -2634,19 +2660,32 @@ PageWriteStatus VecBufferPool::prepare_write_fragments(
                          : PageWriteStatus::kOk;
 }
 
-PageWriteStatus VecBufferPool::pin_write_fragments(
-    const VecBufferWriteFragment *fragments, size_t count,
-    PreparedWritePages &pins) try {
-  // Admission and reads finish before any destination bytes are changed.
-  auto &ids = pins.ids_;
+namespace {
+template <typename Visit>
+bool VisitWriteFragmentPages(const VecBufferWriteFragment *fragments,
+                             size_t count, Visit visit) {
   for (size_t i = 0; i < count; ++i) {
     const auto &fragment = fragments[i];
     if (!fragment.length) continue;
     const size_t last =
         (fragment.file_offset + fragment.length - 1) / kVectorPageSize;
-    for (size_t id = fragment.file_offset / kVectorPageSize; id <= last; ++id)
-      ids.push_back(id);
+    for (size_t id = fragment.file_offset / kVectorPageSize; id <= last; ++id) {
+      if (!visit(id)) return false;
+    }
   }
+  return true;
+}
+}  // namespace
+
+PageWriteStatus VecBufferPool::pin_write_fragments(
+    const VecBufferWriteFragment *fragments, size_t count,
+    PreparedWritePages &pins) try {
+  // Admission and reads finish before any destination bytes are changed.
+  auto &ids = pins.ids_;
+  VisitWriteFragmentPages(fragments, count, [&](block_id_t id) {
+    ids.push_back(id);
+    return true;
+  });
   std::sort(ids.begin(), ids.end());
   ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
   pins.pages_.resize(ids.size());
@@ -2710,13 +2749,44 @@ void VecBufferPool::write_pinned_fragments(
 }
 
 PageWriteStatus VecBufferPool::write_fragments_status(
-    const VecBufferWriteFragment *fragments, size_t count) {
+    const VecBufferWriteFragment *fragments, size_t count) try {
   WriteFragmentLayout layout;
   if (!validate_write_fragments(fragments, count, layout))
     return PageWriteStatus::kError;
   if (!layout.has_data) return PageWriteStatus::kOk;
 
   if (!layout.single_page) {
+    // Most synchronous batches touch only the payload and a few metadata
+    // pages. Keep their pins on the stack until the batch has been committed.
+    constexpr size_t kInlinePages = 8;
+    std::array<block_id_t, kInlinePages> ids;
+    size_t page_count = 0;
+    const bool fits =
+        VisitWriteFragmentPages(fragments, count, [&](block_id_t id) {
+          auto end = ids.begin() + page_count;
+          auto pos = std::lower_bound(ids.begin(), end, id);
+          if (pos != end && *pos == id) return true;
+          if (page_count == ids.size()) return false;
+          std::move_backward(pos, end, end + 1);
+          *pos = id;
+          ++page_count;
+          return true;
+        });
+    if (fits) {
+      std::array<char *, kInlinePages> pages;
+      bool allocation_failed = false;
+      if (!acquire_pages_impl(ids.data(), page_count, pages.data(), 50,
+                              &allocation_failed)) {
+        return allocation_failed ? PageWriteStatus::kNoMemory
+                                 : PageWriteStatus::kError;
+      }
+      const auto release =
+          ScopeGuard::Make([&] { release_pages(ids.data(), page_count); });
+      write_pinned_fragments(fragments, count, ids.data(), pages.data(),
+                             page_count);
+      return PageWriteStatus::kOk;
+    }
+
     PreparedWritePages pins;
     const auto status = pin_write_fragments(fragments, count, pins);
     if (status == PageWriteStatus::kOk)
@@ -2734,6 +2804,8 @@ PageWriteStatus VecBufferPool::write_fragments_status(
   write_pinned_fragments(fragments, count, &layout.page_id, &page, 1);
   page_table_.release_block(layout.page_id);
   return PageWriteStatus::kOk;
+} catch (const std::bad_alloc &) {
+  return PageWriteStatus::kNoMemory;
 }
 
 int VecBufferPool::write_meta(size_t offset, size_t length,
@@ -2747,8 +2819,8 @@ int VecBufferPool::write_meta(size_t offset, size_t length,
   if (length == 0) {
     return 0;
   }
-  if (buffer == nullptr || offset > file_size_ ||
-      length > file_size_ - offset) {
+  const size_t extent = file_size();
+  if (buffer == nullptr || offset > extent || length > extent - offset) {
     return -1;
   }
   ssize_t w = zvec_pwrite(meta_fd_, buffer, length, offset);
@@ -2820,7 +2892,7 @@ bool VecBufferPool::extend_file(size_t new_size) {
               file_name_.c_str());
     return false;
   }
-  if (new_size <= file_size_) {
+  if (new_size <= file_size()) {
     return true;
   }
   // O_DIRECT requires page-aligned backing-file growth. An index written
@@ -2868,14 +2940,14 @@ bool VecBufferPool::extend_file(size_t new_size) {
     }
     return false;
   }
-  file_size_ = new_size;
+  file_size_.store(new_size, std::memory_order_release);
   return true;
 }
 
 bool VecBufferPool::truncate_unused_tail(size_t new_size) {
   if (writeback_quarantined()) return false;
-  if (!writable_ || new_size > file_size_) return false;
-  if (new_size == file_size_) return true;
+  if (!writable_ || new_size > file_size()) return false;
+  if (new_size == file_size()) return true;
 
   std::lock_guard<std::mutex> lock(writeback_flush_mutex_);
   if (writeback_quarantined()) return false;
@@ -2890,14 +2962,15 @@ bool VecBufferPool::truncate_unused_tail(size_t new_size) {
     return false;
   }
   if (discard_pages) page_table_.discard_unused_tail(new_entry_num);
-  file_size_ = new_size;
+  file_size_.store(new_size, std::memory_order_release);
   if (new_size < initial_file_size_) initial_file_size_ = new_size;
   return true;
 }
 
 char *VecBufferPoolHandle::get_single_page(size_t file_offset, size_t len,
                                            size_t &out_page_id) {
-  if (file_offset >= pool_.file_size_ || len > pool_.file_size_ - file_offset) {
+  const size_t extent = pool_.file_size();
+  if (file_offset >= extent || len > extent - file_offset) {
     return nullptr;
   }
   size_t first_page = file_offset / kVectorPageSize;
@@ -2950,8 +3023,8 @@ bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len, char *out,
   if (len == 0) {
     return true;
   }
-  if (out == nullptr || file_offset > pool_.file_size_ ||
-      len > pool_.file_size_ - file_offset) {
+  const size_t extent = pool_.file_size();
+  if (out == nullptr || file_offset > extent || len > extent - file_offset) {
     return false;
   }
   size_t first_page = file_offset / kVectorPageSize;
@@ -3103,7 +3176,7 @@ bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len, char *out,
     }
 
     ssize_t got = zvec_pread(pool_.fd_, bulk_buf, run_bytes, run_file_off);
-    // read_range validated file_offset + len against file_size_ above.
+    // read_range validated file_offset + len against file_size() above.
     size_t needed_bytes = (file_offset + len) - run_file_off;
     if (needed_bytes > run_bytes) needed_bytes = run_bytes;
     if (got < 0 || static_cast<size_t>(got) < needed_bytes) {
@@ -3151,7 +3224,7 @@ bool VecBufferPoolHandle::read_range(size_t file_offset, size_t len, char *out,
         // Admission is optional for immutable scans. Let background reclaim
         // make room instead of cycling one victim for every scanned page.
         const bool oversized_scan = budget.page_admission_reserve() != 0 &&
-                                    pool_.file_size_ > budget.capacity();
+                                    pool_.file_size() > budget.capacity();
         if (!found && !oversized_scan) {
           BlockEvictionQueue::get_instance().recycle();
           found = MemoryLimitPool::get_instance().try_acquire_buffer(
@@ -3179,8 +3252,8 @@ bool VecBufferPoolHandle::read_range_immutable(size_t file_offset, size_t len,
   if (len == 0) {
     return true;
   }
-  if (out == nullptr || file_offset > pool_.file_size_ ||
-      len > pool_.file_size_ - file_offset) {
+  const size_t extent = pool_.file_size();
+  if (out == nullptr || file_offset > extent || len > extent - file_offset) {
     return false;
   }
 
@@ -3288,7 +3361,7 @@ void VecBufferPool::warmup() {
     const size_t read_bytes = pages_in_chunk * kVectorPageSize;
     const size_t file_offset = base * kVectorPageSize;
     const size_t expected_bytes =
-        std::min(read_bytes, file_size_ - file_offset);
+        std::min(read_bytes, file_size() - file_offset);
 
     // One large sequential pread instead of N individual ones.
     ssize_t got = zvec_pread(fd_, chunk_buf, read_bytes, file_offset);
@@ -3386,7 +3459,7 @@ VecBufferPool::PrepareResult VecBufferPool::prepare_pages_if_fits(
       ++pg;
     const size_t bytes = (pg - first) * kVectorPageSize;
     const size_t offset = first * kVectorPageSize;
-    const size_t expected = std::min(bytes, file_size_ - offset);
+    const size_t expected = std::min(bytes, file_size() - offset);
     const ssize_t got = zvec_pread(fd_, scratch.data(), bytes, offset);
     if (got != static_cast<ssize_t>(expected)) {
       result.status = PrepareStatus::kReadError;
@@ -3522,7 +3595,7 @@ void VecBufferPool::prefetch_pages_sync(block_id_t first_page,
     size_t run_pages = run_end - run_start;
     size_t read_bytes = run_pages * kVectorPageSize;
     size_t file_off = run_start * kVectorPageSize;
-    size_t expected_bytes = std::min(read_bytes, file_size_ - file_off);
+    size_t expected_bytes = std::min(read_bytes, file_size() - file_off);
     ssize_t got = zvec_pread(fd_, chunk_buf, read_bytes, file_off);
     if (got != static_cast<ssize_t>(expected_bytes)) {
       pg = run_end;
@@ -3564,8 +3637,9 @@ void VecBufferPool::prefetch_pages_sync(block_id_t first_page,
 
 void VecBufferPoolHandle::prefetch_range(size_t file_offset, size_t len,
                                          uint8_t priority) {
-  if (len == 0 || file_offset >= pool_.file_size_) return;
-  len = std::min(len, pool_.file_size_ - file_offset);
+  const size_t extent = pool_.file_size();
+  if (len == 0 || file_offset >= extent) return;
+  len = std::min(len, extent - file_offset);
   size_t first_page = file_offset / kVectorPageSize;
   size_t last_page = (file_offset + len - 1) / kVectorPageSize;
   pool_.prefetch_pages(static_cast<block_id_t>(first_page),
@@ -3905,7 +3979,7 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
     std::array<bool, kDarwinReadBatch> read_ok{};
     for (size_t i = 0; i < submitted; ++i) {
       const size_t offset = load_pages[i] * kVectorPageSize;
-      const size_t expected = std::min(kVectorPageSize, file_size_ - offset);
+      const size_t expected = std::min(kVectorPageSize, file_size() - offset);
       const struct aiocb *pending = &requests[i];
       int status;
       while ((status = ::aio_error(pending)) == EINPROGRESS) {
@@ -3917,7 +3991,7 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
     }
     for (size_t i = 0; i < allocated; ++i) {
       const size_t offset = load_pages[i] * kVectorPageSize;
-      const size_t expected = std::min(kVectorPageSize, file_size_ - offset);
+      const size_t expected = std::min(kVectorPageSize, file_size() - offset);
       if (!read_ok[i]) {
         abandon_claim(i);
         batch_ok = false;
@@ -4050,7 +4124,7 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
       std::array<IoUringRead, kBlockingAioBatchSize> requests{};
       for (size_t i = 0; i < allocated; ++i) {
         const size_t offset = load_pages[i] * kVectorPageSize;
-        const size_t expected = std::min(kVectorPageSize, file_size_ - offset);
+        const size_t expected = std::min(kVectorPageSize, file_size() - offset);
         requests[i] =
             IoUringRead(offset, kVectorPageSize, buffers[i], expected);
       }
@@ -4118,7 +4192,7 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
       for (size_t i = 0; i < accepted; ++i) {
         const auto idx = reinterpret_cast<uintptr_t>(events[i].data);
         const size_t offset = load_pages[idx] * kVectorPageSize;
-        const size_t expected = std::min(kVectorPageSize, file_size_ - offset);
+        const size_t expected = std::min(kVectorPageSize, file_size() - offset);
         read_ok[idx] = static_cast<ssize_t>(events[i].res) ==
                            static_cast<ssize_t>(expected) &&
                        events[i].res2 == 0;

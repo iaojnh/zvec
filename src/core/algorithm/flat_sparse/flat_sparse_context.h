@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <utility/sparse_utility.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/core/framework/index_context.h>
 #include <zvec/core/framework/index_document.h>
 #include "flat_sparse_entity.h"
@@ -69,7 +70,11 @@ class FlatSparseContext : public IndexContext {
     return &results_.at(idx);
   }
 
-  inline IndexDocumentHeap *result_heap() {
+  ailego::BudgetedString &query_buffer() {
+    return query_buffer_;
+  }
+
+  inline IndexCandidateHeap *result_heap() {
     return &result_heap_;
   }
 
@@ -113,7 +118,6 @@ class FlatSparseContext : public IndexContext {
   void set_group_params(uint32_t group_num, uint32_t group_topk) override {
     group_num_ = group_num;
     group_topk_ = group_topk;
-    result_group_heap_.clear();
   }
 
   //! Get if group by search
@@ -129,7 +133,14 @@ class FlatSparseContext : public IndexContext {
     return group_num_;
   }
 
-  void reset() override {}
+  void reset() override {
+    result_heap_.release();
+    group_results_.clear();
+    for (auto &result : results_) {
+      result.clear();
+      if (result.capacity() > 4096) IndexDocumentList().swap(result);
+    }
+  }
 
   //! Reset the context
   void reset(const FlatSparseStreamer *streamer_ptr) {
@@ -185,14 +196,18 @@ class FlatSparseContext : public IndexContext {
       if (fetch_vector_) {
         node_id_t id = entity()->get_id(key);
         IndexStorage::MemoryBlock vec_block;
-        entity()->get_sparse_vector(id, vec_block);
+        int ret = entity()->get_sparse_vector(id, vec_block);
+        if (ret != 0 || !vec_block.data())
+          throw FlatSparseEntity::ReadError{ret != 0 ? ret
+                                                     : IndexError_ReadData};
         const void *sparse_data = vec_block.data();
         IndexSparseDocument sparse_doc;
         if (sparse_data != nullptr) {
           SparseUtility::ReverseSparseFormat(sparse_data, sparse_doc,
                                              entity()->sparse_unit_size());
         }
-        results_[idx].emplace_back(key, score, id, nullptr, sparse_doc);
+        results_[idx].emplace_back(key, score, id, nullptr,
+                                   std::move(sparse_doc));
       } else {
         results_[idx].emplace_back(key, score);
       }
@@ -206,19 +221,18 @@ class FlatSparseContext : public IndexContext {
   const FlatSparseStreamer *streamer_owner_{nullptr};
   const FlatSparseSearcher *searcher_owner_{nullptr};
   ContextType context_type_{kUnknownContext};
-  std::vector<Stats> stats_vec_{};
+  ailego::BudgetedVector<Stats> stats_vec_{};
   uint32_t magic_{0};
   uint32_t topk_{0};
-  IndexDocumentHeap result_heap_;
-  // std::string batch_queries_{};
+  IndexCandidateHeap result_heap_;
+  ailego::BudgetedString query_buffer_;
   bool fetch_vector_{false};
 
   // group
   uint32_t group_num_{0};
   uint32_t group_topk_{0};
-  std::map<std::string, IndexDocumentHeap> result_group_heap_{};
-  std::vector<IndexDocumentList> results_{};
-  std::vector<IndexGroupDocumentList> group_results_{};
+  ailego::BudgetedVector<IndexDocumentList> results_{};
+  ailego::BudgetedVector<IndexGroupDocumentList> group_results_{};
 };
 
 }  // namespace core

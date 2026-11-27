@@ -70,7 +70,8 @@ class IVFCentroidIndex {
              IndexSearcher::Context::Pointer &ctx);
 
   //! Search the nearest point, must be called in local thread pool
-  uint32_t search_nearest_centroid(const void *query, size_t len);
+  uint32_t search_nearest_centroid(const void *query, size_t len,
+                                   IndexSearcher::Context::Pointer &context);
 
   //! Transform Data and Search the nearest point, called while adding record
   uint32_t transform_and_search_nearest_centroid(

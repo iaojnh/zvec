@@ -1000,6 +1000,43 @@ TEST_F(BufferPoolTest, WritablePoolCanFlushWithoutOptionalIoUringStaging) {
   EXPECT_EQ(value, std::fgetc(file.get()));
 }
 
+TEST_F(BufferPoolTest, CompletedRangeWritebackKeepsPagesResident) {
+  using namespace std::chrono_literals;
+  constexpr size_t pages = 3;
+  init_vec_pool(/*capacity_pages=*/16, pages, /*writable=*/true);
+  const auto path = new_file(pages);
+  VecBufferPool pool(path, true);
+  ASSERT_EQ(0, pool.init());
+  for (size_t page = 0; page < pages; ++page) {
+    ASSERT_EQ(0, pool.write_range(page * kVectorPageSize, 1, "X"));
+  }
+
+  // Limit the request to the one complete page between its partial edges.
+  pool.request_writeback(1, pages * kVectorPageSize - 2);
+  ASSERT_TRUE(pool.extend_file((pages + 1) * kVectorPageSize));
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (pool.stats().writeback_pages == 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_EQ(1u, pool.stats().writeback_pages);
+  EXPECT_TRUE(pool.is_page_resident(1));
+
+  File persisted;
+  ASSERT_TRUE(persisted.open(path, /*rdonly=*/true));
+  for (size_t page = 0; page < pages; ++page) {
+    char value = 0;
+    ASSERT_EQ(1u, persisted.read(page * kVectorPageSize, &value, 1));
+    EXPECT_EQ(page == 1 ? 'X' : static_cast<char>(page), value);
+  }
+  ASSERT_EQ(0, pool.flush_all());
+  for (size_t page = 0; page < pages; ++page) {
+    char value = 0;
+    ASSERT_EQ(1u, persisted.read(page * kVectorPageSize, &value, 1));
+    EXPECT_EQ('X', value);
+  }
+}
+
 TEST_F(BufferPoolTest, ConcurrentWritablePressureUsesBackgroundWriteback) {
   constexpr size_t kFilePages = 64;
   constexpr size_t kThreadCount = 8;
@@ -3573,6 +3610,59 @@ TEST_F(BufferPoolTest, CrossPageWriteAdmissionFailurePreservesAllBytes) {
   ASSERT_TRUE(pool.read_range_bypass(kVectorPageSize - 16, actual.size(),
                                      actual.data()));
   EXPECT_EQ(value, actual);
+}
+
+TEST_F(BufferPoolTest, SmallFragmentBatchRetriesAfterBudgetIsReleased) {
+  init_vec_pool(/*capacity_pages=*/8, /*file_pages=*/2, /*writable=*/true);
+  QueueResidentSampleTestPeer::stop_background();
+  VecBufferPool pool(new_file(2), true);
+  ASSERT_EQ(0, pool.init());
+  char *first = pool.acquire_buffer(0, 0);
+  ASSERT_NE(nullptr, first);
+  const auto unpin = ScopeGuard::Make([&] { pool.get_handle().release_one(0); });
+
+  auto &budget = MemoryLimitPool::get_instance();
+  const size_t held = budget.available();
+  ASSERT_GE(held, kVectorPageSize);
+  const VecBufferWriteFragment writes[] = {
+      {0, 1, "X"}, {0, 0, nullptr}, {kVectorPageSize, 1, "Y"}};
+  {
+    ASSERT_TRUE(budget.try_charge_external(held));
+    const auto release = ScopeGuard::Make([&] { budget.release_external(held); });
+    EXPECT_EQ(PageWriteStatus::kNoMemory,
+              pool.get_handle().write_fragments_status(writes, 3));
+    EXPECT_EQ(0, first[0]);
+  }
+  char second = 0;
+  ASSERT_TRUE(pool.read_range_bypass(kVectorPageSize, 1, &second));
+  EXPECT_EQ(1, second);
+  ASSERT_EQ(PageWriteStatus::kOk,
+            pool.get_handle().write_fragments_status(writes, 3));
+  EXPECT_EQ('X', first[0]);
+  ASSERT_TRUE(pool.read_range_bypass(kVectorPageSize, 1, &second));
+  EXPECT_EQ('Y', second);
+}
+
+TEST_F(BufferPoolTest, LargeFragmentBatchHandlesEmptyAndOverlappingWrites) {
+  constexpr size_t file_pages = 12;
+  init_vec_pool(/*capacity_pages=*/16, file_pages, /*writable=*/true);
+  VecBufferPool pool(new_file(file_pages), true);
+  ASSERT_EQ(0, pool.init());
+  std::vector<char> original(10 * kVectorPageSize, 'X');
+  const std::array<char, 2> replacement{'A', 'B'};
+  const size_t overlap = kVectorPageSize - 1;
+  const VecBufferWriteFragment writes[] = {
+      {0, original.size(), original.data()},
+      {0, 0, nullptr},
+      {overlap, replacement.size(), replacement.data()},
+  };
+  ASSERT_EQ(PageWriteStatus::kOk,
+            pool.get_handle().write_fragments_status(writes, 3));
+  ASSERT_EQ(0, pool.flush_all());
+  std::copy(replacement.begin(), replacement.end(), original.begin() + overlap);
+  std::vector<char> actual(original.size());
+  ASSERT_TRUE(pool.read_range_bypass(0, actual.size(), actual.data()));
+  EXPECT_EQ(original, actual);
 }
 
 TEST_F(BufferPoolTest, AbortedCleanReclaimKeepsDirtyPageInEvictionQueue) {

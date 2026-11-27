@@ -142,6 +142,10 @@ ailego::Params MakeTurboQuantizerParams(const QuantizerParam &quantizer_param,
 
 }  // namespace
 
+BaseIndexParam::Pointer FlatIndex::get_param() const {
+  return std::make_shared<FlatIndexParam>(param_);
+}
+
 int FlatIndex::bind_vector_source(const core::VectorSource &source,
                                   core::IndexContext::Pointer &context) {
   if (!param_.use_external_vector) return core::IndexError_Unsupported;
@@ -154,7 +158,7 @@ int FlatIndex::bind_vector_source(const core::VectorSource &source,
 }
 
 int FlatIndex::add_with_source(const VectorData &vector, uint32_t doc_id,
-                               const core::VectorSource &source) {
+                               const core::VectorSource &source) try {
   if (!is_open_) return core::IndexError_NoReady;
   if (is_read_only_) return core::IndexError_Runtime;
   const auto *dense = std::get_if<DenseVector>(&vector.vector);
@@ -167,11 +171,13 @@ int FlatIndex::add_with_source(const VectorData &vector, uint32_t doc_id,
   // External Flat stores only IDs. Its raw FP32 layout needs no conversion.
   return streamer_->add_with_id_impl(doc_id, dense->data, input_vector_meta_,
                                      context);
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int FlatIndex::search_with_source(
     const VectorData &query, const BaseIndexQueryParam::Pointer &search_param,
-    const core::VectorSource &source, SearchResult *result) {
+    const core::VectorSource &source, SearchResult *result) try {
   if (!is_open_) return core::IndexError_NoReady;
   if (!search_param || !result) return core::IndexError_InvalidArgument;
   *result = SearchResult{};
@@ -180,10 +186,13 @@ int FlatIndex::search_with_source(
   FlatSourceScope scope{context};
   int ret = bind_vector_source(source, context);
   return ret == 0 ? Index::search(query, search_param, result) : ret;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int FlatIndex::open(const std::string &file_path,
-                    StorageOptions storage_options) {
+                    StorageOptions storage_options) try {
+  if (is_open_) return core::IndexError_NoReady;
   // Restore the persisted encoding while keeping the configured structural
   // meta for the streamer's open-time compatibility checks.
   if (turbo_quantizer_ != nullptr) {
@@ -213,11 +222,17 @@ int FlatIndex::open(const std::string &file_path,
         // opened an older file with a different storage precision.
         quantizer_params = persisted_meta.quantizer_params();
       }
+      const bool buffered_training =
+          storage_options.create_new &&
+          storage_options.type == StorageOptions::StorageType::kBufferPool &&
+          ailego::MemoryLimitPool::get_instance().capacity() != 0;
+      quantizer_params.set("buffered_training", buffered_training);
       int ret =
           create_and_init_turbo_quantizer(quantizer_name, quantizer_params);
       if (ret != 0) {
         return ret;
       }
+      turbo_quantizer_->set_buffered_training(buffered_training);
       ret = create_and_init_streamer(param_);
       if (ret != 0) {
         return ret;
@@ -225,6 +240,8 @@ int FlatIndex::open(const std::string &file_path,
     }
   }
   return Index::open(file_path, storage_options);
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int FlatIndex::fallback_to_legacy_pipeline() {

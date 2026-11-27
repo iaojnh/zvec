@@ -12,6 +12,9 @@ foreach(CC_SRCS ${ALL_TEST_SRCS})
     # Same registered centroid trainer as the dedicated RaBitQ index.
     list(APPEND TEST_EXTRA_LIBS core_knn_cluster rabitqlib)
   endif()
+  if(CC_TARGET STREQUAL "turbo_pq_training_samples_test")
+    list(APPEND TEST_EXTRA_LIBS core_utility)
+  endif()
   cc_gtest(
       NAME ${CC_TARGET}
       STRICT

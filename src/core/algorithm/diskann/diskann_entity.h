@@ -131,6 +131,14 @@ static_assert(sizeof(DiskAnnLegacyPqMeta) == sizeof(DiskAnnPqMeta),
 
 class DiskAnnEntity {
  public:
+  class VectorReader {
+   public:
+    virtual ~VectorReader() = default;
+    // NotImplemented requests the normal borrowed read (e.g. a hot batch).
+    // NoMemory requests a smaller synchronous working set.
+    virtual int submit(const diskann_id_t *ids, size_t count) = 0;
+    virtual int finish(IndexStorage::MemoryBlock *blocks, size_t count) = 0;
+  };
   DiskAnnEntity() = default;
   virtual ~DiskAnnEntity() = default;
 
@@ -158,13 +166,71 @@ class DiskAnnEntity {
     return nullptr;
   }
 
+  //! Keep paged or temporary vector data alive for the caller's whole read.
+  //! Legacy entities expose stable storage and need no owning handle.
+  virtual int read_vector(diskann_id_t id,
+                          IndexStorage::MemoryBlock &block) const {
+    block = IndexStorage::MemoryBlock();
+    const void *vector = get_vector(id);
+    if (vector == nullptr) {
+      return IndexError_ReadData;
+    }
+    block =
+        IndexStorage::MemoryBlock::MakeBorrowedView(const_cast<void *>(vector));
+    return 0;
+  }
+
+  // A bounded neighbor batch. All returned handles remain valid together;
+  // failure releases every handle, including those filled before the error.
+  static constexpr size_t kVectorReadBatchSize = 32;
+  virtual bool prefer_vector_batch() const {
+    return false;
+  }
+  virtual int read_vectors(const diskann_id_t *ids,
+                           IndexStorage::MemoryBlock *blocks,
+                           size_t count) const {
+    if (count == 0) return 0;
+    if (!ids || !blocks || count > kVectorReadBatchSize)
+      return IndexError_InvalidArgument;
+    for (size_t i = 0; i < count; ++i) blocks[i].reset();
+    for (size_t i = 0; i < count; ++i) {
+      const int ret = read_vector(ids[i], blocks[i]);
+      if (ret != 0) {
+        for (size_t j = 0; j < count; ++j) blocks[j].reset();
+        return ret;
+      }
+    }
+    return 0;
+  }
+
   virtual std::pair<uint32_t, const diskann_id_t *> get_neighbors(
       diskann_id_t /*id*/) const {
     return std::make_pair(0, nullptr);
   }
 
+  //! Snapshot adjacency before releasing a page or changing another node.
+  virtual int read_neighbors(
+      diskann_id_t id, ailego::BudgetedVector<diskann_id_t> *neighbors) const
+      try {
+    if (neighbors == nullptr) {
+      return IndexError_InvalidArgument;
+    }
+    neighbors->clear();
+    const auto view = get_neighbors(id);
+    if (view.first != 0) {
+      if (view.second == nullptr) {
+        return IndexError_ReadData;
+      }
+      neighbors->assign(view.second, view.second + view.first);
+    }
+    return 0;
+  } catch (const std::bad_alloc &) {
+    return IndexError_NoMemory;
+  }
+
   virtual int set_neighbors(
-      diskann_id_t /*id*/, const std::vector<diskann_id_t> & /*neighbor_ids*/) {
+      diskann_id_t /*id*/,
+      const ailego::BudgetedVector<diskann_id_t> & /*neighbor_ids*/) {
     return IndexError_NotImplemented;
   }
 
@@ -178,6 +244,7 @@ class DiskAnnEntity {
   //! Get primary key of the node id
   virtual diskann_key_t get_key(diskann_id_t id) const = 0;
 
+  // Checked accessors distinguish pageable-metadata I/O errors from a miss.
   virtual int read_key(diskann_id_t id, diskann_key_t *key) const {
     if (!key || id >= doc_cnt()) return IndexError_InvalidArgument;
     *key = get_key(id);
@@ -232,6 +299,11 @@ class DiskAnnEntity {
   virtual const DiskAnnEntity::Pointer clone() const {
     LOG_ERROR("Update neighbors not implemented");
     return DiskAnnEntity::Pointer();
+  }
+
+  // Optional bounded read-ahead. Unsupported layouts keep read_vectors().
+  virtual std::unique_ptr<VectorReader> create_vector_reader() const {
+    return nullptr;
   }
 
  public:

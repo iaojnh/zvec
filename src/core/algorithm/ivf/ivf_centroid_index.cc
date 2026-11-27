@@ -304,8 +304,8 @@ int IVFCentroidIndex::search(const void *query, const IndexQueryMeta &qmeta,
   return 0;
 }
 
-uint32_t IVFCentroidIndex::search_nearest_centroid(const void *query,
-                                                   size_t len) {
+uint32_t IVFCentroidIndex::search_nearest_centroid(
+    const void *query, size_t len, IndexSearcher::Context::Pointer &context) {
   //! Called in building index precedure, so transform the query is needless
   if (len != meta_.element_size()) {
     LOG_ERROR("Invalid query size actual: %zu, expected: %u", len,
@@ -313,8 +313,10 @@ uint32_t IVFCentroidIndex::search_nearest_centroid(const void *query,
     return kInvalidID;
   }
 
-  thread_local IndexSearcher::Context::Pointer context(
-      searcher_->create_context());
+  if (!context) {
+    context = searcher_->create_context();
+    if (!context) return kInvalidID;
+  }
   context->set_topk(1);
 
   IndexQueryMeta qmeta(meta_.data_type(), meta_.dimension());

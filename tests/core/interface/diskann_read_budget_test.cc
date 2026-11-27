@@ -43,6 +43,11 @@ void *operator new(size_t size, std::align_val_t alignment) {
   return memory;
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+// GCC diagnoses the matching aligned new and delete replacements after
+// inlining the free call into a C++ delete expression.
+[[gnu::noinline]]
+#endif
 void operator delete(void *memory, std::align_val_t) noexcept {
   ailego_aligned_free(memory);
 }
@@ -708,8 +713,11 @@ TEST_P(DiskAnnReadBudgetTest, InternalIdsPreserveNoMemoryFromAutoTrain) {
 
   const auto param = parameters(false);
   auto &rss = ailego::MemoryLimitPool::get_instance();
-  ASSERT_TRUE(rss.configure_process_rss_limit(kHighRss));
   for (bool refine : {false, true}) {
+    // The fault targets the first medoid read, after construction. Start each
+    // build without RSS accounting so its writable stores do not retain
+    // process-lifetime worker-stack reservations in this shared pool fixture.
+    ASSERT_TRUE(rss.configure_process_rss_limit(0));
     SCOPED_TRACE(refine);
     auto index = IndexFactory::CreateAndInitIndex(*param);
     ASSERT_NE(nullptr, index);

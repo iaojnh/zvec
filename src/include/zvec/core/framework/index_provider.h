@@ -15,6 +15,7 @@
 #pragma once
 
 #include <unordered_map>
+#include <zvec/core/framework/index_document.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_storage.h>
@@ -45,20 +46,41 @@ struct IndexProvider : public IndexHolder {
     return IndexError_NotImplemented;
   }
 
-  //! Retrieve vectors using primary keys.
+  using VectorBlocks = ailego::BudgetedVector<IndexStorage::MemoryBlock>;
+
+  //! Legacy caller-owned output must be preallocated when a pool is enabled.
   virtual int get_vectors(
       const uint64_t *keys, uint32_t count,
       std::vector<IndexStorage::MemoryBlock> &blocks) const {
+    if (ailego::MemoryLimitPool::get_instance().capacity() &&
+        count > blocks.capacity())
+      return IndexError_NoMemory;
+    return get_vectors_impl(keys, count, blocks);
+  }
+  virtual int get_vectors(const uint64_t *keys, uint32_t count,
+                          VectorBlocks &blocks) const {
+    return get_vectors_impl(keys, count, blocks);
+  }
+
+ private:
+  template <typename Blocks>
+  int get_vectors_impl(const uint64_t *keys, uint32_t count,
+                       Blocks &blocks) const try {
     blocks.resize(count);
     for (uint32_t i = 0; i < count; ++i) {
       int ret = get_vector(keys[i], blocks[i]);
       if (ret != 0) {
+        blocks.clear();
         return ret;
       }
     }
     return 0;
+  } catch (const std::bad_alloc &) {
+    blocks.clear();
+    return IndexError_NoMemory;
   }
 
+ public:
   //! Retrieve the owner class
   virtual const std::string &owner_class() const = 0;
 };
@@ -78,6 +100,13 @@ struct IndexSparseProvider : IndexSparseHolder {
 
  public:  // Provider's unique method
   //! Retrieve a vector using a primary key
+  // Owned output: capacity is admitted before decoding and remains charged
+  // until the caller releases the result (including copies and moves).
+  virtual int get_sparse_vector(uint64_t /*key*/,
+                                IndexSparseDocument & /*result*/) const {
+    return IndexError_NotImplemented;
+  }
+
   virtual int get_sparse_vector(uint64_t key, uint32_t *sparse_count,
                                 std::string *sparse_indices_buffer,
                                 std::string *sparse_values_buffer) const = 0;
@@ -89,7 +118,8 @@ struct IndexSparseProvider : IndexSparseHolder {
 /*! Multi-Pass Numerical Index Provider
  */
 template <typename T>
-class MultiPassNumericalIndexProvider : public IndexProvider {
+class MultiPassNumericalIndexProvider : public IndexProvider,
+                                        public OrdinalAccessHolder {
  public:
   //! Constructor
   explicit MultiPassNumericalIndexProvider(size_t dim)
@@ -97,6 +127,11 @@ class MultiPassNumericalIndexProvider : public IndexProvider {
 
   //! Destructor
   ~MultiPassNumericalIndexProvider() override = default;
+
+  int create_ordinal_reader(
+      OrdinalAccessHolder::Reader::Pointer *out) override {
+    return holder_.create_ordinal_reader(out);
+  }
 
   //! Retrieve count of elements in holder
   size_t count() const override {

@@ -17,6 +17,7 @@
 #include <atomic>
 #include <zvec/core/framework/index_context.h>
 #include <zvec/core/framework/index_dumper.h>
+#include <zvec/core/framework/index_key_batch.h>
 #include <zvec/core/framework/index_meta.h>
 #include <zvec/core/framework/index_metric.h>
 #include <zvec/core/framework/index_module.h>
@@ -464,6 +465,13 @@ class IndexRunner : public IndexModule {
   }
 
   //! Get vector by key
+  // Owned output: capacity is admitted before decoding and remains charged
+  // until the caller releases the result (including copies and moves).
+  virtual int get_sparse_vector(uint64_t /*key*/,
+                                IndexSparseDocument & /*result*/) const {
+    return IndexError_NotImplemented;
+  }
+
   virtual int get_sparse_vector(uint64_t /*key*/, uint32_t * /*sparse_count*/,
                                 std::string * /*sparse_indices_buffer*/,
                                 std::string * /*sparse_values_buffer*/) const {
@@ -471,6 +479,11 @@ class IndexRunner : public IndexModule {
   }
 
   //! Fetch vector by id
+  virtual int get_sparse_vector_by_id(uint32_t /*id*/,
+                                      IndexSparseDocument & /*result*/) const {
+    return IndexError_NotImplemented;
+  }
+
   virtual int get_sparse_vector_by_id(
       uint32_t /*id*/, uint32_t * /*sparse_count*/,
       std::string * /*sparse_indices_buffer*/,
@@ -601,6 +614,15 @@ class IndexRunner : public IndexModule {
     return IndexError_NotImplemented;
   }
 
+  //! Single-query entry point allowing implementations to borrow candidate
+  //! keys without copying them into a batch container.
+  virtual int search_bf_by_keys_impl(const void *query,
+                                     const std::vector<uint64_t> &keys,
+                                     const IndexQueryMeta &qmeta,
+                                     Context::Pointer &context) const {
+    return search_bf_by_p_keys_impl(query, {keys}, qmeta, 1, context);
+  }
+
   //! Similarity brute force search by primary keys
   virtual int search_bf_by_p_keys_impl(
       const void *query, const std::vector<std::vector<uint64_t>> &p_keys,
@@ -615,6 +637,17 @@ class IndexRunner : public IndexModule {
       const IndexQueryMeta & /*qmeta*/, uint32_t /*count*/,
       Context::Pointer & /*context*/) const {
     return IndexError_NotImplemented;
+  }
+
+  //! Linear search by primary keys with dense and sparse inputs
+  virtual int search_bf_by_keys_impl(uint32_t sparse_count,
+                                     const uint32_t *sparse_indices,
+                                     const void *sparse_query,
+                                     const std::vector<uint64_t> &keys,
+                                     const IndexQueryMeta &qmeta,
+                                     Context::Pointer &context) const {
+    return search_bf_by_p_keys_impl(sparse_count, sparse_indices, sparse_query,
+                                    {keys}, qmeta, context);
   }
 
   //! Linear search by primary keys with dense and sparse inputs

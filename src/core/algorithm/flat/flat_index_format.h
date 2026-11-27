@@ -22,9 +22,9 @@ using node_id_t = uint32_t;
 using key_t = uint64_t;
 using level_t = int32_t;
 using dist_t = float;
-using TopkHeap = ailego::KeyValueHeap<node_id_t, dist_t>;
+using TopkHeap = ailego::BudgetedKeyValueHeap<node_id_t, dist_t>;
 using CandidateHeap =
-    ailego::KeyValueHeap<node_id_t, dist_t, std::greater<dist_t>>;
+    ailego::BudgetedKeyValueHeap<node_id_t, dist_t, std::greater<dist_t>>;
 constexpr node_id_t kInvalidNodeId = static_cast<node_id_t>(-1);
 constexpr key_t kInvalidKey = static_cast<key_t>(-1);
 

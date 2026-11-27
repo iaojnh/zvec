@@ -15,6 +15,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -23,6 +24,10 @@
 #include <ailego/parallel/lock.h>
 #include <ailego/utility/memory_helper.h>
 #include <turbo/quantizer/quantizer.h>
+#include <zvec/ailego/buffer/budgeted_allocator.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
+#include <zvec/ailego/buffer/budgeted_mapped_buffer.h>
+#include <zvec/ailego/buffer/retained_block_allocator.h>
 #include <zvec/ailego/utility/string_helper.h>
 #include <zvec/core/framework/index_context.h>
 #include <zvec/core/framework/index_framework.h>
@@ -36,12 +41,12 @@ namespace core {
 
 //! Reusable request-local buffers for storage-specific Flat search paths.
 struct FlatSearchScratch {
-  std::vector<const void *> vector_ptrs{};
-  std::vector<const void *> extra_values{};
-  std::vector<uint64_t> vector_keys{};
-  std::vector<float> distances{};
-  std::vector<uint8_t> query_buffer{};
-  std::vector<uint8_t> key_presence{};
+  ailego::BudgetedVector<const void *> vector_ptrs{};
+  ailego::BudgetedVector<const void *> extra_values{};
+  ailego::BudgetedVector<uint64_t> vector_keys{};
+  ailego::BudgetedVector<float> distances{};
+  ailego::BudgetedVector<uint8_t> query_buffer{};
+  ailego::BudgetedVector<uint8_t> key_presence{};
   turbo::BatchTopK batch_topk;
 };
 
@@ -74,7 +79,7 @@ class FlatStreamerEntity {
 
   //! Search in linear list with filter
   virtual int search(const void *query, const IndexFilter &filter,
-                     uint32_t *scan_count, IndexDocumentHeap *heap,
+                     uint32_t *scan_count, IndexCandidateHeap *heap,
                      IndexContext::Stats *context_stats,
                      FlatSearchScratch *scratch = nullptr,
                      size_t batch_size = 0) const;
@@ -83,7 +88,7 @@ class FlatStreamerEntity {
   virtual int search_by_p_keys(const void *query,
                                const std::vector<uint64_t> &p_keys,
                                const IndexFilter &filter,
-                               IndexDocumentHeap *heap,
+                               IndexCandidateHeap *heap,
                                FlatSearchScratch *scratch = nullptr,
                                size_t batch_size = 0) const;
 
@@ -97,20 +102,20 @@ class FlatStreamerEntity {
                                     FlatSearchScratch *scratch) const;
 
   //! Search in a block
-  void search_block(const void *query, const BlockLocation &bl,
-                    const BlockHeader *hd, float norm_val,
-                    IndexDocumentHeap *heap) const;
+  int search_block(const void *query, const BlockLocation &bl,
+                   const BlockHeader *hd, float norm_val,
+                   IndexCandidateHeap *heap, float *distances) const;
 
   //! Search in a block with filter
-  void search_block(const void *query, const BlockLocation &bl,
-                    const BlockHeader *hd, float norm_val,
-                    const IndexFilter &filter, const DeletionMap *deletion_map,
-                    IndexDocumentHeap *heap,
-                    IndexContext::Stats *context_stats) const;
+  int search_block(const void *query, const BlockLocation &bl,
+                   const BlockHeader *hd, float norm_val,
+                   const IndexFilter &filter, const DeletionMap *deletion_map,
+                   IndexCandidateHeap *heap, IndexContext::Stats *context_stats,
+                   float *distances) const;
 
   //! Flat Search with filter
   int search_bf(const void *query, const IndexFilter &filter,
-                IndexDocumentHeap *heap,
+                IndexCandidateHeap *heap,
                 IndexContext::Stats *context_stats) const;
 
   //! Clone the entity
@@ -159,6 +164,15 @@ class FlatStreamerEntity {
   int get_vectors_by_key(const uint64_t *keys, uint32_t count,
                          std::vector<IndexStorage::MemoryBlock> &blocks) const;
 
+  int get_vectors_by_key(const uint64_t *keys, uint32_t count,
+                         IndexProvider::VectorBlocks &blocks) const;
+
+ private:
+  template <typename Blocks>
+  int get_vectors_by_key_impl(const uint64_t *keys, uint32_t count,
+                              Blocks &blocks) const;
+
+ public:
   //! Create a new iterator
   IndexProvider::Iterator::Pointer creater_iterator() const;
 
@@ -169,19 +183,23 @@ class FlatStreamerEntity {
   }
 
   void set_use_key_info_map(bool use_id_map) {
-    use_key_info_map_ = use_id_map;
+    use_key_info_map_ = use_id_map || use_external_vector_;
     LOG_DEBUG("use_key_info_map_: %d", (int)use_key_info_map_);
   }
 
   void set_use_external_vector(bool enabled) {
     use_external_vector_ = enabled;
+    // External IDs are compactly persisted and need membership lookup even
+    // when the caller disables the embedded direct-ID map.
+    if (enabled) use_key_info_map_ = true;
     // Persist the physical layout independently of the logical vector meta.
     meta_.header.reserved_[0] = enabled ? 1 : 0;
   }
 
   // A null keys pointer denotes consecutive IDs starting at first_key.
+  template <typename Allocator>
   void key_presence(const uint32_t *keys, size_t count, uint32_t first_key,
-                    std::vector<uint8_t> *present) const {
+                    std::vector<uint8_t, Allocator> *present) const {
     present->resize(count);
     ailego::ReadLock lock(*key_info_map_lock_);
     std::lock_guard<ailego::ReadLock> guard(lock);
@@ -191,20 +209,26 @@ class FlatStreamerEntity {
     }
   }
 
+  bool contains_key(uint64_t key) const {
+    std::shared_lock<ailego::SharedMutex> lock(*key_info_map_lock_);
+    return key_info_map_.find(key) != key_info_map_.end();
+  }
+
   size_t registered_key_count() const {
     ailego::ReadLock lock(*key_info_map_lock_);
     std::lock_guard<ailego::ReadLock> guard(lock);
-    return id_key_vector_.size();
+    return external_keys_.size();
   }
 
   // Copy a bounded batch so source callbacks never run under the key lock.
+  template <typename Allocator>
   void get_registered_keys(size_t offset, size_t count,
-                           std::vector<uint64_t> *keys) const {
+                           std::vector<uint64_t, Allocator> *keys) const {
     ailego::ReadLock lock(*key_info_map_lock_);
     std::lock_guard<ailego::ReadLock> guard(lock);
-    offset = std::min(offset, id_key_vector_.size());
-    count = std::min(count, id_key_vector_.size() - offset);
-    auto begin = id_key_vector_.begin() + offset;
+    offset = std::min(offset, external_keys_.size());
+    count = std::min(count, external_keys_.size() - offset);
+    auto begin = external_keys_.begin() + offset;
     keys->assign(begin, begin + count);
   }
 
@@ -228,26 +252,29 @@ class FlatStreamerEntity {
     quantizer_ = quantizer;
   }
 
+  struct ReadError {
+    int status;
+  };
+
   //! Read a key without conflating a missing slot with a storage read error.
   //! A valid positional hole returns success with kInvalidKey.
   inline int get_key(uint32_t id, uint64_t *out) const {
     if (!out) {
-      return -1;
+      return IndexError_InvalidArgument;
     }
-    if (!use_key_info_map_) {
-      // Positional indexes do not rebuild the key cache on open.
-      return get_key_by_position(id, out);
+    if (id >= vector_count()) {
+      return IndexError_OutOfRange;
     }
-    if (id >= id_key_vector_.size()) {
-      return -1;
-    }
-    *out = id_key_vector_[id];
-    return 0;
+    return get_key_by_position(id, out);
   }
 
   inline uint64_t key(uint32_t id) const {
-    uint64_t out = kInvalidKey;
-    return get_key(id, &out) == 0 ? out : kInvalidKey;
+    uint64_t result = kInvalidKey;
+    if (id >= vector_count()) return kInvalidKey;
+    const int ret = get_key(id, &result);
+    if (ret != 0)
+      throw ReadError{ret == IndexError_NoMemory ? ret : IndexError_ReadData};
+    return result;
   }
 
   inline void row_major_distance(const void *query, const void *feature,
@@ -255,12 +282,14 @@ class FlatStreamerEntity {
     const uint8_t *cur_feature = reinterpret_cast<const uint8_t *>(feature);
     if (quantizer_) {
       if (fnum > 1) {
-        std::vector<const void *> dp_list(fnum);
-        for (size_t f = 0; f < fnum; ++f) {
-          dp_list[f] = cur_feature + f * index_meta_.element_size();
+        std::array<const void *, 32> dp_list;
+        for (size_t start = 0; start < fnum; start += dp_list.size()) {
+          const size_t count = std::min(dp_list.size(), fnum - start);
+          for (size_t f = 0; f < count; ++f)
+            dp_list[f] = cur_feature + (start + f) * index_meta_.element_size();
+          quantizer_->calc_distance_dp_query_batch(
+              dp_list.data(), static_cast<int>(count), query, out + start);
         }
-        quantizer_->calc_distance_dp_query_batch(
-            dp_list.data(), static_cast<int>(fnum), query, out);
       } else {
         *out = quantizer_->calc_distance_dp_query(cur_feature, query);
       }
@@ -274,6 +303,9 @@ class FlatStreamerEntity {
 
   virtual int add_vector_with_id(const uint32_t id, const void *query,
                                  const uint32_t element_size);
+  int prepare_add_vector_with_id(
+      uint32_t id, const void *query, uint32_t size,
+      std::unique_ptr<IndexStreamer::PreparedAdd> *out);
 
  protected:
   const IndexMetric::MatrixDistance &distance() const {
@@ -303,7 +335,7 @@ class FlatStreamerEntity {
   int get_key_by_position(uint32_t id, uint64_t *key) const;
 
   size_t id_key_count() const {
-    return id_key_vector_.size();
+    return vector_count();
   }
 
   bool use_key_info_map() const {
@@ -317,7 +349,7 @@ class FlatStreamerEntity {
 
  private:
   int search_batch_rows(const void *query, const IndexFilter &filter,
-                        uint32_t *scan_count, IndexDocumentHeap *heap,
+                        uint32_t *scan_count, IndexCandidateHeap *heap,
                         IndexContext::Stats *context_stats,
                         FlatSearchScratch *scratch, size_t batch_size) const;
 
@@ -326,11 +358,14 @@ class FlatStreamerEntity {
   class Iterator : public IndexProvider::Iterator {
    public:
     //! Constructor
-    Iterator(const FlatStreamerEntity::Pointer &entity) : entity_(entity) {
+    Iterator(const FlatStreamerEntity::Pointer &entity)
+        : entity_(entity), remaining_(entity->vector_count()) {
       this->read_next_block();
     }
     //! Retrieve pointer of data
     const void *data() const override {
+      if (!is_valid_) return nullptr;
+      if (entity_->storage_->vec_buffer_pool()) return row_.data();
       return reinterpret_cast<const char *>(data_) +
              block_vector_index_ * entity_->index_meta_.element_size();
     }
@@ -338,24 +373,38 @@ class FlatStreamerEntity {
     bool is_valid() const override {
       return is_valid_;
     }
+    int status() const override {
+      return status_;
+    }
     //! Retrieve primary key
     uint64_t key() const override {
+      if (entity_->storage_->vec_buffer_pool()) return key_;
       return keys_[block_vector_index_];
     }
     //! Next iterator
     void next() override {
+      if (!is_valid_) return;
+      if (--remaining_ == 0) {
+        is_valid_ = false;
+        return;
+      }
       if (++block_vector_index_ == block_vector_count_) {
         ++block_index_;
         this->read_next_block();
+      } else if (entity_->storage_->vec_buffer_pool()) {
+        read_row();
       }
     }
 
    private:
     //! Read next non-empty block
     void read_next_block();
+    void read_row();
 
     //! Members
     std::string buffer_{};
+    std::vector<char, ailego::BudgetedAllocator<char>> row_;
+    uint64_t key_{0};
     const FlatStreamerEntity::Pointer entity_;
     IndexStorage::MemoryBlock block_;
     const void *data_{nullptr};
@@ -365,6 +414,8 @@ class FlatStreamerEntity {
     uint32_t block_vector_index_{0u};
     uint32_t block_vector_count_{0u};
     bool is_valid_{true};
+    size_t remaining_{0};
+    int status_{0};
   };
 
   //! Retrive storage segment by index
@@ -404,8 +455,11 @@ class FlatStreamerEntity {
   //! Load keys to keys map
   int load_segment_keys_to_map(BlockLocation block);
 
-  //! Load keys to keys map
-  int load_segment_keys_to_vector();
+  // Positions are derived from block layout; only one prefix per segment.
+  bool locate_position(uint64_t id, VectorLocation *loc,
+                       size_t *key_offset = nullptr) const;
+
+  Pointer clone_impl(bool copy_key_map, bool propagate_oom = false) const;
 
   //! Load index from storage
   int load_storage(IndexStorage::Pointer storage);
@@ -421,9 +475,10 @@ class FlatStreamerEntity {
     if (!hd_segment) {
       return IndexError_WriteData;
     }
-    if (hd_segment->write(0, &block, sizeof(block)) != sizeof(block)) {
+    const IndexStorage::SegmentData write{0, sizeof(block), &block};
+    if (!hd_segment->write_batch(&write, 1)) {
       LOG_ERROR("Failed to write head block location");
-      return IndexError_WriteData;
+      return hd_segment->write_error();
     }
 
     return 0;
@@ -437,9 +492,15 @@ class FlatStreamerEntity {
 
   //! Add a record to a block
   int add_to_block(const BlockLocation &block, uint64_t key, const void *data,
-                   size_t size);
+                   size_t size, std::unique_lock<std::mutex> *lock = nullptr,
+                   std::unique_ptr<IndexStreamer::PreparedAdd> *out = nullptr);
+  int append_vector_with_id(uint32_t id, const void *query, uint32_t size,
+                            std::unique_lock<std::mutex> &lock,
+                            std::unique_ptr<IndexStreamer::PreparedAdd> *out);
 
  private:
+  class PreparedVectorAdd;
+
   size_t stored_vector_size() const {
     return use_external_vector_ ? 0 : index_meta_.element_size();
   }
@@ -470,6 +531,14 @@ class FlatStreamerEntity {
            vector_index * stored_vector_size();
   }
 
+  static void check_read_budget(const IndexStorage::Segment::Pointer &segment) {
+    // The legacy block helpers return a short-read marker. Preserve budget
+    // refusal before that marker becomes a generic read/format error; public
+    // streamer entry points translate bad_alloc to IndexError_NoMemory.
+    if (segment && segment->read_error() == IndexError_NoMemory)
+      throw std::bad_alloc();
+  }
+
   //! Get header block of an linear list
   int get_head_block(IndexStorage::MemoryBlock &header_block) const {
     auto hd_segment = get_segment(0);
@@ -479,6 +548,7 @@ class FlatStreamerEntity {
     if (hd_segment->read(0, header_block, sizeof(BlockLocation)) !=
         sizeof(BlockLocation)) {
       LOG_ERROR("Failed to read head block location");
+      check_read_budget(hd_segment);
       return -1;
     }
     return 0;
@@ -494,6 +564,7 @@ class FlatStreamerEntity {
     if (segment->read(off, header_block, sizeof(BlockHeader)) !=
         sizeof(BlockHeader)) {
       LOG_ERROR("Failed to read block header, off=%zu", off);
+      check_read_budget(segment);
       return -1;
     }
     return 0;
@@ -507,6 +578,7 @@ class FlatStreamerEntity {
     if (segment->read(off, deletion_map_block, sizeof(DeletionMap)) !=
         sizeof(DeletionMap)) {
       LOG_ERROR("Failed to read deletion map, off=%zu", off);
+      check_read_budget(segment);
       return -1;
     }
     return 0;
@@ -521,6 +593,7 @@ class FlatStreamerEntity {
                       block_vector_count() * sizeof(uint64_t)) !=
         block_vector_count() * sizeof(uint64_t)) {
       LOG_ERROR("Failed to read block header, off=%zu", off);
+      check_read_budget(segment);
       return -1;
     }
     return 0;
@@ -535,6 +608,7 @@ class FlatStreamerEntity {
                       block_vector_count() * index_meta_.element_size()) !=
         block_vector_count() * index_meta_.element_size()) {
       LOG_ERROR("Failed to read block header, off=%zu", off);
+      check_read_budget(segment);
       return -1;
     }
     return 0;
@@ -562,13 +636,51 @@ class FlatStreamerEntity {
   std::shared_ptr<zvec::turbo::Quantizer> quantizer_{};
   IndexMetric::DistanceBatchQueryPreprocessFunc batch_query_preprocess_{};
   size_t extra_values_size_{0};
-  mutable std::vector<IndexStorage::Segment::Pointer> segments_{};
+  mutable ailego::BudgetedVector<IndexStorage::Segment::Pointer> segments_{};
   IndexStreamer::Stats &stats_;
   mutable std::shared_ptr<ailego::SharedMutex> key_info_map_lock_{};
-  std::unordered_map<uint64_t, VectorLocation> key_info_map_{};
-  std::vector<VectorLocation> withid_key_info_map_{};
-  std::vector<uint32_t> withid_key_map_{};
-  std::vector<uint64_t> id_key_vector_{};
+  using KeyMap =
+      std::unordered_map<uint64_t, VectorLocation, std::hash<uint64_t>,
+                         std::equal_to<uint64_t>,
+                         ailego::RetainedBlockAllocator<
+                             std::pair<const uint64_t, VectorLocation>>>;
+  KeyMap key_info_map_{};
+  // Only external sources need an ordered directory for bounded random reads.
+  // Mapped backing stays charged until the directory storage is released.
+  std::vector<uint64_t, ailego::RetainedBlockAllocator<uint64_t>>
+      external_keys_{key_info_map_.get_allocator()};
+
+  // Reserve both bucket capacity and the node before publishing vector bytes.
+  // Failed admission leaves the lookup table unchanged and releases the node.
+  KeyMap::node_type prepare_key(uint64_t key) {
+    if (!use_key_info_map_) return {};
+    std::unique_lock<ailego::SharedMutex> lock(*key_info_map_lock_);
+    if (key_info_map_.find(key) != key_info_map_.end()) return {};
+    if (use_external_vector_ &&
+        external_keys_.size() == external_keys_.capacity())
+      external_keys_.reserve(std::max(size_t{8}, external_keys_.size() * 2));
+    if (key_info_map_.size() + 1 >
+        key_info_map_.bucket_count() * key_info_map_.max_load_factor())
+      key_info_map_.reserve(std::max(size_t{8}, key_info_map_.size() * 2));
+    KeyMap pending(key_info_map_.get_allocator());
+    pending.emplace(key, VectorLocation{});
+    return pending.extract(key);
+  }
+  void publish_key(uint64_t key, const VectorLocation &loc,
+                   KeyMap::node_type pending) {
+    if (!use_key_info_map_) return;
+    std::unique_lock<ailego::SharedMutex> lock(*key_info_map_lock_);
+    if (pending) {
+      pending.mapped() = loc;
+      key_info_map_.insert(std::move(pending));
+      // prepare_key admitted capacity before the persistent write.
+      if (use_external_vector_) external_keys_.push_back(key);
+    } else {
+      key_info_map_.find(key)->second = loc;
+    }
+  }
+
+  ailego::BudgetedVector<uint64_t> segment_first_id_{};
   bool filter_same_key_{false};
   // Linear metadata only needs rewriting after creation or vector writes.
   bool meta_dirty_{false};
@@ -594,10 +706,10 @@ class FlatContiguousStreamerEntity : public FlatStreamerEntity {
                          uint32_t element_size) override;
 
   int search(const void *query, const IndexFilter &filter, uint32_t *scan_count,
-             IndexDocumentHeap *heap, IndexContext::Stats *context_stats,
+             IndexCandidateHeap *heap, IndexContext::Stats *context_stats,
              FlatSearchScratch *scratch, size_t batch_size) const override;
   int search_by_p_keys(const void *query, const std::vector<uint64_t> &p_keys,
-                       const IndexFilter &filter, IndexDocumentHeap *heap,
+                       const IndexFilter &filter, IndexCandidateHeap *heap,
                        FlatSearchScratch *scratch,
                        size_t batch_size) const override;
 
@@ -612,19 +724,15 @@ class FlatContiguousStreamerEntity : public FlatStreamerEntity {
   }
 
  private:
-  struct ContiguousDeleter {
-    size_t size;
-    void operator()(char *ptr) const {
-      ailego::MemoryHelper::FreeHugePage(ptr, size);
-    }
-  };
-
   struct ContiguousStorage {
-    std::shared_ptr<char> vector_memory{};
+    ailego::BudgetedMappedBuffer vector_memory;
     size_t vector_stride{0};
     size_t vector_count{0};
-    std::unordered_map<uint64_t, uint32_t> key_to_position{};
-    std::vector<uint64_t> position_to_key{};
+    std::unordered_map<
+        uint64_t, uint32_t, std::hash<uint64_t>, std::equal_to<uint64_t>,
+        ailego::BudgetedAllocator<std::pair<const uint64_t, uint32_t>>>
+        key_to_position{};
+    ailego::BudgetedVector<uint64_t> position_to_key{};
   };
 
   // Same lifetime model as HNSW/Vamana contiguous entity clones: a search
@@ -641,7 +749,7 @@ class FlatContiguousStreamerEntity : public FlatStreamerEntity {
                          const IndexFilter &filter, size_t batch_size,
                          FlatSearchScratch *scratch,
                          IndexContext::Stats *context_stats,
-                         IndexDocumentHeap *heap) const;
+                         IndexCandidateHeap *heap) const;
   const void *get_vector_ptr(const ContiguousStorage &storage,
                              size_t position) const;
   const void *get_vector_ptr_by_key(const ContiguousStorage &storage,
