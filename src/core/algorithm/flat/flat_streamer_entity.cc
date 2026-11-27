@@ -22,6 +22,16 @@
 namespace zvec {
 namespace core {
 namespace {
+template <typename Header>
+int FetchInsertHeader(const IndexStorage::Segment::Pointer &segment,
+                      size_t offset, Header &header) {
+  if (!segment) return IndexError_ReadData;
+  if (segment->fetch(offset, &header, sizeof(header)) == sizeof(header))
+    return 0;
+  return segment->read_error() == IndexError_NoMemory ? IndexError_NoMemory
+                                                      : IndexError_ReadData;
+}
+
 // A search may add to a caller-owned heap. Bound the new selection using its
 // current worst score, then merge only the winners through the existing heap.
 void ResetBatchTopK(turbo::BatchTopK *topk, const IndexCandidateHeap &heap) {
@@ -347,22 +357,9 @@ int FlatStreamerEntity::add(uint64_t key, const void *vec, size_t size) try {
     return IndexError_Mismatch;
   }
 
-  IndexStorage::MemoryBlock head_block;
-  this->get_head_block(head_block);
   BlockLocation block;
-  {
-    const BlockLocation *bl =
-        reinterpret_cast<const BlockLocation *>(head_block.data());
-    if (ailego_unlikely(bl == nullptr)) {
-      LOG_ERROR("Failed to get block loc");
-      return IndexError_ReadData;
-    }
-    block = *bl;
-  }
-  // Release the head block reference early so that the buffer pool ref_count
-  // and memory budget held by it do not block subsequent acquire/evict in this
-  // function (alloc_block / add_to_block may compete for the same memory).
-  head_block.reset(nullptr);
+  const int head_status = FetchInsertHeader(get_segment(0), 0, block);
+  if (head_status != 0) return head_status;
 
   meta_dirty_ = true;
   if (!this->is_valid_block(block)) {
@@ -1729,33 +1726,22 @@ int FlatStreamerEntity::add_to_block(
     const BlockLocation &block, uint64_t key, const void *data, size_t size,
     std::unique_lock<std::mutex> *lock,
     std::unique_ptr<IndexStreamer::PreparedAdd> *out) {
-  IndexStorage::MemoryBlock block_header_block;
-  this->get_block_header(block, block_header_block);
-  const BlockHeader *header =
-      reinterpret_cast<const BlockHeader *>(block_header_block.data());
-  if (ailego_unlikely(header == nullptr)) {
-    LOG_ERROR("Failed to get header");
-    return IndexError_ReadData;
-  }
+  const auto segment = get_segment(block.segment_id);
+  const size_t hd_off = get_block_header_offset(block.block_index);
+  BlockHeader hd;
+  const int header_status = FetchInsertHeader(segment, hd_off, hd);
+  if (header_status != 0) return header_status;
 
-  if (header->vector_count == block_vector_count()) {
+  if (hd.vector_count == block_vector_count()) {
     return IndexError_IndexFull;
   }
 
   auto pending_key = prepare_key(key);
-  auto segment = get_segment(block.segment_id);
-  if (!segment) {
-    return IndexError_WriteData;
-  }
-
   const size_t vector_off =
-      get_block_vector_offset(block.block_index, header->vector_count);
+      get_block_vector_offset(block.block_index, hd.vector_count);
   const size_t key_off =
-      get_block_key_offset(block.block_index, header->vector_count);
-  BlockHeader hd = *header;
-  block_header_block.reset();
+      get_block_key_offset(block.block_index, hd.vector_count);
   ++hd.vector_count;
-  const size_t hd_off = get_block_header_offset(block.block_index);
   const IndexStorage::SegmentData writes[] = {{vector_off, size, data},
                                               {key_off, sizeof(key), &key},
                                               {hd_off, sizeof(hd), &hd}};
@@ -1785,13 +1771,9 @@ int FlatStreamerEntity::append_vector_with_id(
     uint32_t id, const void *query, uint32_t size,
     std::unique_lock<std::mutex> &lock,
     std::unique_ptr<IndexStreamer::PreparedAdd> *out) {
-  IndexStorage::MemoryBlock head_block;
-  get_head_block(head_block);
-  if (!head_block.data()) return IndexError_ReadData;
-  BlockLocation block =
-      *reinterpret_cast<const BlockLocation *>(head_block.data());
-  // New segments may evict or replace the pool's page directory.
-  head_block.reset();
+  BlockLocation block;
+  const int head_status = FetchInsertHeader(get_segment(0), 0, block);
+  if (head_status != 0) return head_status;
   if (!is_valid_block(block)) {
     const int ret = alloc_block(block, &block);
     if (ret != 0) return ret;

@@ -837,6 +837,24 @@ TEST_F(FlatStreamerStorageFailureTest, PropagatesShortWritesAndRetriesSameId) {
   }
 }
 
+TEST_F(FlatStreamerStorageFailureTest,
+       AppendPropagatesHeaderRefusalAndRetries) {
+  const float values[] = {1.0f, 2.0f, 3.0f, 4.0f};
+  ASSERT_EQ(0, entity_->add_vector_with_id(0, values, sizeof(values)));
+  for (size_t ordinal : {1u, 2u}) {
+    SCOPED_TRACE(ordinal);
+    const uint32_t id = entity_->vector_count();
+    const size_t added = stats_.added_count();
+    storage_->fail_fetch(ordinal);
+    EXPECT_EQ(IndexError_NoMemory,
+              entity_->add_vector_with_id(id, values, sizeof(values)));
+    ASSERT_EQ(id, entity_->vector_count());
+    EXPECT_EQ(added, stats_.added_count());
+    ASSERT_EQ(0, entity_->add_vector_with_id(id, values, sizeof(values)));
+    EXPECT_EQ(id + 1, entity_->vector_count());
+  }
+}
+
 TEST_F(FlatStreamerStorageFailureTest, PagedIteratorReportsRowAndKeyRefusal) {
   const float values[] = {1.0f, 2.0f, 3.0f, 4.0f};
   ASSERT_EQ(0, entity_->add_vector_with_id(0, values, sizeof(values)));
