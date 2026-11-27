@@ -3575,6 +3575,59 @@ TEST_F(BufferPoolTest, CrossPageWriteAdmissionFailurePreservesAllBytes) {
   EXPECT_EQ(value, actual);
 }
 
+TEST_F(BufferPoolTest, SmallFragmentBatchRetriesAfterBudgetIsReleased) {
+  init_vec_pool(/*capacity_pages=*/8, /*file_pages=*/2, /*writable=*/true);
+  QueueResidentSampleTestPeer::stop_background();
+  VecBufferPool pool(new_file(2), true);
+  ASSERT_EQ(0, pool.init());
+  char *first = pool.acquire_buffer(0, 0);
+  ASSERT_NE(nullptr, first);
+  const auto unpin = ScopeGuard::Make([&] { pool.get_handle().release_one(0); });
+
+  auto &budget = MemoryLimitPool::get_instance();
+  const size_t held = budget.available();
+  ASSERT_GE(held, kVectorPageSize);
+  const VecBufferWriteFragment writes[] = {
+      {0, 1, "X"}, {0, 0, nullptr}, {kVectorPageSize, 1, "Y"}};
+  {
+    ASSERT_TRUE(budget.try_charge_external(held));
+    const auto release = ScopeGuard::Make([&] { budget.release_external(held); });
+    EXPECT_EQ(PageWriteStatus::kNoMemory,
+              pool.get_handle().write_fragments_status(writes, 3));
+    EXPECT_EQ(0, first[0]);
+  }
+  char second = 0;
+  ASSERT_TRUE(pool.read_range_bypass(kVectorPageSize, 1, &second));
+  EXPECT_EQ(1, second);
+  ASSERT_EQ(PageWriteStatus::kOk,
+            pool.get_handle().write_fragments_status(writes, 3));
+  EXPECT_EQ('X', first[0]);
+  ASSERT_TRUE(pool.read_range_bypass(kVectorPageSize, 1, &second));
+  EXPECT_EQ('Y', second);
+}
+
+TEST_F(BufferPoolTest, LargeFragmentBatchHandlesEmptyAndOverlappingWrites) {
+  constexpr size_t file_pages = 12;
+  init_vec_pool(/*capacity_pages=*/16, file_pages, /*writable=*/true);
+  VecBufferPool pool(new_file(file_pages), true);
+  ASSERT_EQ(0, pool.init());
+  std::vector<char> original(10 * kVectorPageSize, 'X');
+  const std::array<char, 2> replacement{'A', 'B'};
+  const size_t overlap = kVectorPageSize - 1;
+  const VecBufferWriteFragment writes[] = {
+      {0, original.size(), original.data()},
+      {0, 0, nullptr},
+      {overlap, replacement.size(), replacement.data()},
+  };
+  ASSERT_EQ(PageWriteStatus::kOk,
+            pool.get_handle().write_fragments_status(writes, 3));
+  ASSERT_EQ(0, pool.flush_all());
+  std::copy(replacement.begin(), replacement.end(), original.begin() + overlap);
+  std::vector<char> actual(original.size());
+  ASSERT_TRUE(pool.read_range_bypass(0, actual.size(), actual.data()));
+  EXPECT_EQ(original, actual);
+}
+
 TEST_F(BufferPoolTest, AbortedCleanReclaimKeepsDirtyPageInEvictionQueue) {
   init_table_pool(/*capacity_pages=*/16, /*entry_num=*/1);
   auto &queue = BlockEvictionQueue::get_instance();

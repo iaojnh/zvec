@@ -2634,19 +2634,32 @@ PageWriteStatus VecBufferPool::prepare_write_fragments(
                          : PageWriteStatus::kOk;
 }
 
-PageWriteStatus VecBufferPool::pin_write_fragments(
-    const VecBufferWriteFragment *fragments, size_t count,
-    PreparedWritePages &pins) try {
-  // Admission and reads finish before any destination bytes are changed.
-  auto &ids = pins.ids_;
+namespace {
+template <typename Visit>
+bool VisitWriteFragmentPages(const VecBufferWriteFragment *fragments,
+                             size_t count, Visit visit) {
   for (size_t i = 0; i < count; ++i) {
     const auto &fragment = fragments[i];
     if (!fragment.length) continue;
     const size_t last =
         (fragment.file_offset + fragment.length - 1) / kVectorPageSize;
-    for (size_t id = fragment.file_offset / kVectorPageSize; id <= last; ++id)
-      ids.push_back(id);
+    for (size_t id = fragment.file_offset / kVectorPageSize; id <= last; ++id) {
+      if (!visit(id)) return false;
+    }
   }
+  return true;
+}
+}  // namespace
+
+PageWriteStatus VecBufferPool::pin_write_fragments(
+    const VecBufferWriteFragment *fragments, size_t count,
+    PreparedWritePages &pins) try {
+  // Admission and reads finish before any destination bytes are changed.
+  auto &ids = pins.ids_;
+  VisitWriteFragmentPages(fragments, count, [&](block_id_t id) {
+    ids.push_back(id);
+    return true;
+  });
   std::sort(ids.begin(), ids.end());
   ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
   pins.pages_.resize(ids.size());
@@ -2710,13 +2723,44 @@ void VecBufferPool::write_pinned_fragments(
 }
 
 PageWriteStatus VecBufferPool::write_fragments_status(
-    const VecBufferWriteFragment *fragments, size_t count) {
+    const VecBufferWriteFragment *fragments, size_t count) try {
   WriteFragmentLayout layout;
   if (!validate_write_fragments(fragments, count, layout))
     return PageWriteStatus::kError;
   if (!layout.has_data) return PageWriteStatus::kOk;
 
   if (!layout.single_page) {
+    // Most synchronous batches touch only the payload and a few metadata
+    // pages. Keep their pins on the stack until the batch has been committed.
+    constexpr size_t kInlinePages = 8;
+    std::array<block_id_t, kInlinePages> ids;
+    size_t page_count = 0;
+    const bool fits =
+        VisitWriteFragmentPages(fragments, count, [&](block_id_t id) {
+          auto end = ids.begin() + page_count;
+          auto pos = std::lower_bound(ids.begin(), end, id);
+          if (pos != end && *pos == id) return true;
+          if (page_count == ids.size()) return false;
+          std::move_backward(pos, end, end + 1);
+          *pos = id;
+          ++page_count;
+          return true;
+        });
+    if (fits) {
+      std::array<char *, kInlinePages> pages;
+      bool allocation_failed = false;
+      if (!acquire_pages_impl(ids.data(), page_count, pages.data(), 50,
+                              &allocation_failed)) {
+        return allocation_failed ? PageWriteStatus::kNoMemory
+                                 : PageWriteStatus::kError;
+      }
+      const auto release =
+          ScopeGuard::Make([&] { release_pages(ids.data(), page_count); });
+      write_pinned_fragments(fragments, count, ids.data(), pages.data(),
+                             page_count);
+      return PageWriteStatus::kOk;
+    }
+
     PreparedWritePages pins;
     const auto status = pin_write_fragments(fragments, count, pins);
     if (status == PageWriteStatus::kOk)
@@ -2734,6 +2778,8 @@ PageWriteStatus VecBufferPool::write_fragments_status(
   write_pinned_fragments(fragments, count, &layout.page_id, &page, 1);
   page_table_.release_block(layout.page_id);
   return PageWriteStatus::kOk;
+} catch (const std::bad_alloc &) {
+  return PageWriteStatus::kNoMemory;
 }
 
 int VecBufferPool::write_meta(size_t offset, size_t length,
