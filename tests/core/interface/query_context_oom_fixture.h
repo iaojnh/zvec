@@ -4,8 +4,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <new>
 #include <string>
 #include <utility>
@@ -18,13 +20,12 @@
 namespace {
 struct AllocationProbe {
   size_t context_size;
-  size_t refused_filter_allocation;
+  size_t fail_after_aligned;
   void *context{nullptr};
-  void *filter{nullptr};
-  size_t filter_allocations{0};
-  bool refused_filter{false};
+  std::array<void *, 2> aligned_blocks{};
+  size_t allocated_aligned{0};
+  bool refused{false};
   bool destroyed_context{false};
-  bool destroyed_filter{false};
 };
 
 thread_local AllocationProbe *probe = nullptr;
@@ -53,33 +54,16 @@ void *operator new(std::size_t size, const std::nothrow_t &) noexcept {
 }
 
 void *operator new(std::size_t size, std::align_val_t alignment) {
-  // Search visitation allocates its bits and word generations through
-  // DiskAnnReadAllocator. Refuse each allocation independently, after the
-  // owning context has been constructed.
-  if (probe && probe->context && !probe->refused_filter &&
-      ++probe->filter_allocations == probe->refused_filter_allocation) {
-    probe->refused_filter = true;
+  const bool track = probe && probe->context && !probe->refused;
+  if (track && probe->allocated_aligned == probe->fail_after_aligned) {
+    probe->refused = true;
     throw std::bad_alloc();
   }
   void *ptr =
       ailego_aligned_malloc(size ? size : 1, static_cast<size_t>(alignment));
   if (!ptr) throw std::bad_alloc();
-  if (probe && probe->context && probe->filter_allocations == 1) {
-    probe->filter = ptr;
-  }
+  if (track) probe->aligned_blocks[probe->allocated_aligned++] = ptr;
   return ptr;
-}
-
-void operator delete(void *ptr, std::align_val_t) noexcept {
-  if (probe && ptr && ptr == probe->filter) {
-    probe->destroyed_filter = true;
-  }
-  ailego_aligned_free(ptr);
-}
-
-void operator delete(void *ptr, std::size_t,
-                     std::align_val_t alignment) noexcept {
-  ::operator delete(ptr, alignment);
 }
 
 void operator delete(void *ptr) noexcept {
@@ -93,21 +77,39 @@ void operator delete(void *ptr, std::size_t) noexcept {
   ::operator delete(ptr);
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+[[gnu::noinline]]
+#endif
+void operator delete(void *ptr, std::align_val_t) noexcept {
+  if (probe && ptr) {
+    for (auto &block : probe->aligned_blocks) {
+      if (block == ptr) block = nullptr;
+    }
+  }
+  ailego_aligned_free(ptr);
+}
+
+void operator delete(void *ptr, std::size_t,
+                     std::align_val_t alignment) noexcept {
+  ::operator delete(ptr, alignment);
+}
+
 namespace zvec {
 namespace {
 namespace fs = std::filesystem;
 
 template <typename Index>
 void check_context_failure(Index &index, size_t context_size) {
-  for (size_t allocation : {size_t{1}, size_t{2}}) {
-    SCOPED_TRACE(allocation);
-    AllocationProbe attempt{context_size, allocation};
+  // After allocating DiskAnnContext, init allocates the aligned query
+  // workspace, the visit bits and the generation bytes in that order.
+  for (size_t fail_after : {0u, 1u, 2u}) {
+    SCOPED_TRACE(fail_after);
+    AllocationProbe attempt{context_size, fail_after};
     core::IndexContext::Pointer result;
     bool threw = false;
     {
       probe = &attempt;
-      const auto reset_probe =
-          ailego::ScopeGuard::Make([] { probe = nullptr; });
+      auto clear_probe = ailego::ScopeGuard::Make([] { probe = nullptr; });
       try {
         result = index.create_context();
       } catch (const std::bad_alloc &) {
@@ -115,14 +117,12 @@ void check_context_failure(Index &index, size_t context_size) {
       }
     }
 
-    ASSERT_TRUE(attempt.refused_filter);
-    EXPECT_EQ(allocation, attempt.filter_allocations);
-    EXPECT_EQ(nullptr, result);
+    ASSERT_TRUE(attempt.refused);
     EXPECT_FALSE(threw);
+    EXPECT_EQ(nullptr, result);
     EXPECT_TRUE(attempt.destroyed_context);
-    if (allocation == 2) {
-      ASSERT_NE(nullptr, attempt.filter);
-      EXPECT_TRUE(attempt.destroyed_filter);
+    for (const auto *block : attempt.aligned_blocks) {
+      EXPECT_EQ(nullptr, block);
     }
     auto retry = index.create_context();
     ASSERT_NE(nullptr, retry);

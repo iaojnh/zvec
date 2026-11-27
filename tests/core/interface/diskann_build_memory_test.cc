@@ -124,7 +124,6 @@ TEST(DiskAnnBuildMemory, ReleaseStateAndReopenDirectAndMerged) {
                       fp16 ? 0.002 : 0.00001);
         }
         ASSERT_EQ(0, target->close());
-        target = IndexFactory::CreateAndInitIndex(*param);
         ASSERT_EQ(0, target->open(path, {StorageOptions::StorageType::kMMAP,
                                          false, true}));
         VectorDataBuffer after;
@@ -324,7 +323,9 @@ TEST(DiskAnnBuildMemory, DeferredSourceReadFailureAndRepeatedDump) {
       else
         EXPECT_EQ(0, builder->dump(dumper));
       int close_result = dumper->close();
-      if (!fail) ASSERT_EQ(0, close_result);
+      if (!fail) {
+        ASSERT_EQ(0, close_result);
+      }
     }
     ASSERT_EQ(0, builder->cleanup());
     test_util::RemoveTestFiles(path);
@@ -421,7 +422,9 @@ TEST(DiskAnnBuildMemory, DeferredDecodedSourceReadFailureDuringDump) {
         EXPECT_EQ(fail ? core::IndexError_ReadData : 0, builder->dump(dumper));
         EXPECT_EQ(fail ? core::IndexError_ReadData : 0, holder->status());
         const int close_result = dumper->close();
-        if (!fail) EXPECT_EQ(0, close_result);
+        if (!fail) {
+          EXPECT_EQ(0, close_result);
+        }
       }
       ASSERT_EQ(0, builder->cleanup());
       holder.reset();

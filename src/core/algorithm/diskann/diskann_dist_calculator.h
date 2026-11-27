@@ -13,10 +13,13 @@
 // limitations under the License.
 #pragma once
 
+#include <array>
+#include <limits>
 #include <memory>
 #include <vector>
 #include <ailego/pattern/scope_guard.h>
 #include <turbo/quantizer/quantizer.h>
+#include <zvec/ailego/buffer/budgeted_buffer.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/core/framework/index_context.h>
 #include <zvec/core/framework/index_factory.h>
@@ -48,6 +51,7 @@ class DistCalculator {
   void update(const DiskAnnEntity *entity, const IndexMeta &meta,
               const IndexMetric::Pointer &measure,
               const turbo::Quantizer::Pointer &data_quantizer = nullptr) {
+    vector_reader_.reset();
     entity_ = entity;
     bind_distance(meta, measure, data_quantizer);
     dim_ = meta.dimension();
@@ -59,7 +63,7 @@ class DistCalculator {
 
   //! Reset query vector data
   inline void reset_query(const void *query) {
-    error_ = false;
+    error_code_ = 0;
     query_ = query;
   }
 
@@ -68,7 +72,7 @@ class DistCalculator {
     if (ailego_unlikely(vec_lhs == nullptr || vec_rhs == nullptr)) {
       LOG_ERROR("Nullptr of dense vector");
 
-      error_ = true;
+      error_code_ = IndexError_ReadData;
       return 0.0f;
     }
 
@@ -88,34 +92,174 @@ class DistCalculator {
   inline dist_t dist(diskann_id_t id) {
     compare_cnt_++;
 
-    const void *vec = entity_->get_vector(id);
-    if (ailego_unlikely(vec == nullptr)) {
-      LOG_ERROR("Get nullptr vector, id=%u", id);
-      error_ = true;
+    IndexStorage::MemoryBlock block;
+    const int ret = entity_->read_vector(id, block);
+    if (ailego_unlikely(ret != 0 || block.data() == nullptr)) {
+      LOG_ERROR("Read vector failed, id=%u, ret=%d", id, ret);
+      error_code_ = ret != 0 ? ret : IndexError_ReadData;
       return 0.0f;
     }
 
-    return dist(vec, query_);
+    return dist(block.data(), query_);
   }
 
   inline dist_t dist(diskann_id_t lhs, diskann_id_t rhs) {
     compare_cnt_++;
 
-    const void *vec_lhs = entity_->get_vector(lhs);
-    if (ailego_unlikely(vec_lhs == nullptr)) {
-      LOG_ERROR("Get nullptr vector, lhs id=%u", lhs);
-      error_ = true;
+    IndexStorage::MemoryBlock lhs_block;
+    int ret = entity_->read_vector(lhs, lhs_block);
+    if (ailego_unlikely(ret != 0 || lhs_block.data() == nullptr)) {
+      LOG_ERROR("Read vector failed, lhs id=%u, ret=%d", lhs, ret);
+      error_code_ = ret != 0 ? ret : IndexError_ReadData;
       return 0.0f;
     }
 
-    const void *vec_rhs = entity_->get_vector(rhs);
-    if (ailego_unlikely(vec_rhs == nullptr)) {
-      LOG_ERROR("Get nullptr vector, rhs id=%u", rhs);
-      error_ = true;
+    IndexStorage::MemoryBlock rhs_block;
+    ret = entity_->read_vector(rhs, rhs_block);
+    if (ailego_unlikely(ret != 0 || rhs_block.data() == nullptr)) {
+      LOG_ERROR("Read vector failed, rhs id=%u, ret=%d", rhs, ret);
+      error_code_ = ret != 0 ? ret : IndexError_ReadData;
       return 0.0f;
     }
 
-    return dist(vec_lhs, vec_rhs);
+    return dist(lhs_block.data(), rhs_block.data());
+  }
+
+  inline dist_t dist(const IndexStorage::MemoryBlock &lhs,
+                     const IndexStorage::MemoryBlock &rhs) {
+    compare_cnt_++;
+    return dist(lhs.data(), rhs.data());
+  }
+
+  // Compare one center with a bounded neighbor batch. Keeping the center
+  // alive avoids re-reading it, and cold neighbors can share one I/O submit.
+  // Optional batch scratch must not make a two-vector operation fail.
+  void dist_batch(diskann_id_t center, const diskann_id_t *ids, size_t count,
+                  dist_t *distances,
+                  IndexStorage::MemoryBlock *retained = nullptr,
+                  const IndexStorage::MemoryBlock *retained_center = nullptr) {
+    if (count == 0) return;
+    if (!ids || !distances || count > DiskAnnEntity::kVectorReadBatchSize) {
+      error_code_ = IndexError_InvalidArgument;
+      return;
+    }
+    IndexStorage::MemoryBlock center_block;
+    error_code_ =
+        retained_center ? 0 : entity_->read_vector(center, center_block);
+    if (error_code_ != 0) return;
+    const auto &anchor = retained_center ? *retained_center : center_block;
+    if (!anchor.data()) {
+      error_code_ = IndexError_ReadData;
+      return;
+    }
+
+    std::array<IndexStorage::MemoryBlock, DiskAnnEntity::kVectorReadBatchSize>
+        scratch;
+    auto *blocks = retained ? retained : scratch.data();
+    try {
+      error_code_ = entity_->read_vectors(ids, blocks, count);
+    } catch (const std::bad_alloc &) {
+      error_code_ = IndexError_NoMemory;
+    }
+    if (error_code_ == IndexError_NoMemory) {
+      for (size_t i = 0; i < count; ++i) blocks[i].reset();
+      // Drop earlier optional cache entries before retrying with two vectors.
+      // No distances have been computed for this batch yet.
+      if (retained) return;
+      error_code_ = 0;
+      for (size_t i = 0; i < count; ++i) {
+        IndexStorage::MemoryBlock block;
+        error_code_ = entity_->read_vector(ids[i], block);
+        if (error_code_ != 0) return;
+        distances[i] = dist(anchor, block);
+        if (error()) return;
+      }
+      return;
+    }
+    if (error()) return;
+    for (size_t i = 0; i < count; ++i) {
+      distances[i] = dist(anchor, blocks[i]);
+      if (error()) return;
+    }
+  }
+
+  void dist_batch(const diskann_id_t *ids, size_t count, dist_t *distances) {
+    std::array<IndexStorage::MemoryBlock, DiskAnnEntity::kVectorReadBatchSize>
+        blocks;
+    error_code_ = entity_->read_vectors(ids, blocks.data(), count);
+    if (error_code_ != 0) return;
+    for (size_t i = 0; i < count; ++i) {
+      distances[i] = dist(blocks[i].data());
+      if (error()) return;
+    }
+  }
+
+  // Prefetch only the next known batch while the consumer calculates the
+  // current one. Preserve visit/comparison order and a bounded working set.
+  template <class Consume>
+  int visit_vector_batches(const diskann_id_t *ids, size_t total,
+                           Consume consume) {
+    if (!total) return 0;
+    if (!ids) return error_code_ = IndexError_InvalidArgument;
+    if (!vector_reader_ && total > DiskAnnEntity::kVectorReadBatchSize) {
+      try {
+        vector_reader_ = entity_->create_vector_reader();
+      } catch (const std::bad_alloc &) {
+        vector_reader_.reset();
+      }
+    }
+    bool pending = false;
+    const auto cancel = ailego::ScopeGuard::Make([&] {
+      if (pending) vector_reader_.reset();
+    });
+    std::array<IndexStorage::MemoryBlock, DiskAnnEntity::kVectorReadBatchSize>
+        blocks;
+    for (size_t begin = 0; begin < total;) {
+      const size_t count = std::min(blocks.size(), total - begin);
+      int ret;
+      if (pending) {
+        ret = vector_reader_->finish(blocks.data(), count);
+        pending = false;
+      } else {
+        try {
+          ret = entity_->read_vectors(ids + begin, blocks.data(), count);
+        } catch (const std::bad_alloc &) {
+          ret = IndexError_NoMemory;
+        }
+      }
+      if (ret == IndexError_NoMemory) {
+        vector_reader_.reset();
+        for (auto &block : blocks) block.reset();
+        // Optional buffering must yield to the original one-vector read.
+        for (size_t i = 0; i < count; ++i) {
+          IndexStorage::MemoryBlock block;
+          ret = entity_->read_vector(ids[begin + i], block);
+          if (ret) return error_code_ = ret;
+          ret = consume(ids + begin + i, &block, size_t{1});
+          if (ret) return error_code_ = ret;
+        }
+        begin += count;
+        continue;
+      }
+      if (ret) return error_code_ = ret;
+      const size_t next = begin + count;
+      if (vector_reader_ && next < total) {
+        const size_t size = std::min(blocks.size(), total - next);
+        ret = vector_reader_->submit(ids + next, size);
+        if (ret == IndexError_NoMemory)
+          vector_reader_.reset();
+        else if (ret == IndexError_NotImplemented) {
+        } else if (ret)
+          return error_code_ = ret;
+        else
+          pending = true;
+      }
+      ret = consume(ids + begin, blocks.data(), count);
+      if (ret) return error_code_ = ret;
+      for (auto &block : blocks) block.reset();
+      begin = next;
+    }
+    return 0;
   }
 
   dist_t operator()(const void *vec) {
@@ -135,17 +279,19 @@ class DistCalculator {
 
   int quantize_query(const void *query_rotated) try {
     if (!quantizer_ || !query_rotated) return IndexError_InvalidArgument;
-    quant_query_scratch_.resize(quantizer_->quantized_query_vector_length());
+    const size_t bytes = quantizer_->quantized_query_vector_length();
+    if (!bytes) return IndexError_Unsupported;
+    quant_query_scratch_.resize(bytes);
     quantizer_->quantize_query(query_rotated, quant_query_scratch_.data());
-    quant_dist_impl_ = quantizer_->distance(quant_query_scratch_.data(),
-                                            quantizer_->quantized_query_meta());
-    return quant_dist_impl_.valid() ? 0 : IndexError_Unsupported;
+    return 0;
   } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;
   }
 
   int quantized_dist(const diskann_id_t *ids, uint32_t n, float *dists) try {
     if (n == 0) return 0;
+    if (n > static_cast<uint32_t>((std::numeric_limits<int>::max)()))
+      return IndexError_InvalidLength;
     auto release =
         ailego::ScopeGuard::Make([&] { resident_pq_batch_.release(); });
     quant_dp_list_.resize(n);
@@ -167,7 +313,11 @@ class DistCalculator {
                                   quant_code_scratch_, quant_dp_list_.data());
       if (status != 0) return status;
     }
-    quant_dist_impl_.batch(quant_dp_list_.data(), n, dists);
+    // The LUT is already owned by this RSS-accounted context. Use it
+    // directly so a second copy does not consume the page-cache budget.
+    quantizer_->calc_distance_dp_query_batch(
+        quant_dp_list_.data(), static_cast<int>(n), quant_query_scratch_.data(),
+        dists);
     return 0;
   } catch (const std::bad_alloc &) {
     return IndexError_NoMemory;
@@ -194,7 +344,7 @@ class DistCalculator {
 
   inline void clear() {
     compare_cnt_ = 0;
-    error_ = false;
+    error_code_ = 0;
   }
 
   inline void clear_compare_cnt() {
@@ -202,7 +352,11 @@ class DistCalculator {
   }
 
   inline bool error() const {
-    return error_;
+    return error_code_ != 0;
+  }
+
+  inline int error_code() const {
+    return error_code_;
   }
 
   //! Get distances compute times
@@ -281,6 +435,7 @@ class DistCalculator {
 
  private:
   const DiskAnnEntity *entity_;
+  std::unique_ptr<DiskAnnEntity::VectorReader> vector_reader_;
 
   turbo::Quantizer::Pointer data_quantizer_{};
 
@@ -289,13 +444,12 @@ class DistCalculator {
   uint32_t dim_;
 
   uint32_t compare_cnt_;
-  bool error_{false};
+  int error_code_{0};
 
   const turbo::Quantizer *quantizer_{nullptr};
   const uint8_t *quant_codes_{nullptr};
   uint32_t quant_code_size_{0};
 
-  turbo::DistanceImpl quant_dist_impl_{};
 
   DiskAnnReadVector<const void *> quant_dp_list_;
   DiskAnnReadVector<uint8_t> quant_query_scratch_;

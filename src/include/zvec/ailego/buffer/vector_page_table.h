@@ -834,6 +834,10 @@ class ZVEC_AILEGO_API VecBufferPool {
   //! repeatedly; no-op in read-only mode.
   int flush_all();
 
+  //! Queue optional writeback of full pages in a completed data range.
+  //! Does not evict the pages or publish the file's directory.
+  void request_writeback(size_t offset, size_t length);
+
   //! Extend the backing file and page table to at least `new_size`, rounding
   //! the physical size up to the host page size. Callers only need to align
   //! their requests to the index format's own page size.
@@ -852,7 +856,7 @@ class ZVEC_AILEGO_API VecBufferPool {
   }
 
   size_t file_size() const {
-    return file_size_;
+    return file_size_.load(std::memory_order_acquire);
   }
 
   //! The backing file remains available when the budget cannot fit a cache.
@@ -967,6 +971,11 @@ class ZVEC_AILEGO_API VecBufferPool {
   void start_writeback();
   void stop_writeback();
   void drain_writeback();
+  // Caller holds writeback_mutex_.
+  bool writeback_idle_locked() const {
+    return writeback_queue_.empty() && writeback_inflight_ == 0 &&
+           writeback_hint_next_ == writeback_hint_end_;
+  }
   void writeback_loop();
   bool flush_writeback_batch(std::vector<block_id_t> &page_ids, char *staging);
   bool flush_whole_pages(const block_id_t *page_ids, size_t count,
@@ -995,7 +1004,7 @@ class ZVEC_AILEGO_API VecBufferPool {
 
   int fd_;       // page-data channel: O_DIRECT or F_NOCACHE when supported
   int meta_fd_;  // metadata channel: always buffered IO
-  size_t file_size_;
+  std::atomic<size_t> file_size_{0};
   size_t initial_file_size_;  // Newly extended pages without metadata can
                               // skip pread on first load (content is zeros).
   std::string file_name_;
@@ -1078,6 +1087,8 @@ class ZVEC_AILEGO_API VecBufferPool {
   std::deque<block_id_t> writeback_queue_{};
   std::mutex writeback_flush_mutex_{};
   size_t writeback_inflight_{0};
+  block_id_t writeback_hint_next_{0};
+  block_id_t writeback_hint_end_{0};
   bool writeback_stopping_{false};
 };
 

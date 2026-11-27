@@ -15,31 +15,62 @@
 #include "diskann_algorithm.h"
 #include <algorithm>
 #include <set>
+#include <ailego/pattern/defer.h>
 #include <zvec/core/framework/index_holder.h>
 #include "diskann_util.h"
 
 namespace zvec {
 namespace core {
 
-DiskAnnAlgorithm::DiskAnnAlgorithm(DiskAnnEntity &entity, uint32_t max_degree)
-    : entity_(entity), max_degree_(max_degree), lock_pool_(kLockCnt) {}
+DiskAnnAlgorithm::DiskAnnAlgorithm(DiskAnnEntity &entity, uint32_t max_degree,
+                                   size_t thread_count)
+    : entity_(entity), max_degree_(max_degree) {
+  const size_t concurrency = std::max<size_t>(1, thread_count);
+  const size_t target = std::max<size_t>(
+      1, std::min<size_t>(entity.doc_cnt(), concurrency >= kLockCnt / 64
+                                                ? kLockCnt
+                                                : concurrency * 64));
+  size_t count = 1;
+  while (count * 2 <= target) count *= 2;
+  for (;;) {
+    try {
+      decltype(lock_pool_) replacement(count);
+      lock_pool_.swap(replacement);
+      break;
+    } catch (const std::bad_alloc &) {
+      if (count == 1) throw;
+      count /= 2;
+    }
+  }
+}
 
-std::vector<diskann_id_t> DiskAnnAlgorithm::get_init_ids(DiskAnnContext *ctx) {
+ailego::BudgetedVector<diskann_id_t> DiskAnnAlgorithm::get_init_ids(
+    DiskAnnContext *ctx) {
   const auto &entity = ctx->get_entity();
 
-  std::vector<diskann_id_t> init_ids;
+  ailego::BudgetedVector<diskann_id_t> init_ids;
 
   init_ids.emplace_back(entity.medoid());
 
   return init_ids;
 }
 
-int DiskAnnAlgorithm::add_node(diskann_id_t id, DiskAnnContext *ctx) {
-  const void *vec = entity_.get_vector(id);
+int DiskAnnAlgorithm::add_node(diskann_id_t id, DiskAnnContext *ctx) try {
+  // reset_query copies the vector into context-owned storage, so the page can
+  // be released before traversal needs to read any other vector.
+  {
+    IndexStorage::MemoryBlock block;
+    const int ret = entity_.read_vector(id, block);
+    if (ret != 0) {
+      return ret;
+    }
+    if (block.data() == nullptr) {
+      return IndexError_ReadData;
+    }
+    ctx->reset_query(block.data());
+  }
 
-  ctx->reset_query(vec);
-
-  std::vector<diskann_id_t> pruned_list;
+  ailego::BudgetedVector<diskann_id_t> pruned_list;
 
   int ret = search_neighbor_and_prune(id, pruned_list, ctx);
   if (ret != 0) {
@@ -49,81 +80,96 @@ int DiskAnnAlgorithm::add_node(diskann_id_t id, DiskAnnContext *ctx) {
   {
     auto lock = lock_for(id);
     ret = entity_.set_neighbors(id, pruned_list);
-    if (ret != 0) return ret;
+    if (ret != 0) {
+      return ret;
+    }
   }
 
   return inter_insert(id, pruned_list, ctx);
+} catch (const std::bad_alloc &) {
+  ctx->best_list_nodes().release();
+  ctx->clear();
+  return IndexError_NoMemory;
 }
 
-int DiskAnnAlgorithm::prune_node(diskann_id_t id, DiskAnnContext *ctx) {
+int DiskAnnAlgorithm::prune_node(diskann_id_t id, DiskAnnContext *ctx) try {
   DistCalculator &dc = ctx->dist_calculator();
+  dc.clear();
 
-  auto neighbors = entity_.get_neighbors(id);
+  ailego::BudgetedVector<diskann_id_t> neighbors;
+  int ret;
+  {
+    auto lock = lock_for(id);
+    ret = entity_.read_neighbors(id, &neighbors);
+  }
+  if (ret != 0) {
+    return ret;
+  }
 
-  if (neighbors.first > max_degree_) {
-    std::set<diskann_id_t> dummy_visited;
-    std::vector<Neighbor> dummy_pool(0);
-    std::vector<diskann_id_t> new_out_neighbors;
+  if (neighbors.size() > max_degree_) {
+    PruneCandidates dummy_pool;
+    ailego::BudgetedVector<diskann_id_t> new_out_neighbors;
+    PruneVectorCache cache;
+    ret = collect_prune_candidates(id, neighbors, dummy_pool, ctx, &cache);
+    if (ret != 0) return ret;
 
-    for (size_t i = 0; i < neighbors.first; ++i) {
-      diskann_id_t node_id = (neighbors.second)[i];
-
-      auto itr = dummy_visited.find(node_id);
-      if (itr == dummy_visited.end() && node_id != id) {
-        float dist = dc.dist(id, node_id);
-
-        dummy_pool.emplace_back(Neighbor(node_id, dist));
-        dummy_visited.insert(node_id);
-      }
+    ret = prune_neighbors(id, dummy_pool, new_out_neighbors, ctx, &cache);
+    if (ret != 0) {
+      return ret;
     }
 
-    prune_neighbors(id, dummy_pool, new_out_neighbors, ctx);
-
+    cache.clear();
     {
       auto lock = lock_for(id);
-      int ret = entity_.set_neighbors(id, new_out_neighbors);
-      if (ret != 0) return ret;
+      ret = entity_.set_neighbors(id, new_out_neighbors);
+      if (ret != 0) {
+        return ret;
+      }
     }
   }
 
   return 0;
+} catch (const std::bad_alloc &) {
+  ctx->clear();
+  return IndexError_NoMemory;
 }
 
-int DiskAnnAlgorithm::inter_insert(diskann_id_t id,
-                                   std::vector<diskann_id_t> &pruned_list,
-                                   DiskAnnContext *ctx) {
-  DistCalculator &dc = ctx->dist_calculator();
-
+int DiskAnnAlgorithm::inter_insert(
+    diskann_id_t id, ailego::BudgetedVector<diskann_id_t> &pruned_list,
+    DiskAnnContext *ctx) {
   for (auto &des : pruned_list) {
-    std::vector<diskann_id_t> new_neighbors;
+    ailego::BudgetedVector<diskann_id_t> new_neighbors;
     bool need_prune = false;
 
     {
       auto lock = lock_for(des);
 
-      auto neighbors = entity_.get_neighbors(des);
+      ailego::BudgetedVector<diskann_id_t> neighbors;
+      const int ret = entity_.read_neighbors(des, &neighbors);
+      if (ret != 0) {
+        return ret;
+      }
 
       bool found = false;
-      for (size_t i = 0; i < neighbors.first; ++i) {
-        if ((neighbors.second)[i] == id) {
+      for (diskann_id_t neighbor : neighbors) {
+        if (neighbor == id) {
           found = true;
           break;
         }
       }
 
       if (!found) {
-        if (neighbors.first <
+        if (neighbors.size() <
             static_cast<uint64_t>(DiskAnnEntity::kDefaultGraphSlackFactor *
                                   max_degree_)) {
-          int ret = entity_.add_neighbor(des, id);
-          if (ret != 0) return ret;
+          const int add_ret = entity_.add_neighbor(des, id);
+          if (add_ret != 0) {
+            return add_ret;
+          }
           need_prune = false;
         } else {
-          new_neighbors.resize(neighbors.first + 1);
-          memcpy(&new_neighbors[0], neighbors.second,
-                 sizeof(diskann_id_t) * neighbors.first);
-
-          new_neighbors[neighbors.first] = id;
+          new_neighbors = std::move(neighbors);
+          new_neighbors.push_back(id);
 
           need_prune = true;
         }
@@ -131,29 +177,31 @@ int DiskAnnAlgorithm::inter_insert(diskann_id_t id,
     }
 
     if (need_prune) {
-      std::set<diskann_id_t> new_visited;
-      std::vector<Neighbor> new_pool(0);
+      PruneCandidates new_pool;
 
       size_t reserve_size = static_cast<size_t>(std::ceil(
           1.05 * DiskAnnEntity::kDefaultGraphSlackFactor * max_degree_));
 
-      new_pool.reserve(reserve_size);
+      new_pool.reserve(std::min<size_t>(reserve_size, max_candidate_size_));
 
-      for (auto node_id : new_neighbors) {
-        if (new_visited.find(node_id) == new_visited.end() && node_id != des) {
-          float dist = dc.dist(des, node_id);
-          new_pool.emplace_back(Neighbor(node_id, dist));
-          new_visited.insert(node_id);
-        }
+      PruneVectorCache cache;
+      int ret =
+          collect_prune_candidates(des, new_neighbors, new_pool, ctx, &cache);
+      if (ret != 0) return ret;
+
+      ailego::BudgetedVector<diskann_id_t> new_pruned_neighbors;
+      ret = prune_neighbors(des, new_pool, new_pruned_neighbors, ctx, &cache);
+      if (ret != 0) {
+        return ret;
       }
 
-      std::vector<diskann_id_t> new_pruned_neighbors;
-      prune_neighbors(des, new_pool, new_pruned_neighbors, ctx);
-
+      cache.clear();
       {
         auto lock = lock_for(des);
-        int ret = entity_.set_neighbors(des, new_pruned_neighbors);
-        if (ret != 0) return ret;
+        ret = entity_.set_neighbors(des, new_pruned_neighbors);
+        if (ret != 0) {
+          return ret;
+        }
       }
     }
   }
@@ -162,18 +210,21 @@ int DiskAnnAlgorithm::inter_insert(diskann_id_t id,
 }
 
 int DiskAnnAlgorithm::iterate_to_fixed_point(
-    const std::vector<diskann_id_t> &init_ids, DiskAnnContext *ctx) {
+    const ailego::BudgetedVector<diskann_id_t> &init_ids, diskann_id_t excluded,
+    DiskAnnContext *ctx) {
   DistCalculator &dc = ctx->dist_calculator();
-  std::vector<Neighbor> &expanded_nodes = ctx->expanded_nodes();
+  auto &expanded_nodes = ctx->expanded_nodes();
+  expanded_nodes.clear();
   NeighborPriorityQueue &best_list_nodes = ctx->best_list_nodes();
   VisitFilter &visit = ctx->visit_filter();
 
   best_list_nodes.reserve(ctx->list_size());
 
   for (auto id : init_ids) {
-    const void *vec = entity_.get_vector(id);
-
-    float distance = dc.dist(vec);
+    const float distance = dc.dist(id);
+    if (dc.error()) {
+      return dc.error_code();
+    }
 
     Neighbor nn = Neighbor(id, distance);
     best_list_nodes.insert(nn);
@@ -183,16 +234,19 @@ int DiskAnnAlgorithm::iterate_to_fixed_point(
     auto neighbor = best_list_nodes.closest_unexpanded();
     auto node_id = neighbor.id;
 
-    expanded_nodes.emplace_back(neighbor);
+    CollectPruneCandidate(expanded_nodes, neighbor, excluded,
+                          max_candidate_size_);
 
-    std::vector<diskann_id_t> id_scratch;
+    ailego::BudgetedVector<diskann_id_t> id_scratch;
     {
       auto lock = lock_for(node_id);
-      auto neighbors = entity_.get_neighbors(node_id);
+      ailego::BudgetedVector<diskann_id_t> neighbors;
+      const int ret = entity_.read_neighbors(node_id, &neighbors);
+      if (ret != 0) {
+        return ret;
+      }
 
-      for (size_t i = 0; i < neighbors.first; ++i) {
-        diskann_id_t neighbor_id = (neighbors.second)[i];
-
+      for (diskann_id_t neighbor_id : neighbors) {
         if (!visit.visited(neighbor_id)) {
           id_scratch.push_back(neighbor_id);
 
@@ -201,22 +255,132 @@ int DiskAnnAlgorithm::iterate_to_fixed_point(
       }
     }
 
-    for (size_t i = 0; i < id_scratch.size(); ++i) {
-      diskann_id_t id = id_scratch[i];
-
-      const void *vec = entity_.get_vector(id);
-      float dist = dc.dist(vec);
-
-      best_list_nodes.insert(Neighbor(id, dist));
+    if (!entity_.prefer_vector_batch()) {
+      // Keep the in-memory builder's scalar fast path unchanged.
+      for (diskann_id_t id : id_scratch) {
+        const float distance = dc.dist(id);
+        if (dc.error()) return dc.error_code();
+        best_list_nodes.insert(Neighbor(id, distance));
+      }
+      continue;
     }
+    const int ret = dc.visit_vector_batches(
+        id_scratch.data(), id_scratch.size(),
+        [&](const diskann_id_t *ids, IndexStorage::MemoryBlock *blocks,
+            size_t count) {
+          for (size_t i = 0; i < count; ++i) {
+            const float distance = dc.dist(blocks[i].data());
+            if (dc.error()) return dc.error_code();
+            best_list_nodes.insert(Neighbor(ids[i], distance));
+          }
+          return 0;
+        });
+    if (ret) return ret;
   }
 
   return 0;
 }
 
-int DiskAnnAlgorithm::occlude_list(diskann_id_t id, std::vector<Neighbor> &pool,
-                                   std::vector<diskann_id_t> &result,
-                                   DiskAnnContext *ctx) {
+int DiskAnnAlgorithm::collect_prune_candidates(
+    diskann_id_t center, const ailego::BudgetedVector<diskann_id_t> &neighbors,
+    PruneCandidates &pool, DiskAnnContext *ctx, PruneVectorCache *cache) {
+  auto &dc = ctx->dist_calculator();
+  if (std::none_of(neighbors.begin(), neighbors.end(),
+                   [center](diskann_id_t id) { return id != center; }))
+    return 0;
+
+  // Allocate the bounded candidate workspace before optional vector retention.
+  // Incremental growth temporarily charges both old and new allocations and
+  // can reject a working set that fits, depending on the STL growth policy.
+  // Duplicates may make the actual candidate set smaller than this bound, so
+  // retain incremental growth when the upper bound cannot be reserved.
+  try {
+    pool.reserve(std::min(neighbors.size(), size_t(max_candidate_size_)));
+  } catch (const std::bad_alloc &) {
+  }
+  std::set<diskann_id_t> visited;
+  const bool batch_reads = entity_.prefer_vector_batch();
+  if (!batch_reads) {
+    for (const auto id : neighbors) {
+      if (id == center || !visited.insert(id).second) continue;
+      const float distance = dc.dist(center, id);
+      if (dc.error()) return dc.error_code();
+      CollectPruneCandidate(pool, Neighbor(id, distance), center,
+                            max_candidate_size_);
+    }
+    return 0;
+  }
+
+  IndexStorage::MemoryBlock center_block;
+  const int center_ret = entity_.read_vector(center, center_block);
+  if (center_ret != 0) return center_ret;
+  if (!center_block.data()) return IndexError_ReadData;
+
+  // Charge descriptors before retaining candidates. Optional retention yields
+  // to the original small working set when it cannot fit.
+  if (neighbors.size() <= max_candidate_size_) {
+    try {
+      cache->ids.resize(neighbors.size());
+      cache->blocks.resize(neighbors.size());
+    } catch (const std::bad_alloc &) {
+      cache->clear();
+    }
+  }
+
+  std::array<diskann_id_t, DiskAnnEntity::kVectorReadBatchSize> ids;
+  std::array<dist_t, DiskAnnEntity::kVectorReadBatchSize> distances;
+  size_t count = 0;
+  size_t completed = 0;
+  const auto collect = [&]() {
+    auto *retained =
+        cache->blocks.empty() ? nullptr : cache->blocks.data() + completed;
+    dc.dist_batch(center, ids.data(), count, distances.data(), retained,
+                  &center_block);
+    if (retained && dc.error_code() == IndexError_NoMemory) {
+      cache->clear();
+      dc.dist_batch(center, ids.data(), count, distances.data(), nullptr,
+                    &center_block);
+    }
+    if (dc.error()) return dc.error_code();
+    // Preserve first-visit order, distance orientation and candidate pruning.
+    for (size_t i = 0; i < count; ++i) {
+      try {
+        CollectPruneCandidate(pool, Neighbor(ids[i], distances[i]), center,
+                              max_candidate_size_);
+      } catch (const std::bad_alloc &) {
+        if (cache->blocks.empty()) throw;
+        cache->clear();
+        CollectPruneCandidate(pool, Neighbor(ids[i], distances[i]), center,
+                              max_candidate_size_);
+      }
+    }
+    if (!cache->ids.empty())
+      std::copy_n(ids.data(), count, cache->ids.data() + completed);
+    completed += count;
+    count = 0;
+    return 0;
+  };
+  for (const auto id : neighbors) {
+    if (id == center || !visited.insert(id).second) continue;
+    ids[count++] = id;
+    if (count == ids.size()) {
+      const int ret = collect();
+      if (ret != 0) return ret;
+    }
+  }
+  const int ret = count ? collect() : 0;
+  if (ret == 0 && !cache->ids.empty()) {
+    cache->ids.resize(completed);
+    cache->blocks.resize(completed);
+    cache->complete = true;
+  }
+  return ret;
+}
+
+int DiskAnnAlgorithm::occlude_list(diskann_id_t id, PruneCandidates &pool,
+                                   ailego::BudgetedVector<diskann_id_t> &result,
+                                   DiskAnnContext *ctx,
+                                   PruneVectorCache *cache) {
   if (pool.size() == 0) return 0;
 
   DistCalculator &dc = ctx->dist_calculator();
@@ -228,10 +392,53 @@ int DiskAnnAlgorithm::occlude_list(diskann_id_t id, std::vector<Neighbor> &pool,
     pool.resize(max_candidate_size_);
   }
 
-  std::vector<float> &occlude_factor = ctx->occlude_factor();
+  auto &occlude_factor = ctx->occlude_factor();
 
   occlude_factor.clear();
   occlude_factor.insert(occlude_factor.end(), pool.size(), 0.0f);
+
+  std::array<size_t, DiskAnnEntity::kDefaultMaxOcclusionSize> cached_indices;
+  bool retained = cache && cache->complete;
+  if (retained) {
+    for (size_t i = 0; i < pool.size(); ++i) {
+      const auto found =
+          std::find(cache->ids.begin(), cache->ids.end(), pool[i].id);
+      if (found == cache->ids.end()) {
+        retained = false;
+        cache->clear();
+        break;
+      }
+      cached_indices[i] = found - cache->ids.begin();
+    }
+  }
+
+  // Robust pruning compares the same candidate vectors repeatedly. Retain
+  // just this bounded candidate set while pruning, instead of re-reading
+  // pageable vectors for every pair. Both descriptors and borrowed/owned
+  // blocks remain charged to the pool. Under pressure the scalar path needs
+  // only two vectors, so this optional working set must not reject a build.
+  ailego::BudgetedVector<IndexStorage::MemoryBlock> vectors;
+  if (!retained && entity_.prefer_vector_batch()) {
+    try {
+      vectors.resize(pool.size());
+      for (size_t begin = 0; begin < pool.size();
+           begin += DiskAnnEntity::kVectorReadBatchSize) {
+        const size_t count =
+            std::min(DiskAnnEntity::kVectorReadBatchSize, pool.size() - begin);
+        std::array<diskann_id_t, DiskAnnEntity::kVectorReadBatchSize> ids;
+        for (size_t i = 0; i < count; ++i) ids[i] = pool[begin + i].id;
+        const int ret =
+            entity_.read_vectors(ids.data(), vectors.data() + begin, count);
+        if (ret == IndexError_NoMemory) {
+          decltype(vectors)().swap(vectors);
+          break;
+        }
+        if (ret != 0) return ret;
+      }
+    } catch (const std::bad_alloc &) {
+      decltype(vectors)().swap(vectors);
+    }
+  }
 
   float cur_alpha = 1;
   while (cur_alpha <= alpha_ && result.size() < max_degree_) {
@@ -253,7 +460,16 @@ int DiskAnnAlgorithm::occlude_list(diskann_id_t id, std::vector<Neighbor> &pool,
           continue;
         }
 
-        float djk = dc.dist(iter2->id, iter->id);
+        float djk =
+            retained
+                ? dc.dist(cache->blocks[cached_indices[t]],
+                          cache->blocks[cached_indices[iter - pool.begin()]])
+            : vectors.empty()
+                ? dc.dist(iter2->id, iter->id)
+                : dc.dist(vectors[t], vectors[iter - pool.begin()]);
+        if (dc.error()) {
+          return dc.error_code();
+        }
 
         occlude_factor[t] =
             (djk == 0) ? std::numeric_limits<float>::max()
@@ -266,10 +482,10 @@ int DiskAnnAlgorithm::occlude_list(diskann_id_t id, std::vector<Neighbor> &pool,
   return 0;
 }
 
-int DiskAnnAlgorithm::prune_neighbors(diskann_id_t id,
-                                      std::vector<Neighbor> &pool,
-                                      std::vector<diskann_id_t> &pruned_list,
-                                      DiskAnnContext *ctx) {
+int DiskAnnAlgorithm::prune_neighbors(
+    diskann_id_t id, PruneCandidates &pool,
+    ailego::BudgetedVector<diskann_id_t> &pruned_list, DiskAnnContext *ctx,
+    PruneVectorCache *cache) {
   if (pool.size() == 0) {
     pruned_list.clear();
     return 0;
@@ -277,10 +493,23 @@ int DiskAnnAlgorithm::prune_neighbors(diskann_id_t id,
 
   std::sort(pool.begin(), pool.end());
 
-  pruned_list.clear();
-  pruned_list.reserve(max_degree_);
-
-  occlude_list(id, pool, pruned_list, ctx);
+  int ret;
+  for (;;) {
+    try {
+      pruned_list.clear();
+      pruned_list.reserve(max_degree_);
+      ret = occlude_list(id, pool, pruned_list, ctx, cache);
+      break;
+    } catch (const std::bad_alloc &) {
+      // Mandatory metadata may grow after candidate collection. Give back
+      // optional pins before retrying; preserve the already sorted order.
+      if (!cache || !cache->complete) throw;
+      cache->clear();
+    }
+  }
+  if (ret != 0) {
+    return ret;
+  }
 
   ailego_assert(pruned_list.size() <= max_degree_);
 
@@ -302,11 +531,11 @@ int DiskAnnAlgorithm::prune_neighbors(diskann_id_t id,
 }
 
 int DiskAnnAlgorithm::search_neighbor_and_prune(
-    diskann_id_t id, std::vector<diskann_id_t> &pruned_list,
+    diskann_id_t id, ailego::BudgetedVector<diskann_id_t> &pruned_list,
     DiskAnnContext *ctx) {
-  const std::vector<diskann_id_t> init_ids = get_init_ids(ctx);
+  const ailego::BudgetedVector<diskann_id_t> init_ids = get_init_ids(ctx);
 
-  int ret = iterate_to_fixed_point(init_ids, ctx);
+  int ret = iterate_to_fixed_point(init_ids, id, ctx);
   if (ret != 0) {
     return ret;
   }

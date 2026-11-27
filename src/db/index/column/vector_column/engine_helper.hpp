@@ -79,17 +79,16 @@ class ProximaEngineHelper {
  public:
   static Result<vector_column_params::VectorDataBuffer>
   move_from_engine_vector_buffer(
-      const core_interface::VectorDataBuffer &&vector_data_buffer,
-      bool is_sparse) {
+      core_interface::VectorDataBuffer &&vector_data_buffer, bool is_sparse) {
     if (is_sparse) {
-      auto sparse_vector_buffer = std::get<core_interface::SparseVectorBuffer>(
+      auto &sparse_vector_buffer = std::get<core_interface::SparseVectorBuffer>(
           vector_data_buffer.vector_buffer);
       return vector_column_params::VectorDataBuffer{
           vector_column_params::SparseVectorBuffer{
               std::move(sparse_vector_buffer.indices),
               std::move(sparse_vector_buffer.values)}};
     }
-    auto dense_vector_buffer = std::get<core_interface::DenseVectorBuffer>(
+    auto &dense_vector_buffer = std::get<core_interface::DenseVectorBuffer>(
         vector_data_buffer.vector_buffer);
     return vector_column_params::VectorDataBuffer{
         vector_column_params::DenseVectorBuffer{

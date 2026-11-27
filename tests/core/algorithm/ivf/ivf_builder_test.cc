@@ -599,9 +599,11 @@ TEST_F(IVFBuilderTest, HalfFloatOrdinalReaderPreservesErrorsAndFallback) {
   ASSERT_EQ(0, reader->read(0, &key, &data));
   ASSERT_NE(nullptr, data);
 
-  // An ordinary multipass source has no ordinal capability. Declining it
-  // must leave the existing reader intact and sequential conversion usable.
-  ASSERT_EQ(0, converter->transform(holder_));
+  // Use an iterator-only source. The numerical holder now also supports
+  // ordinal reads for paged training and can no longer exercise fallback.
+  auto sequential = std::make_shared<IteratorErrorHolder>(
+      holder_, holder_->count(), IteratorErrorOperation::kData);
+  ASSERT_EQ(0, converter->transform(sequential));
   auto fallback = converter->result();
   auto *unsupported = dynamic_cast<OrdinalAccessHolder *>(fallback.get());
   ASSERT_NE(nullptr, unsupported);

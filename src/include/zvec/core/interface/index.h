@@ -81,7 +81,31 @@ struct DenseVectorBuffer {
 };
 
 struct SparseVectorBuffer {
-  uint32_t count;
+ private:
+  // Keep capacity charged until both strings are destroyed, including copies.
+  ailego::MemoryReservation memory_;
+
+ public:
+  SparseVectorBuffer() = default;
+  SparseVectorBuffer(uint32_t sparse_count, std::string sparse_indices = {},
+                     std::string sparse_values = {})
+      : count(sparse_count),
+        indices(std::move(sparse_indices)),
+        values(std::move(sparse_values)) {}
+  explicit SparseVectorBuffer(core::IndexSparseDocument &&document) {
+    document.swap_buffers(count, indices, values, memory_);
+  }
+  SparseVectorBuffer(const SparseVectorBuffer &) = default;
+  SparseVectorBuffer(SparseVectorBuffer &&) noexcept = default;
+  SparseVectorBuffer &operator=(SparseVectorBuffer other) noexcept {
+    memory_.swap(other.memory_);
+    std::swap(count, other.count);
+    indices.swap(other.indices);
+    values.swap(other.values);
+    return *this;
+  }
+
+  uint32_t count{0};
   std::string indices;
   std::string values;
 
@@ -110,6 +134,8 @@ struct SearchResult {
   std::vector<std::vector<std::string>> group_reverted_vector_list_{};
   std::vector<std::vector<std::string>> group_reverted_sparse_values_list_{};
 };
+
+class BufferedInput;
 
 class ZVEC_CORE_API Index {
  public:
@@ -316,6 +342,7 @@ class ZVEC_CORE_API Index {
 
   size_t context_index_{std::numeric_limits<size_t>::max()};
   core::IndexStorage::Pointer storage_{};
+  std::shared_ptr<BufferedInput> buffered_input_;
 
   bool is_open_{false};
   bool is_sparse_{false};
@@ -326,6 +353,7 @@ class ZVEC_CORE_API Index {
 
 class ZVEC_CORE_API FlatIndex : public Index {
  public:
+  BaseIndexParam::Pointer get_param() const override;
   FlatIndex() = default;
 
   // External Flat supports raw row-major FP32 L2/IP. Register IDs after

@@ -1734,7 +1734,9 @@ TEST(IndexInterface, MergeUnquantizedFlatAndIvfSourcesWithOrdinalReads) {
                               kDim * sizeof(float));
       }
     }
-    if (s == 1) ASSERT_EQ(0, source->train());
+    if (s == 1) {
+      ASSERT_EQ(0, source->train());
+    }
     sources.push_back(std::move(source));
   }
   auto target = IndexFactory::CreateAndInitIndex(*ivf_param);

@@ -25,6 +25,7 @@
 #include <zvec/core/framework/index_holder.h>
 #include <zvec/core/framework/index_storage.h>
 #include <zvec/core/interface/index.h>
+#include "indexes/buffered_input.h"
 #include "mixed_reducer/mixed_reducer_params.h"
 #include "utility/utility_params.h"
 
@@ -311,6 +312,7 @@ bool Index::is_trained() const {
 }
 
 uint32_t Index::get_doc_count() const {
+  if (buffered_input_ && !is_trained_) return buffered_input_->count();
   if (pending_quantizer_training_) return 0;
   if (streamer_ == nullptr) {
     return -1;
@@ -766,8 +768,10 @@ int Index::finish_streamer_open(const StorageOptions &storage_options) {
     }
   }
 
-  // TODO: context pool
-  if (!pending_quantizer_training_ && !init_context()) {
+  // Flat admits its worker context when the first operation needs it.
+  // Opening a storage handle alone does not need query scratch.
+  if (!pending_quantizer_training_ && param_.index_type != IndexType::kFlat &&
+      !init_context()) {
     LOG_ERROR("Failed to init context");
     return core::IndexError_Runtime;
   }
@@ -781,7 +785,8 @@ int Index::close() {
     return core::IndexError_Runtime;
   }
 
-  if (!is_read_only_ && !pending_quantizer_training_) {
+  if (!is_read_only_ && !pending_quantizer_training_ &&
+      !(buffered_input_ && !is_trained_)) {
     if (ailego_unlikely(flush() != 0)) {
       LOG_ERROR("Failed to cleanup streamer");
       return core::IndexError_Runtime;
@@ -807,6 +812,11 @@ int Index::close() {
     LOG_ERROR("Failed to close storage");
     return core::IndexError_Runtime;
   }
+  if (buffered_input_) {
+    if (builder_) builder_->cleanup();
+    buffered_input_->clear();
+    buffered_input_.reset();
+  }
   is_open_ = false;
   return 0;
 }
@@ -822,6 +832,7 @@ int Index::flush() {
     LOG_ERROR("Cannot flush read-only index");
     return core::IndexError_Runtime;
   }
+  if (buffered_input_ && !is_trained_) return buffered_input_->flush();
   if (ailego_unlikely(streamer_->flush(0) != 0)) {
     LOG_ERROR("Failed to flush streamer");
     return core::IndexError_Runtime;
@@ -852,7 +863,7 @@ int Index::fetch(const uint32_t doc_id, VectorDataBuffer *vector_data_buffer) {
   return _dense_fetch(doc_id, vector_data_buffer);
 }
 
-int Index::add(const VectorData &vector_data, const uint32_t doc_id) {
+int Index::add(const VectorData &vector_data, const uint32_t doc_id) try {
   if (pending_quantizer_training_) return core::IndexError_NoReady;
   if (!is_open_) {
     LOG_ERROR("Index is not open");
@@ -878,6 +889,8 @@ int Index::add(const VectorData &vector_data, const uint32_t doc_id) {
   }
   context->reset();
   return ret;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int Index::add_with_source(const VectorData & /*vector*/, uint32_t /*doc_id*/,
@@ -1057,29 +1070,56 @@ int Index::_dense_fetch(const uint32_t doc_id,
 
 
 int Index::_sparse_fetch(const uint32_t doc_id,
-                         VectorDataBuffer *vector_data_buffer) {
+                         VectorDataBuffer *vector_data_buffer) try {
+  core::IndexSparseDocument decoded;
+  const int ret = streamer_->get_sparse_vector_by_id(doc_id, decoded);
+  if (ret != core::IndexError_NotImplemented) {
+    if (ret != 0) return ret;
+    if (reformer_ != nullptr) {
+      core::IndexSparseDocument reverted;
+      reverted.reserve_sparse_buffers(
+          decoded.sparse_indices().size(),
+          size_t{decoded.sparse_count()} * input_vector_meta_.unit_size());
+      *reverted.mutable_sparse_count() = decoded.sparse_count();
+      *reverted.mutable_sparse_indices() = decoded.sparse_indices();
+      const int error = reformer_->revert(
+          decoded.sparse_count(),
+          reinterpret_cast<const uint32_t *>(decoded.sparse_indices().data()),
+          decoded.sparse_values().data(), streamer_vector_meta_,
+          reverted.mutable_sparse_values());
+      if (error != 0) return error;
+      decoded = std::move(reverted);
+    }
+    vector_data_buffer->vector_buffer = SparseVectorBuffer(std::move(decoded));
+    return 0;
+  }
+
   SparseVectorBuffer sparse_vector_buffer;
 
-  if (0 != streamer_->get_sparse_vector_by_id(
-               doc_id, &sparse_vector_buffer.count,
-               &sparse_vector_buffer.indices, &sparse_vector_buffer.values)) {
-    LOG_ERROR("Failed to fetch vector");
-    return core::IndexError_Runtime;
+  const int fetch_ret = streamer_->get_sparse_vector_by_id(
+      doc_id, &sparse_vector_buffer.count, &sparse_vector_buffer.indices,
+      &sparse_vector_buffer.values);
+  if (fetch_ret != 0) {
+    LOG_ERROR("Failed to fetch vector, doc_id: %u", doc_id);
+    return fetch_ret;
   }
 
   if (reformer_ != nullptr) {
     std::string reverted_sparse_values_buffer;
-    if (reformer_->revert(
-            sparse_vector_buffer.count, sparse_vector_buffer.get_indices(),
-            sparse_vector_buffer.get_values(), streamer_vector_meta_,
-            &reverted_sparse_values_buffer) != 0) {
+    const int revert_ret = reformer_->revert(
+        sparse_vector_buffer.count, sparse_vector_buffer.get_indices(),
+        sparse_vector_buffer.get_values(), streamer_vector_meta_,
+        &reverted_sparse_values_buffer);
+    if (revert_ret != 0) {
       LOG_ERROR("Failed to convert vector");
-      return core::IndexError_Runtime;
+      return revert_ret;
     }
     sparse_vector_buffer.values = std::move(reverted_sparse_values_buffer);
   }
   vector_data_buffer->vector_buffer = std::move(sparse_vector_buffer);
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int Index::_dense_add(const VectorData &vector_data, const uint32_t doc_id,
@@ -1235,9 +1275,8 @@ int Index::_execute_dense_search(
     std::vector<uint64_t> *candidate_keys) {
   if (candidate_keys) candidate_keys->clear();
   if (search_param->bf_pks != nullptr) {
-    const int ret = streamer_->search_bf_by_p_keys_impl(
-        vector, std::vector<std::vector<uint64_t>>{*search_param->bf_pks},
-        new_meta, 1, context);
+    const int ret = streamer_->search_bf_by_keys_impl(
+        vector, *search_param->bf_pks, new_meta, context);
     if (ret != 0) {
       LOG_ERROR("Failed to search_bf_by_p_keys_impl vector");
       return ret == core::IndexError_NoMemory ? ret : core::IndexError_Runtime;
@@ -1511,12 +1550,12 @@ int Index::_sparse_search(const VectorData &vector_data,
   }
 
   if (search_param->bf_pks != nullptr) {
-    if (streamer_->search_bf_by_p_keys_impl(
-            sparse_vector.count, indices, values,
-            std::vector<std::vector<uint64_t>>{*search_param->bf_pks}, new_meta,
-            context) != 0) {
+    const int ret = streamer_->search_bf_by_keys_impl(
+        sparse_vector.count, indices, values, *search_param->bf_pks, new_meta,
+        context);
+    if (ret != 0) {
       LOG_ERROR("Failed to search_bf_by_p_keys_impl vector");
-      return core::IndexError_Runtime;
+      return ret;
     }
   } else if (search_param->is_linear) {
     if (streamer_->search_bf_impl(sparse_vector.count, indices, values,
@@ -1619,7 +1658,7 @@ int Index::_sparse_search(const VectorData &vector_data,
 
 
 int Index::merge(const std::vector<Index::Pointer> &indexes,
-                 const IndexFilter &filter, const MergeOptions &options) {
+                 const IndexFilter &filter, const MergeOptions &options) try {
   if (!is_open_ || is_read_only_) {
     LOG_ERROR("Cannot merge into an index that is closed or read-only");
     return core::IndexError_Runtime;
@@ -1632,7 +1671,8 @@ int Index::merge(const std::vector<Index::Pointer> &indexes,
     return core::IndexError_Unsupported;
   }
   for (const auto &index : indexes) {
-    if (index && index->param_.index_type == IndexType::kFlat &&
+    if (!index) return core::IndexError_InvalidArgument;
+    if (index->param_.index_type == IndexType::kFlat &&
         index->param_.use_external_vector) {
       return core::IndexError_Unsupported;
     }
@@ -1669,6 +1709,10 @@ int Index::merge(const std::vector<Index::Pointer> &indexes,
                      true);
   reducer_params.set(core::PARAM_MIXED_STREAMER_REDUCER_NUM_OF_ADD_THREADS,
                      effective_write_concurrency);
+  reducer_params.set(core::PARAM_MIXED_STREAMER_REDUCER_SPOOL_VECTORS,
+                     storage_ && (storage_->name() == "BufferStorage" ||
+                                  storage_->name() == "BufferReadStorage" ||
+                                  storage_->name() == "ChunkReadStorage"));
   if (reducer->init(reducer_params) != 0) {
     LOG_ERROR("Failed to init reducer");
     return core::IndexError_Runtime;
@@ -1754,12 +1798,15 @@ int Index::merge(const std::vector<Index::Pointer> &indexes,
       return core::IndexError_Runtime;
     }
   }
-  if (reducer->reduce(filter) != 0) {
-    LOG_ERROR("Failed to reduce");
-    return core::IndexError_Runtime;
+  const int status = reducer->reduce(filter);
+  if (status != 0) {
+    LOG_ERROR("Failed to reduce, ret=%d", status);
+    return status;
   }
   is_trained_ = true;
   return 0;
+} catch (const std::bad_alloc &) {
+  return core::IndexError_NoMemory;
 }
 
 int Index::_get_coarse_search_topk(

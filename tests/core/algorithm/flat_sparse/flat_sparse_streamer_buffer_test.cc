@@ -14,14 +14,17 @@
 
 #include <string>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/math_helper.h>
 #include <ailego/utility/memory_helper.h>
+#include <algorithm/flat/flat_utility.h>
 #include <algorithm/flat_sparse/flat_sparse_utility.h>
 #include <gtest/gtest.h>
 #include <turbo/norm/norm2_matrix.h>
 #include <zvec/core/framework/index_framework.h>
 #include <zvec/core/framework/index_streamer.h>
 #include "tests/test_util.h"
+#include "../../../ailego/buffer/pool_payload_budget.h"
 
 using namespace std;
 using namespace testing;
@@ -91,6 +94,90 @@ void FlatSparseStreamerTest::SetUp() {
 
 void FlatSparseStreamerTest::TearDown() {
   zvec::test_util::RemoveTestPath(dir_);
+}
+
+TEST_F(FlatSparseStreamerTest, PreparedAddCancelsBeforePublishAndReusesGap) {
+  auto &pool = PoolPayloadBudget::get_instance();
+  const size_t previous_capacity = pool.capacity();
+  ASSERT_EQ(0, pool.init(8 * 1024 * 1024));
+  auto restore =
+      ScopeGuard::Make([&] { EXPECT_EQ(0, pool.init(previous_capacity)); });
+  const IndexQueryMeta qmeta(IndexMeta::MT_SPARSE, IndexMeta::DT_FP32);
+  const uint32_t dimension[] = {7};
+  const float abandoned[] = {1.5f}, persisted[] = {4.25f};
+
+  for (bool use_id_map : {false, true}) {
+    SCOPED_TRACE(use_id_map);
+    const auto path = dir_ + std::to_string(use_id_map) + "/index";
+    Params params;
+    params.set(PARAM_FLAT_USE_ID_MAP, use_id_map);
+    params.set(PARAM_FLAT_SPARSE_STREAMER_MAX_DOC_CNT, uint32_t{128});
+    params.set(PARAM_FLAT_SPARSE_STREAMER_MAX_DATA_CHUNK_CNT, uint32_t{4});
+    params.set(PARAM_FLAT_SPARSE_STREAMER_OFFSET_CHUNK_SIZE, uint32_t{48});
+    params.set(PARAM_FLAT_SPARSE_STREAMER_DATA_CHUNK_SIZE, uint32_t{64});
+    auto storage = IndexFactory::CreateStorage("BufferStorage");
+    ASSERT_NE(nullptr, storage);
+    ASSERT_EQ(0, storage->init({}));
+    ASSERT_EQ(0, storage->open(path, true));
+    auto streamer = IndexFactory::CreateStreamer("FlatSparseStreamer");
+    ASSERT_NE(nullptr, streamer);
+    ASSERT_EQ(0, streamer->init(*index_meta_ptr_, params));
+    ASSERT_EQ(0, streamer->open(storage));
+    auto context = streamer->create_context();
+    ASSERT_NE(nullptr, context);
+
+    std::unique_ptr<IndexStreamer::PreparedAdd> pending;
+    ASSERT_EQ(0, streamer->prepare_add_with_id(1, 1, dimension, abandoned,
+                                               qmeta, context, &pending));
+    ASSERT_NE(nullptr, pending);
+    uint32_t count = 0;
+    std::string indices, values;
+    EXPECT_EQ(IndexError_NoExist,
+              streamer->get_sparse_vector_by_id(1, &count, &indices, &values));
+    EXPECT_EQ(0u, streamer->stats().added_count());
+    pending.reset();
+
+    ASSERT_EQ(0, streamer->prepare_add_with_id(2, 1, dimension, persisted,
+                                               qmeta, context, &pending));
+    ASSERT_NE(nullptr, pending);
+    ASSERT_EQ(IndexError_NoExist,
+              streamer->get_sparse_vector_by_id(2, &count, &indices, &values));
+    {
+      MemoryReservation pressure;
+      pressure.add(pool.capacity() - pool.used());
+      pending->commit();
+    }
+    EXPECT_EQ(1u, streamer->stats().added_count());
+    pending.reset();
+
+    auto verify = [&] {
+      for (uint32_t id : {0, 1}) {
+        EXPECT_EQ(IndexError_NoExist, streamer->get_sparse_vector_by_id(
+                                          id, &count, &indices, &values));
+      }
+      indices.clear();
+      values.clear();
+      ASSERT_EQ(
+          0, streamer->get_sparse_vector_by_id(2, &count, &indices, &values));
+      EXPECT_EQ(1u, count);
+      EXPECT_EQ(std::string(reinterpret_cast<const char *>(dimension),
+                            sizeof(dimension)),
+                indices);
+      EXPECT_EQ(std::string(reinterpret_cast<const char *>(persisted),
+                            sizeof(persisted)),
+                values);
+    };
+    verify();
+    ASSERT_EQ(0, streamer->flush(0));
+    context.reset();
+    ASSERT_EQ(0, streamer->close());
+    ASSERT_EQ(0, storage->close());
+    ASSERT_EQ(0, storage->open(path, false));
+    ASSERT_EQ(0, streamer->open(storage));
+    verify();
+    ASSERT_EQ(0, streamer->close());
+    ASSERT_EQ(0, storage->close());
+  }
 }
 
 TEST_F(FlatSparseStreamerTest, TestGeneral) {
