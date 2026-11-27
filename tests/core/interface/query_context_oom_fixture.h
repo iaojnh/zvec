@@ -11,9 +11,10 @@
 #include <new>
 #include <string>
 #include <utility>
-#include <gtest/gtest.h>
 #include <ailego/pattern/scope_guard.h>
+#include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
+#include <zvec/ailego/internal/platform.h>
 #include <zvec/core/framework/index_framework.h>
 
 namespace {
@@ -123,6 +124,8 @@ void check_context_failure(Index &index, size_t context_size) {
     for (const auto *block : attempt.aligned_blocks) {
       EXPECT_EQ(nullptr, block);
     }
+    auto retry = index.create_context();
+    ASSERT_NE(nullptr, retry);
   }
 }
 
@@ -147,7 +150,7 @@ class QueryContextOomTest : public ::testing::TestWithParam<bool> {
   }
 
   void open_read_storage(const std::string &path,
-                       core::IndexStorage::Pointer *storage) {
+                         core::IndexStorage::Pointer *storage) {
     *storage = core::IndexFactory::CreateStorage(
         GetParam() ? "BufferReadStorage" : "FileReadStorage");
     ASSERT_NE(nullptr, *storage);
